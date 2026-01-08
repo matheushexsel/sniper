@@ -1,3 +1,6 @@
+# pump_sniper.py
+# Pump Sniper (Solana) - PumpPortal WS + DexScreener filters + Jupiter v6 swaps (api.jup.ag w/ x-api-key)
+
 import os
 import json
 import time
@@ -6,17 +9,20 @@ import binascii
 import socket
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple, Set
+from urllib.parse import urlparse
 
 import requests
 import base58
 import websockets
-
 import urllib3.util.connection as urllib3_cn
+
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TokenAccountOpts, TxOpts
+
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
+
 
 # Force IPv4 DNS resolution (helps in some cloud runtimes)
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
@@ -53,8 +59,10 @@ def env_bool(name: str, default: bool) -> bool:
 
 def _strip_wrappers(s: str) -> str:
     s = s.strip()
+    # Remove accidental "PRIVATE_KEY=" prefix if user pasted raw line
     if s.upper().startswith("PRIVATE_KEY="):
         s = s.split("=", 1)[1].strip()
+    # Remove surrounding quotes
     if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in ("'", '"')):
         s = s[1:-1].strip()
     return s
@@ -63,7 +71,7 @@ def _strip_wrappers(s: str) -> str:
 def parse_keypair(private_key_env: str) -> Keypair:
     """
     Accepts common Solana secret formats:
-      1) base58 64-byte secret key
+      1) base58 64-byte secret key (most common)
       2) base58 32-byte seed -> Keypair.from_seed
       3) JSON array of ints (len 64 or 32)
       4) base64 of 64/32 bytes
@@ -115,19 +123,40 @@ def parse_keypair(private_key_env: str) -> Keypair:
         pass
 
     raise RuntimeError(
-        "PRIVATE_KEY format invalid. Use base58 64-byte secret key OR base58 32-byte seed OR JSON array (32/64) OR base64/hex (32/64). "
-        "Do not paste the wallet address/public key."
+        "PRIVATE_KEY format invalid. Use: base58 64-byte secret key OR base58 32-byte seed OR JSON array (32/64) OR base64/hex (32/64). "
+        "Also ensure you did NOT paste the wallet address/public key."
     )
+
+
+def is_valid_solana_mint(mint: str) -> bool:
+    try:
+        Pubkey.from_string(mint)
+        return True
+    except Exception:
+        return False
+
+
+# ===================== HTTP (WITH JUP API KEY SUPPORT) =====================
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "pump-sniper/1.0"})
+
+
+def _host(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
 
 
 def http_get_json(url: str, timeout: float = 10.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     last = None
-    hdrs = {"User-Agent": "pump-sniper/1.0"}
-    if headers:
-        hdrs.update(headers)
     for i in range(retries):
         try:
-            r = requests.get(url, timeout=timeout, headers=hdrs)
+            h = dict(SESSION.headers)
+            if headers:
+                h.update(headers)
+            r = SESSION.get(url, timeout=timeout, headers=h)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -137,25 +166,18 @@ def http_get_json(url: str, timeout: float = 10.0, retries: int = 3, headers: Op
 
 def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 15.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     last = None
-    hdrs = {"User-Agent": "pump-sniper/1.0"}
-    if headers:
-        hdrs.update(headers)
     for i in range(retries):
         try:
-            r = requests.post(url, json=payload, timeout=timeout, headers=hdrs)
+            h = dict(SESSION.headers)
+            if headers:
+                h.update(headers)
+            r = SESSION.post(url, json=payload, timeout=timeout, headers=h)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last = e
             time.sleep(0.6 * (2 ** i))
     raise RuntimeError(f"POST failed after {retries} retries: {url} err={last}")
-
-def is_valid_solana_mint(mint: str) -> bool:
-    try:
-        Pubkey.from_string(mint)
-        return True
-    except Exception:
-        return False
 
 
 # ===================== CONFIG (ENV VARS) =====================
@@ -166,13 +188,16 @@ WS_URL = os.getenv("WS_URL", "wss://pumpportal.fun/api/data")
 PRIVATE_KEY = env_str("PRIVATE_KEY")
 
 # Jupiter
-JUP_BASE_URL = os.getenv("JUP_BASE_URL", "https://api.jup.ag").rstrip("/")
-JUP_API_KEY = env_str("JUP_API_KEY")  # REQUIRED (your screenshot confirms this)
+# IMPORTANT: base must be https://api.jup.ag (no trailing slash required)
+JUP_BASE_URL = os.getenv("JUP_BASE_URL", "https://api.jup.ag").strip().rstrip("/")
+JUP_API_KEY = (os.getenv("JUP_API_KEY") or os.getenv("JUPITER_API_KEY") or "").strip()
+if not JUP_API_KEY:
+    raise RuntimeError("Missing required env var: JUP_API_KEY (or JUPITER_API_KEY)")
 
 # Trading
 BUY_SOL = env_float("BUY_SOL", 0.01)
-SLIPPAGE_BPS = env_int("SLIPPAGE_BPS", 150)
-PRIORITY_FEE_MICRO_LAMPORTS = env_int("PRIORITY_FEE_MICRO_LAMPORTS", 8000)
+SLIPPAGE_BPS = env_int("SLIPPAGE_BPS", 150)  # 1.5%
+PRIORITY_FEE_MICRO_LAMPORTS = env_int("PRIORITY_FEE_MICRO_LAMPORTS", 8000)  # 0 = none
 SKIP_PREFLIGHT = env_bool("SKIP_PREFLIGHT", False)
 
 # New launches filters
@@ -209,7 +234,7 @@ CONFIRM_POLL_SEC = env_float("CONFIRM_POLL_SEC", 1.5)
 
 LOG_SKIPS = env_bool("LOG_SKIPS", False)
 
-SOL_MINT = "So11111111111111111111111111111111111111112"
+SOL_MINT = "So11111111111111111111111111111111111111112"  # wrapped SOL mint (wSOL)
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 
@@ -225,26 +250,25 @@ positions: Dict[str, float] = {}
 monitored: Set[str] = set()
 _last_buy_ts = 0.0
 
-# Jupiter plan says 1 RPS. Enforce it globally.
-_jup_last_call_ts = 0.0
-_jup_lock = asyncio.Lock()
 
-def _jup_headers() -> Dict[str, str]:
-    # Jupiter auth. If their docs specify a different header name, change it here only.
-    # Current implementation uses "Authorization: Bearer <key>" which is the most common pattern.
-    return {
-        "Authorization": f"Bearer {JUP_API_KEY}",
-        "Accept": "application/json",
-    }
+# ===================== JUP RATE LIMIT (FREE TIER SAFETY) =====================
 
-async def jup_rate_limit() -> None:
-    global _jup_last_call_ts
-    async with _jup_lock:
+# Free tier is 60 RPM. Enforce ~1 request/sec to avoid 429s and also reduce burst.
+_JUP_LOCK = asyncio.Lock()
+_JUP_NEXT_TS = 0.0
+
+async def jup_throttle() -> None:
+    global _JUP_NEXT_TS
+    async with _JUP_LOCK:
         now = time.time()
-        wait = 1.0 - (now - _jup_last_call_ts)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _jup_last_call_ts = time.time()
+        if now < _JUP_NEXT_TS:
+            await asyncio.sleep(_JUP_NEXT_TS - now)
+        _JUP_NEXT_TS = time.time() + 1.05  # ~1 rps
+
+
+def jup_headers() -> Dict[str, str]:
+    # Jupiter requires x-api-key for api.jup.ag
+    return {"x-api-key": JUP_API_KEY}
 
 
 # ===================== DEXSCREENER DATA =====================
@@ -308,26 +332,22 @@ async def get_token_balance(mint: str) -> int:
         return 0
 
 
-# ===================== JUPITER SWAP =====================
+# ===================== JUPITER SWAP (v6) =====================
 
 def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
+    # MUST include /v6/quote (not just base)
     return (
-        f"{JUP_BASE_URL}"
+        f"{JUP_BASE_URL}/v6/quote"
         f"?inputMint={input_mint}"
         f"&outputMint={output_mint}"
         f"&amount={amount}"
         f"&slippageBps={SLIPPAGE_BPS}"
     )
 
-async def jup_get_json(url: str) -> Dict[str, Any]:
-    await jup_rate_limit()
-    return http_get_json(url, timeout=12.0, retries=3, headers=_jup_headers())
-
-async def jup_post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    await jup_rate_limit()
-    return http_post_json(url, payload, timeout=18.0, retries=3, headers=_jup_headers())
-
 async def send_swap(action: str, mint: str) -> Optional[str]:
+    """
+    Uses Jupiter Quote API v6 + Swap API v6 on https://api.jup.ag (requires x-api-key)
+    """
     try:
         if action == "buy":
             input_mint = SOL_MINT
@@ -343,17 +363,20 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
 
         quote_url = build_jupiter_quote_url(input_mint, output_mint, amount)
 
+        # Throttle to stay within free-tier limits (and reduce 429/401 edge cases)
+        await jup_throttle()
+
         try:
-            quote = await jup_get_json(quote_url)
+            quote = http_get_json(quote_url, timeout=12.0, retries=3, headers=jup_headers())
         except Exception as e:
             log(f"Swap error ({action}) mint={mint}: quote_error={e}")
             return None
 
-        if isinstance(quote, dict) and quote.get("error"):
+        if isinstance(quote, dict) and "error" in quote:
             log(f"Swap error ({action}) mint={mint}: quote_error={quote.get('error')}")
             return None
 
-        swap_payload = {
+        swap_payload: Dict[str, Any] = {
             "quoteResponse": quote,
             "userPublicKey": str(WALLET_PUBKEY),
             "wrapAndUnwrapSol": True,
@@ -361,13 +384,15 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
         if PRIORITY_FEE_MICRO_LAMPORTS > 0:
             swap_payload["computeUnitPriceMicroLamports"] = int(PRIORITY_FEE_MICRO_LAMPORTS)
 
+        await jup_throttle()
+
         try:
-            swap = await jup_post_json(f"{JUP_BASE_URL}/swap", swap_payload)
+            swap = http_post_json(f"{JUP_BASE_URL}/v6/swap", swap_payload, timeout=20.0, retries=3, headers=jup_headers())
         except Exception as e:
             log(f"Swap error ({action}) mint={mint}: swap_error={e}")
             return None
 
-        tx_b64 = swap.get("swapTransaction")
+        tx_b64 = swap.get("swapTransaction") if isinstance(swap, dict) else None
         if not tx_b64:
             log(f"Swap error ({action}) mint={mint}: no swapTransaction in response")
             return None
@@ -416,16 +441,13 @@ async def price_monitor(mint: str, entry_price: float) -> None:
         px = float(data.get("priceUsd") or 0.0)
         if px <= 0:
             continue
-
         mult = px / entry_price if entry_price > 0 else 0.0
-
         if mult >= TAKE_PROFIT_X:
             log(f"TP hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
             await send_swap("sell", mint)
             positions.pop(mint, None)
             monitored.discard(mint)
             return
-
         if mult <= STOP_LOSS_X:
             log(f"SL hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
             await send_swap("sell", mint)
@@ -490,13 +512,16 @@ async def scan_existing_tokens() -> None:
                     seen_pairs[mint] = p
 
             ranked: List[Tuple[float, Dict[str, Any]]] = []
-            for mint, p in seen_pairs.items():
+            for _mint, p in seen_pairs.items():
                 change1h = float((p.get("priceChange") or {}).get("h1") or 0.0)
                 vol1h = float((p.get("volume") or {}).get("h1") or 0.0)
                 liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
                 buys1h = int(((p.get("txns") or {}).get("h1") or {}).get("buys") or 0)
 
-                if change1h >= EXISTING_MIN_CHG_1H and vol1h >= EXISTING_MIN_VOL_1H_USD and liq >= EXISTING_MIN_LIQ_USD and buys1h >= EXISTING_MIN_BUYS_1H:
+                if (change1h >= EXISTING_MIN_CHG_1H and
+                    vol1h >= EXISTING_MIN_VOL_1H_USD and
+                    liq >= EXISTING_MIN_LIQ_USD and
+                    buys1h >= EXISTING_MIN_BUYS_1H):
                     ranked.append((change1h, p))
                 else:
                     skipped_filters += 1
@@ -676,4 +701,13 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        try:
+            # best-effort close
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(client.close())
+            loop.close()
+        except Exception:
+            pass
