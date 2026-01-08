@@ -312,7 +312,7 @@ async def get_token_balance(mint: str) -> int:
 
 def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
     return (
-        f"{JUP_BASE_URL}/v6/quote"
+        f"{JUP_BASE_URL}"
         f"?inputMint={input_mint}"
         f"&outputMint={output_mint}"
         f"&amount={amount}"
@@ -362,7 +362,7 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
             swap_payload["computeUnitPriceMicroLamports"] = int(PRIORITY_FEE_MICRO_LAMPORTS)
 
         try:
-            swap = await jup_post_json(f"{JUP_BASE_URL}/v6/swap", swap_payload)
+            swap = await jup_post_json(f"{JUP_BASE_URL}/swap", swap_payload)
         except Exception as e:
             log(f"Swap error ({action}) mint={mint}: swap_error={e}")
             return None
