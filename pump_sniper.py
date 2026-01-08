@@ -4,7 +4,7 @@ import json
 import base64
 import random
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import aiohttp
 import websockets
@@ -18,44 +18,34 @@ from solders.transaction import VersionedTransaction
 
 
 # ===================== ENV CONFIG =====================
-# Required
-PRIVATE_KEY_B58 = os.environ["PRIVATE_KEY"]          # base58-encoded 64-byte secret key
-RPC_URL = os.environ["RPC_URL"]                      # Helius RPC URL with api-key
-
-# Jupiter Swap API v1 (Jupiter docs show x-api-key required)
+PRIVATE_KEY_B58 = os.environ["PRIVATE_KEY"]
+RPC_URL = os.environ["RPC_URL"]
 JUP_API_KEY = os.environ.get("JUP_API_KEY", "").strip()
 
-# Optional runtime tuning
 WS_URL = os.environ.get("WS_URL", "wss://pumpportal.fun/api/data")
 
 BUY_SOL = float(os.environ.get("BUY_SOL", "0.01"))
-SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", "50"))  # 50 = 0.5%
+SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", "50"))
 PRIORITY_FEE_MICRO_LAMPORTS = int(os.environ.get("PRIORITY_FEE_MICRO_LAMPORTS", "0"))
 SKIP_PREFLIGHT = os.environ.get("SKIP_PREFLIGHT", "true").lower() == "true"
 
-# New token filters (USD values from Dexscreener)
 MIN_VOLUME_USD_NEW = float(os.environ.get("MIN_VOLUME_USD_NEW", "0"))
 MIN_LIQUIDITY_USD_NEW = float(os.environ.get("MIN_LIQUIDITY_USD_NEW", "0"))
 MIN_BUYS_H1_NEW = int(os.environ.get("MIN_BUYS_H1_NEW", "0"))
 REQUIRE_SOCIALS = os.environ.get("REQUIRE_SOCIALS", "false").lower() == "true"
 NEW_TOKEN_WARMUP_SEC = int(os.environ.get("NEW_TOKEN_WARMUP_SEC", "60"))
 
-# Existing token scan filters
-MIN_PRICE_CHANGE_1H = float(os.environ.get("MIN_PRICE_CHANGE_1H", "0"))  # percent
+MIN_PRICE_CHANGE_1H = float(os.environ.get("MIN_PRICE_CHANGE_1H", "0"))
 MIN_VOLUME_USD_EXISTING = float(os.environ.get("MIN_VOLUME_USD_EXISTING", "0"))
 MIN_LIQUIDITY_USD_EXISTING = float(os.environ.get("MIN_LIQUIDITY_USD_EXISTING", "0"))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "30"))
 
-# Sell rules (multipliers vs entry price)
-PROFIT_TARGET_X = float(os.environ.get("PROFIT_TARGET_X", "3.0"))  # sell-half trigger
-STOP_LOSS_X = float(os.environ.get("STOP_LOSS_X", "0.5"))          # sell-all trigger
+PROFIT_TARGET_X = float(os.environ.get("PROFIT_TARGET_X", "3.0"))
+STOP_LOSS_X = float(os.environ.get("STOP_LOSS_X", "0.5"))
 PRICE_POLL_SEC = int(os.environ.get("PRICE_POLL_SEC", "5"))
 
-# Safety
 MAX_CONCURRENT_MONITORS = int(os.environ.get("MAX_CONCURRENT_MONITORS", "25"))
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
-# Constants
 SOL_MINT = "So11111111111111111111111111111111111111112"
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
@@ -67,7 +57,6 @@ def log(msg: str) -> None:
 
 def load_keypair_from_b58(b58_str: str) -> Keypair:
     raw = base58.b58decode(b58_str)
-    # solders expects 64 bytes (secret + public)
     if len(raw) != 64:
         raise ValueError(f"PRIVATE_KEY must decode to 64 bytes, got {len(raw)} bytes")
     return Keypair.from_bytes(raw)
@@ -87,13 +76,10 @@ def is_valid_solana_pubkey(s: str) -> bool:
 
 def jup_headers() -> Dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    # Jupiter docs show x-api-key required for /swap/v1/*
     if JUP_API_KEY:
         headers["x-api-key"] = JUP_API_KEY
     return headers
 
-
-# ===================== HTTP HELPERS =====================
 
 class HttpError(Exception):
     pass
@@ -110,7 +96,6 @@ async def fetch_json(
     backoff_base: float = 1.5,
 ) -> Dict[str, Any]:
     headers = headers or {}
-
     for attempt in range(retries):
         try:
             timeout = aiohttp.ClientTimeout(total=timeout_sec)
@@ -118,7 +103,6 @@ async def fetch_json(
                 async with session.get(url, headers=headers, timeout=timeout) as r:
                     text = await r.text()
                     ct = (r.headers.get("Content-Type") or "").lower()
-
                     if r.status in (429, 500, 502, 503, 504):
                         raise HttpError(f"HTTP {r.status} transient: {text[:160]}")
                     if r.status != 200:
@@ -130,7 +114,6 @@ async def fetch_json(
             async with session.post(url, headers=headers, json=payload or {}, timeout=timeout) as r:
                 text = await r.text()
                 ct = (r.headers.get("Content-Type") or "").lower()
-
                 if r.status in (429, 500, 502, 503, 504):
                     raise HttpError(f"HTTP {r.status} transient: {text[:160]}")
                 if r.status != 200:
@@ -149,21 +132,12 @@ async def fetch_json(
     return {}
 
 
-# ===================== DEXSCREENER =====================
-# Use Solana-scoped endpoint to avoid EVM / bad addresses:
-# https://api.dexscreener.com/token-pairs/v1/solana/{tokenAddress}
-# (Dexscreener API reference lists token-pairs/v1 and rate limits) :contentReference[oaicite:2]{index=2}
-
-async def get_token_data_dexscreener(
-    session: aiohttp.ClientSession,
-    mint: str
-) -> Dict[str, Any]:
+async def get_token_data_dexscreener(session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
     url = f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
     try:
         pools = await fetch_json(session, url, method="GET", headers={"Accept": "application/json"}, retries=2)
         if not isinstance(pools, list) or not pools:
             return {}
-        # Choose the first pool; you can improve selection later (highest liquidity, etc.)
         p = pools[0]
         return {
             "priceUsd": float(p.get("priceUsd", 0) or 0),
@@ -177,11 +151,7 @@ async def get_token_data_dexscreener(
         return {}
 
 
-async def search_pairs_dexscreener(
-    session: aiohttp.ClientSession,
-    q: str,
-    limit: int = 150
-) -> list:
+async def search_pairs_dexscreener(session: aiohttp.ClientSession, q: str, limit: int = 150) -> list:
     url = f"https://api.dexscreener.com/latest/dex/search?q={q}"
     try:
         r = await fetch_json(session, url, method="GET", headers={"Accept": "application/json"}, retries=2)
@@ -192,40 +162,36 @@ async def search_pairs_dexscreener(
         return []
 
 
-# ===================== SOLANA BALANCES =====================
-
-async def get_token_balance(
-    client: AsyncClient,
-    owner: Pubkey,
-    mint: str
-) -> int:
+async def get_token_balance(client: AsyncClient, owner: Pubkey, mint: str) -> int:
     if not is_valid_solana_pubkey(mint):
         return 0
+
     try:
         opts = TokenAccountOpts(mint=Pubkey.from_string(mint), program_id=TOKEN_PROGRAM_ID)
         resp = await client.get_token_accounts_by_owner(owner, opts)
+
+        if not hasattr(resp, "value"):
+            log(f"Balance RPC returned non-standard response for {mint}: {type(resp)}")
+            return 0
+
         if not resp.value:
             return 0
-        # Pick first ATA
+
         ata = resp.value[0].pubkey
         bal = await client.get_token_account_balance(ata)
+
+        if not hasattr(bal, "value") or not hasattr(bal.value, "amount"):
+            log(f"Balance amount missing for {mint}: {bal}")
+            return 0
+
         return int(bal.value.amount)
+
     except Exception as e:
         log(f"Balance error for {mint}: {e}")
         return 0
 
 
-# ===================== JUPITER SWAP (v1) =====================
-# Docs show:
-# GET https://api.jup.ag/swap/v1/quote with x-api-key :contentReference[oaicite:3]{index=3}
-# POST https://api.jup.ag/swap/v1/swap with x-api-key required :contentReference[oaicite:4]{index=4}
-
-async def jupiter_quote(
-    session: aiohttp.ClientSession,
-    input_mint: str,
-    output_mint: str,
-    amount: int
-) -> Dict[str, Any]:
+async def jupiter_quote(session: aiohttp.ClientSession, input_mint: str, output_mint: str, amount: int) -> Dict[str, Any]:
     url = (
         "https://api.jup.ag/swap/v1/quote"
         f"?inputMint={input_mint}"
@@ -236,17 +202,12 @@ async def jupiter_quote(
     return await fetch_json(session, url, method="GET", headers=jup_headers(), retries=2)
 
 
-async def jupiter_swap_tx(
-    session: aiohttp.ClientSession,
-    quote: Dict[str, Any],
-    user_pubkey: str
-) -> Dict[str, Any]:
+async def jupiter_swap_tx(session: aiohttp.ClientSession, quote: Dict[str, Any], user_pubkey: str) -> Dict[str, Any]:
     payload = {
         "quoteResponse": quote,
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": True,
     }
-    # Optional: computeUnitPriceMicroLamports can be used for priority fee
     if PRIORITY_FEE_MICRO_LAMPORTS > 0:
         payload["computeUnitPriceMicroLamports"] = PRIORITY_FEE_MICRO_LAMPORTS
 
@@ -262,13 +223,9 @@ async def send_swap(
     mint: str,
     buy_lamports: int,
 ) -> Optional[str]:
-    """
-    action: "buy" or "sell"
-    buy_lamports: used only for buy. sell uses full balance.
-    Returns signature (string) on success.
-    """
     try:
         owner = keypair.pubkey()
+
         if action == "buy":
             input_mint, output_mint, amount = SOL_MINT, mint, buy_lamports
         else:
@@ -292,15 +249,19 @@ async def send_swap(
         tx_bytes = base64.b64decode(swap_tx_b64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # Sign the transaction message
-        msg_bytes = bytes(tx.message.serialize())
+        # FIX: MessageV0 has no serialize() here; use bytes(message)
+        msg_bytes = bytes(tx.message)
         sig = keypair.sign_message(msg_bytes)
         signed = VersionedTransaction(tx.message, [sig])
 
-        # Send raw tx via RPC
         opts = TxOpts(skip_preflight=SKIP_PREFLIGHT, preflight_commitment="processed")
         resp = await client.send_raw_transaction(bytes(signed), opts=opts)
-        signature = resp.value
+
+        signature = resp.value if hasattr(resp, "value") else None
+        if not signature:
+            log(f"RPC send_raw_transaction returned unexpected response: {resp}")
+            return None
+
         log(f"{action.upper()} sent: https://solscan.io/tx/{signature}")
         return signature
 
@@ -309,22 +270,13 @@ async def send_swap(
         return None
 
 
-# ===================== STRATEGY LOOPS =====================
-
-monitored_tokens: Dict[str, float] = {}  # mint -> entry price
+monitored_tokens: Dict[str, float] = {}
 monitor_semaphore: asyncio.Semaphore
 
 
-async def price_monitor(
-    session: aiohttp.ClientSession,
-    client: AsyncClient,
-    keypair: Keypair,
-    mint: str,
-    entry_price: float,
-) -> None:
+async def price_monitor(session: aiohttp.ClientSession, client: AsyncClient, keypair: Keypair, mint: str, entry_price: float) -> None:
     async with monitor_semaphore:
         try:
-            sold_half = False
             while True:
                 await asyncio.sleep(PRICE_POLL_SEC)
                 data = await get_token_data_dexscreener(session, mint)
@@ -334,16 +286,14 @@ async def price_monitor(
 
                 mult = px / entry_price
 
-                if (not sold_half) and mult >= PROFIT_TARGET_X:
-                    log(f"PROFIT trigger {mult:.2f}x for {mint}. Selling FULL balance (simplified).")
-                    # NOTE: implementing true 50% requires reading token decimals + splitting amount.
-                    # Keep it deterministic: sell all on target.
+                if mult >= PROFIT_TARGET_X:
+                    log(f"PROFIT {mult:.2f}x for {mint}. Selling FULL balance.")
                     await send_swap(session, client, keypair, "sell", mint, lamports(BUY_SOL))
                     monitored_tokens.pop(mint, None)
                     return
 
                 if mult <= STOP_LOSS_X:
-                    log(f"STOP-LOSS trigger {mult:.2f}x for {mint}. Selling FULL balance.")
+                    log(f"STOP-LOSS {mult:.2f}x for {mint}. Selling FULL balance.")
                     await send_swap(session, client, keypair, "sell", mint, lamports(BUY_SOL))
                     monitored_tokens.pop(mint, None)
                     return
@@ -353,11 +303,7 @@ async def price_monitor(
             monitored_tokens.pop(mint, None)
 
 
-async def scan_existing_tokens(
-    session: aiohttp.ClientSession,
-    client: AsyncClient,
-    keypair: Keypair,
-) -> None:
+async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClient, keypair: Keypair) -> None:
     owner = keypair.pubkey()
     while True:
         try:
@@ -366,17 +312,13 @@ async def scan_existing_tokens(
                 if (p.get("chainId") or "").lower() != "solana":
                     continue
 
-                base = p.get("baseToken") or {}
-                mint = base.get("address") or ""
+                mint = ((p.get("baseToken") or {}).get("address") or "").strip()
                 if not mint or not is_valid_solana_pubkey(mint):
                     continue
-
                 if mint in monitored_tokens:
                     continue
 
-                # Skip if already held
-                held = await get_token_balance(client, owner, mint)
-                if held > 0:
+                if await get_token_balance(client, owner, mint) > 0:
                     continue
 
                 change1h = float((p.get("priceChange") or {}).get("h1", 0) or 0)
@@ -397,14 +339,10 @@ async def scan_existing_tokens(
         await asyncio.sleep(SCAN_INTERVAL_SEC)
 
 
-async def monitor_new_launches(
-    session: aiohttp.ClientSession,
-    client: AsyncClient,
-    keypair: Keypair,
-) -> None:
+async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClient, keypair: Keypair) -> None:
     owner = keypair.pubkey()
-
     backoff = 5
+
     while True:
         try:
             async with websockets.connect(
@@ -421,28 +359,20 @@ async def monitor_new_launches(
                 while True:
                     raw = await ws.recv()
                     data = json.loads(raw)
-
-                    mint = data.get("mint")
-                    if not mint:
-                        continue
-
-                    if not is_valid_solana_pubkey(mint):
+                    mint = (data.get("mint") or "").strip()
+                    if not mint or not is_valid_solana_pubkey(mint):
                         continue
 
                     if mint in monitored_tokens:
                         continue
 
-                    held = await get_token_balance(client, owner, mint)
-                    if held > 0:
+                    if await get_token_balance(client, owner, mint) > 0:
                         continue
 
-                    # Optional social constraint (based on event payload)
                     has_social = bool(data.get("twitter") or data.get("telegram") or data.get("website"))
-
                     if REQUIRE_SOCIALS and not has_social:
                         continue
 
-                    # Warmup to avoid Dex returning zeros right after mint
                     await asyncio.sleep(NEW_TOKEN_WARMUP_SEC)
 
                     tdata = await get_token_data_dexscreener(session, mint)
@@ -470,15 +400,13 @@ async def monitor_new_launches(
             backoff = min(backoff * 2, 60)
 
 
-# ===================== MAIN =====================
-
 async def main() -> None:
     keypair = load_keypair_from_b58(PRIVATE_KEY_B58)
     sol_client = AsyncClient(RPC_URL)
+
     global monitor_semaphore
     monitor_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MONITORS)
 
-    # Single shared HTTP session
     async with aiohttp.ClientSession() as session:
         try:
             asyncio.create_task(scan_existing_tokens(session, sol_client, keypair))
