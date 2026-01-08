@@ -1,20 +1,4 @@
 # pump_sniper.py
-# Pump Sniper (Solana) - PumpPortal WS + DexScreener filters + Jupiter Metis swap/v1
-#
-# Key changes (state correctness under real-world RPC conditions):
-#  1) Jupiter endpoints updated to /swap/v1/quote and /swap/v1/swap
-#  2) Guardrails:
-#       - EXPECTED_WALLET (optional): hard-stop if wrong keypair loaded
-#       - MIN_SOL_BALANCE_SOL: hard-stop if wallet SOL too low
-#  3) Reconciliation loop (SOURCE OF TRUTH = wallet balances):
-#       - Tracks buys/sells even when signature confirmation times out
-#       - Ensures positions/monitored reflect REAL on-chain state
-#  4) Pending maps:
-#       - pending_buys / pending_sells keyed by signature
-#
-# IMPORTANT:
-# - With SKIP_PREFLIGHT=True you will see more "sent but not confirmed" because
-#   you're bypassing simulation and relying on RPC status propagation. The recon loop fixes tracking.
 
 import os
 import json
@@ -24,7 +8,6 @@ import binascii
 import socket
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple, Set
-from urllib.parse import urlparse
 
 import requests
 import base58
@@ -38,10 +21,8 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
-
 # Force IPv4 DNS resolution (helps in some cloud runtimes)
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
-
 
 # ===================== UTIL =====================
 
@@ -71,7 +52,6 @@ def env_bool(name: str, default: bool) -> bool:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-
 def _strip_wrappers(s: str) -> str:
     s = s.strip()
     if s.upper().startswith("PRIVATE_KEY="):
@@ -80,19 +60,10 @@ def _strip_wrappers(s: str) -> str:
         s = s[1:-1].strip()
     return s
 
-
 def parse_keypair(private_key_env: str) -> Keypair:
-    """
-    Accepts common Solana secret formats:
-      1) base58 64-byte secret key (most common)
-      2) base58 32-byte seed -> Keypair.from_seed
-      3) JSON array of ints (len 64 or 32)
-      4) base64 of 64/32 bytes
-      5) hex string of 64/32 bytes
-    """
     pk = _strip_wrappers(private_key_env)
 
-    # 1) JSON array format
+    # JSON array
     try:
         arr = json.loads(pk)
         if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
@@ -104,7 +75,7 @@ def parse_keypair(private_key_env: str) -> Keypair:
     except Exception:
         pass
 
-    # 2) base58 decode
+    # base58
     try:
         raw = base58.b58decode(pk)
         if len(raw) == 64:
@@ -114,7 +85,7 @@ def parse_keypair(private_key_env: str) -> Keypair:
     except Exception:
         pass
 
-    # 3) base64 decode
+    # base64
     try:
         raw = base64.b64decode(pk, validate=True)
         if len(raw) == 64:
@@ -124,7 +95,7 @@ def parse_keypair(private_key_env: str) -> Keypair:
     except Exception:
         pass
 
-    # 4) hex decode
+    # hex
     try:
         hx = pk[2:] if pk.lower().startswith("0x") else pk
         raw = binascii.unhexlify(hx)
@@ -136,10 +107,9 @@ def parse_keypair(private_key_env: str) -> Keypair:
         pass
 
     raise RuntimeError(
-        "PRIVATE_KEY format invalid. Use: base58 64-byte secret key OR base58 32-byte seed OR JSON array (32/64) OR base64/hex (32/64). "
-        "Also ensure you did NOT paste the wallet address/public key."
+        "PRIVATE_KEY format invalid. Use base58 64-byte secret key or JSON/base64/hex (32/64). "
+        "Do NOT paste the public wallet address."
     )
-
 
 def is_valid_solana_mint(mint: str) -> bool:
     try:
@@ -148,18 +118,12 @@ def is_valid_solana_mint(mint: str) -> bool:
     except Exception:
         return False
 
-
 # ===================== HTTP =====================
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "pump-sniper/1.0"})
 
-def http_get_json(
-    url: str,
-    timeout: float = 10.0,
-    retries: int = 3,
-    headers: Optional[Dict[str, str]] = None
-) -> Dict[str, Any]:
+def http_get_json(url: str, timeout: float = 10.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     last = None
     for i in range(retries):
         try:
@@ -174,13 +138,7 @@ def http_get_json(
             time.sleep(0.4 * (2 ** i))
     raise RuntimeError(f"GET failed after {retries} retries: {url} err={last}")
 
-def http_post_json(
-    url: str,
-    payload: Dict[str, Any],
-    timeout: float = 15.0,
-    retries: int = 3,
-    headers: Optional[Dict[str, str]] = None
-) -> Dict[str, Any]:
+def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 15.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     last = None
     for i in range(retries):
         try:
@@ -195,7 +153,6 @@ def http_post_json(
             time.sleep(0.6 * (2 ** i))
     raise RuntimeError(f"POST failed after {retries} retries: {url} err={last}")
 
-
 # ===================== CONFIG =====================
 
 RPC_URL = env_str("RPC_URL")
@@ -203,9 +160,11 @@ WS_URL = os.getenv("WS_URL", "wss://pumpportal.fun/api/data")
 
 PRIVATE_KEY = env_str("PRIVATE_KEY")
 
-# Guardrails
 EXPECTED_WALLET = (os.getenv("EXPECTED_WALLET") or "").strip()
 MIN_SOL_BALANCE_SOL = env_float("MIN_SOL_BALANCE_SOL", 0.02)
+
+# Ignore dust. Raw token units (not decimals). Default 1 means any nonzero counts.
+MIN_TOKEN_BALANCE_RAW = env_int("MIN_TOKEN_BALANCE_RAW", 1)
 
 # Jupiter
 JUP_BASE_URL = os.getenv("JUP_BASE_URL", "https://api.jup.ag").strip().rstrip("/")
@@ -256,7 +215,6 @@ LOG_SKIPS = env_bool("LOG_SKIPS", False)
 SOL_MINT = "So11111111111111111111111111111111111111112"
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
-
 # ===================== GLOBALS =====================
 
 client = AsyncClient(RPC_URL)
@@ -265,14 +223,13 @@ WALLET_PUBKEY = wallet.pubkey()
 
 BUY_AMOUNT_LAMPORTS = int(BUY_SOL * 1e9)
 
-positions: Dict[str, float] = {}    # mint -> entry_price_usd
-monitored: Set[str] = set()         # mints currently monitored
+positions: Dict[str, float] = {}
+monitored: Set[str] = set()
 
-pending_buys: Dict[str, Dict[str, Any]] = {}   # sig -> {mint, sent_ts, entry_hint}
-pending_sells: Dict[str, Dict[str, Any]] = {}  # sig -> {mint, sent_ts}
+pending_buys: Dict[str, Dict[str, Any]] = {}
+pending_sells: Dict[str, Dict[str, Any]] = {}
 
 _last_buy_ts = 0.0
-
 
 # ===================== JUP THROTTLE =====================
 
@@ -287,14 +244,12 @@ async def jup_throttle() -> None:
             await asyncio.sleep(_JUP_NEXT_TS - now)
         _JUP_NEXT_TS = time.time() + 1.05
 
-
 def jup_headers() -> Dict[str, str]:
     return {
         "x-api-key": JUP_API_KEY,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-
 
 # ===================== DEXSCREENER =====================
 
@@ -334,7 +289,6 @@ def dexscreener_search(query: str, limit: int) -> List[Dict[str, Any]]:
     out = [p for p in pairs if p.get("chainId") == "solana"]
     return out[:limit]
 
-
 # ===================== BALANCES =====================
 
 async def get_sol_balance(pubkey: Pubkey) -> int:
@@ -342,6 +296,10 @@ async def get_sol_balance(pubkey: Pubkey) -> int:
     return int(resp.value)
 
 async def get_token_balance(mint: str) -> int:
+    """
+    SUM all token accounts for this mint.
+    This fixes false positives/negatives when the wallet has multiple accounts per mint.
+    """
     if not is_valid_solana_mint(mint):
         return 0
     try:
@@ -352,15 +310,23 @@ async def get_token_balance(mint: str) -> int:
         resp = await client.get_token_accounts_by_owner(WALLET_PUBKEY, opts)
         if not resp or not getattr(resp, "value", None):
             return 0
-        acct = resp.value[0].pubkey
-        bal = await client.get_token_account_balance(acct)
-        return int(bal.value.amount)  # type: ignore
+
+        total = 0
+        # For each token account, fetch balance and sum
+        for item in resp.value:
+            acct = item.pubkey
+            bal = await client.get_token_account_balance(acct)
+            total += int(bal.value.amount)  # type: ignore
+
+        return total
     except Exception as e:
         log(f"Balance error for {mint}: {e}")
         return 0
 
+def has_position_balance(raw_bal: int) -> bool:
+    return raw_bal >= int(MIN_TOKEN_BALANCE_RAW)
 
-# ===================== JUPITER (Metis swap/v1) =====================
+# ===================== JUPITER (swap/v1) =====================
 
 def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
     return (
@@ -373,9 +339,6 @@ def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> s
     )
 
 async def send_swap(action: str, mint: str, entry_hint: float = 0.0) -> Optional[str]:
-    """
-    Returns signature string if broadcast succeeded; on-chain landing is handled by confirm/reconcile.
-    """
     try:
         if action == "buy":
             input_mint = SOL_MINT
@@ -443,20 +406,13 @@ async def send_swap(action: str, mint: str, entry_hint: float = 0.0) -> Optional
             log(f"SELL sent: https://solscan.io/tx/{sig}")
 
         return sig
-
     except Exception as e:
         log(f"Swap error ({action}) mint={mint}: {e}")
         return None
 
-
 async def wait_confirm(sig: str) -> bool:
-    """
-    Best-effort confirmation. Not the source of truth.
-    Source of truth is reconcile_wallet_state().
-    """
     deadline = time.time() + CONFIRM_TIMEOUT_SEC
     seen_any_status = False
-
     while time.time() < deadline:
         try:
             st = await client.get_signature_statuses([sig], search_transaction_history=True)
@@ -474,43 +430,33 @@ async def wait_confirm(sig: str) -> bool:
         except Exception:
             pass
         await asyncio.sleep(CONFIRM_POLL_SEC)
-
     if not seen_any_status:
-        log(f"CONFIRM WARN: signature {sig} never showed up in status lookup (likely dropped or RPC lag).")
+        log(f"CONFIRM WARN: signature {sig} never showed up in status lookup (RPC lag or dropped).")
     return False
-
 
 # ===================== RECONCILIATION =====================
 
 async def reconcile_wallet_state() -> None:
-    """
-    SOURCE OF TRUTH = wallet balances.
-    This repairs state when confirmations time out but the swap actually landed.
-    """
     while True:
         try:
-            # Resolve pending buys -> if balance appears, record position + start monitoring
+            # Pending buys: if balance appears, create/repair position
             for sig, info in list(pending_buys.items()):
                 mint = info["mint"]
                 bal = await get_token_balance(mint)
-                if bal > 0:
+                if has_position_balance(bal):
                     if mint not in positions:
                         entry = float(info.get("entry_hint") or 0.0)
                         if entry <= 0:
                             td = dexscreener_token_data(mint)
                             entry = float(td.get("priceUsd") or 0.0)
-
                         positions[mint] = entry if entry > 0 else 0.0
                         monitored.add(mint)
-
                         if entry > 0 and len(positions) <= MAX_MONITORS:
                             asyncio.create_task(price_monitor(mint, entry))
-
-                        log(f"RECONCILE: BUY confirmed by balance mint={mint} bal={bal} -> tracking (entry={entry:.10f})")
-
+                        log(f"RECONCILE: BUY detected by balance mint={mint} bal={bal} -> tracking (entry={entry:.10f})")
                     pending_buys.pop(sig, None)
 
-            # Resolve pending sells -> if balance is zero, clear position
+            # Pending sells: if balance hits 0, clear
             for sig, info in list(pending_sells.items()):
                 mint = info["mint"]
                 bal = await get_token_balance(mint)
@@ -518,15 +464,14 @@ async def reconcile_wallet_state() -> None:
                     positions.pop(mint, None)
                     monitored.discard(mint)
                     pending_sells.pop(sig, None)
-                    log(f"RECONCILE: SELL confirmed by balance mint={mint} -> position cleared")
+                    log(f"RECONCILE: SELL detected by balance mint={mint} -> cleared")
 
-            # Expire very old pending entries to keep maps clean
+            # Expire stale pending (15 minutes)
             now = time.time()
             for sig, info in list(pending_buys.items()):
                 if now - float(info.get("sent_ts", now)) > 15 * 60:
                     log(f"RECONCILE: expiring stale pending buy sig={sig} mint={info.get('mint')}")
                     pending_buys.pop(sig, None)
-
             for sig, info in list(pending_sells.items()):
                 if now - float(info.get("sent_ts", now)) > 15 * 60:
                     log(f"RECONCILE: expiring stale pending sell sig={sig} mint={info.get('mint')}")
@@ -536,7 +481,6 @@ async def reconcile_wallet_state() -> None:
             log(f"Reconcile error: {e}")
 
         await asyncio.sleep(8)
-
 
 # ===================== SELL MONITOR =====================
 
@@ -553,14 +497,12 @@ async def price_monitor(mint: str, entry_price: float) -> None:
         if mult >= TAKE_PROFIT_X:
             log(f"TP hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
             await send_swap("sell", mint)
-            # state will be cleaned by reconcile when balance hits zero
             return
 
         if mult <= STOP_LOSS_X:
             log(f"SL hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
             await send_swap("sell", mint)
             return
-
 
 # ===================== RISK =====================
 
@@ -575,7 +517,6 @@ def can_buy_now() -> bool:
 def mark_bought() -> None:
     global _last_buy_ts
     _last_buy_ts = time.time()
-
 
 # ===================== EXISTING MOVERS =====================
 
@@ -648,7 +589,6 @@ async def scan_existing_tokens() -> None:
                 candidates += 1
                 log(f"EXISTING candidate {mint} | chg1h={change1h:.2f}% vol1h=${vol1h:.2f} liq=${liq:.2f} buys1h={buys1h} px=${px:.10f}")
 
-                # If we already track it, skip
                 if mint in monitored or mint in positions:
                     skipped_held += 1
                     continue
@@ -660,8 +600,9 @@ async def scan_existing_tokens() -> None:
                         skipped_cooldown += 1
                     continue
 
-                # If wallet already has it, track it (state fix for manual buys / prior runs)
-                if await get_token_balance(mint) > 0:
+                bal = await get_token_balance(mint)
+                if has_position_balance(bal):
+                    log(f"HOLDING detected mint={mint} raw_bal={bal} -> tracking as position (no buy)")
                     monitored.add(mint)
                     positions[mint] = px if px > 0 else 0.0
                     if px > 0 and len(positions) <= MAX_MONITORS:
@@ -673,15 +614,13 @@ async def scan_existing_tokens() -> None:
                 if not sig:
                     continue
 
-                # Optional confirm gate (NOT source of truth)
                 if CONFIRM_BEFORE_BUY:
                     ok = await wait_confirm(sig)
                     if not ok:
                         skipped_confirm += 1
-                        log(f"BUY NOT confirmed for {mint}: sig={sig} reason=timeout waiting confirmation (reconcile will detect if landed)")
+                        log(f"BUY NOT confirmed for {mint}: sig={sig} reason=timeout (reconcile will detect if landed)")
                         continue
 
-                # If confirmed quickly, add immediately (reconcile would also catch it)
                 entry = px
                 if entry <= 0:
                     td = dexscreener_token_data(mint)
@@ -690,7 +629,6 @@ async def scan_existing_tokens() -> None:
                 monitored.add(mint)
                 mark_bought()
                 buys += 1
-
                 if entry > 0:
                     positions[mint] = entry
                     if len(positions) <= MAX_MONITORS:
@@ -709,8 +647,7 @@ async def scan_existing_tokens() -> None:
 
         await asyncio.sleep(EXISTING_SCAN_EVERY_SEC)
 
-
-# ===================== NEW LAUNCHES (WS) =====================
+# ===================== NEW LAUNCHES =====================
 
 async def monitor_new_launches() -> None:
     backoff = 5
@@ -752,7 +689,9 @@ async def monitor_new_launches() -> None:
                     if not can_buy_now():
                         continue
 
-                    if await get_token_balance(mint) > 0:
+                    bal = await get_token_balance(mint)
+                    if has_position_balance(bal):
+                        log(f"HOLDING detected (new stream) mint={mint} raw_bal={bal} -> tracking as position (no buy)")
                         monitored.add(mint)
                         positions[mint] = px
                         if len(positions) <= MAX_MONITORS:
@@ -768,7 +707,7 @@ async def monitor_new_launches() -> None:
                     if CONFIRM_BEFORE_BUY:
                         ok = await wait_confirm(sig)
                         if not ok:
-                            log(f"NEW BUY NOT confirmed mint={mint} sig={sig} reason=timeout waiting confirmation (reconcile will detect if landed)")
+                            log(f"NEW BUY NOT confirmed mint={mint} sig={sig} reason=timeout (reconcile will detect if landed)")
                             continue
 
                     positions[mint] = px
@@ -786,14 +725,12 @@ async def monitor_new_launches() -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
-
 # ===================== HEARTBEAT =====================
 
 async def heartbeat() -> None:
     while True:
         await asyncio.sleep(60)
         log(f"Heartbeat: monitored={len(monitored)} open_positions={len(positions)} pending_buys={len(pending_buys)} pending_sells={len(pending_sells)}")
-
 
 # ===================== MAIN =====================
 
@@ -808,9 +745,9 @@ async def main() -> None:
     log(f"  NEW: warmup={NEW_WARMUP_SEC}s minVol1h={NEW_MIN_VOL_1H_USD} minLiq={NEW_MIN_LIQ_USD} minBuys1h={NEW_MIN_BUYS_1H} requireSocials={NEW_REQUIRE_SOCIALS}")
     log(f"  EXISTING: queries={EXISTING_QUERIES} limitPerQuery={EXISTING_LIMIT_PER_QUERY} scanEvery={EXISTING_SCAN_EVERY_SEC}s")
     log(f"           minChg1h={EXISTING_MIN_CHG_1H}% minVol1h={EXISTING_MIN_VOL_1H_USD} minLiq={EXISTING_MIN_LIQ_USD} minBuys1h={EXISTING_MIN_BUYS_1H}")
+    log(f"  LOG_SKIPS={LOG_SKIPS}")
     log(f"  RISK: MAX_BUYS_PER_SCAN={MAX_BUYS_PER_SCAN} BUY_COOLDOWN_SEC={BUY_COOLDOWN_SEC} MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}")
     log(f"  SELL: tp={TAKE_PROFIT_X}x sl={STOP_LOSS_X}x poll={PRICE_POLL_SEC}s maxMonitors={MAX_MONITORS}")
-    log(f"  LOG_SKIPS={LOG_SKIPS}")
 
     if EXPECTED_WALLET and str(WALLET_PUBKEY) != EXPECTED_WALLET:
         raise RuntimeError(
@@ -822,14 +759,13 @@ async def main() -> None:
     log(f"  SOL_BALANCE={bal_sol:.6f} SOL")
     if bal_sol < MIN_SOL_BALANCE_SOL:
         raise RuntimeError(
-            f"SOL balance too low for trading: {bal_sol:.6f} SOL. Need at least MIN_SOL_BALANCE_SOL={MIN_SOL_BALANCE_SOL:.6f} SOL."
+            f"SOL balance too low: {bal_sol:.6f} SOL. Need MIN_SOL_BALANCE_SOL={MIN_SOL_BALANCE_SOL:.6f} SOL."
         )
 
     asyncio.create_task(reconcile_wallet_state())
     asyncio.create_task(scan_existing_tokens())
     asyncio.create_task(heartbeat())
     await monitor_new_launches()
-
 
 if __name__ == "__main__":
     try:
