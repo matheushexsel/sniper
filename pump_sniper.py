@@ -21,7 +21,6 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
-# Force IPv4 DNS resolution (helps in some cloud runtimes)
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 # ===================== UTIL =====================
@@ -159,11 +158,9 @@ RPC_URL = env_str("RPC_URL")
 WS_URL = os.getenv("WS_URL", "wss://pumpportal.fun/api/data")
 
 PRIVATE_KEY = env_str("PRIVATE_KEY")
-
 EXPECTED_WALLET = (os.getenv("EXPECTED_WALLET") or "").strip()
-MIN_SOL_BALANCE_SOL = env_float("MIN_SOL_BALANCE_SOL", 0.02)
 
-# Ignore dust. Raw token units (not decimals). Default 1 means any nonzero counts.
+MIN_SOL_BALANCE_SOL = env_float("MIN_SOL_BALANCE_SOL", 0.02)
 MIN_TOKEN_BALANCE_RAW = env_int("MIN_TOKEN_BALANCE_RAW", 1)
 
 # Jupiter
@@ -194,12 +191,12 @@ EXISTING_MIN_VOL_1H_USD = env_float("EXISTING_MIN_VOL_1H_USD", 8000.0)
 EXISTING_MIN_LIQ_USD = env_float("EXISTING_MIN_LIQ_USD", 25000.0)
 EXISTING_MIN_BUYS_1H = env_int("EXISTING_MIN_BUYS_1H", 40)
 
-# Risk controls
+# Risk controls (ONLY counts bot_positions)
 MAX_BUYS_PER_SCAN = env_int("MAX_BUYS_PER_SCAN", 1)
 BUY_COOLDOWN_SEC = env_int("BUY_COOLDOWN_SEC", 20)
 MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 5)
 
-# Sell logic
+# Sell logic (ONLY for bot_positions)
 TAKE_PROFIT_X = env_float("TAKE_PROFIT_X", 1.6)
 STOP_LOSS_X = env_float("STOP_LOSS_X", 0.75)
 PRICE_POLL_SEC = env_int("PRICE_POLL_SEC", 5)
@@ -223,8 +220,12 @@ WALLET_PUBKEY = wallet.pubkey()
 
 BUY_AMOUNT_LAMPORTS = int(BUY_SOL * 1e9)
 
-positions: Dict[str, float] = {}
-monitored: Set[str] = set()
+# IMPORTANT:
+# - wallet_holdings = tokens wallet owns (for reporting only)
+# - bot_positions = positions bot is actively managing (TP/SL + risk limits)
+wallet_holdings: Dict[str, int] = {}     # mint -> raw balance
+bot_positions: Dict[str, float] = {}     # mint -> entry price (usd)
+monitored: Set[str] = set()              # mints that currently have an active monitor task
 
 pending_buys: Dict[str, Dict[str, Any]] = {}
 pending_sells: Dict[str, Dict[str, Any]] = {}
@@ -296,10 +297,6 @@ async def get_sol_balance(pubkey: Pubkey) -> int:
     return int(resp.value)
 
 async def get_token_balance(mint: str) -> int:
-    """
-    SUM all token accounts for this mint.
-    This fixes false positives/negatives when the wallet has multiple accounts per mint.
-    """
     if not is_valid_solana_mint(mint):
         return 0
     try:
@@ -312,12 +309,10 @@ async def get_token_balance(mint: str) -> int:
             return 0
 
         total = 0
-        # For each token account, fetch balance and sum
         for item in resp.value:
             acct = item.pubkey
             bal = await client.get_token_account_balance(acct)
             total += int(bal.value.amount)  # type: ignore
-
         return total
     except Exception as e:
         log(f"Balance error for {mint}: {e}")
@@ -355,12 +350,7 @@ async def send_swap(action: str, mint: str, entry_hint: float = 0.0) -> Optional
         quote_url = build_jupiter_quote_url(input_mint, output_mint, amount)
 
         await jup_throttle()
-        try:
-            quote = http_get_json(quote_url, timeout=12.0, retries=3, headers=jup_headers())
-        except Exception as e:
-            log(f"Swap error ({action}) mint={mint}: quote_error={e}")
-            return None
-
+        quote = http_get_json(quote_url, timeout=12.0, retries=3, headers=jup_headers())
         if isinstance(quote, dict) and "error" in quote:
             log(f"Swap error ({action}) mint={mint}: quote_error={quote.get('error')}")
             return None
@@ -374,17 +364,13 @@ async def send_swap(action: str, mint: str, entry_hint: float = 0.0) -> Optional
             swap_payload["computeUnitPriceMicroLamports"] = int(PRIORITY_FEE_MICRO_LAMPORTS)
 
         await jup_throttle()
-        try:
-            swap = http_post_json(
-                f"{JUP_BASE_URL}/swap/v1/swap",
-                swap_payload,
-                timeout=20.0,
-                retries=3,
-                headers=jup_headers(),
-            )
-        except Exception as e:
-            log(f"Swap error ({action}) mint={mint}: swap_error={e}")
-            return None
+        swap = http_post_json(
+            f"{JUP_BASE_URL}/swap/v1/swap",
+            swap_payload,
+            timeout=20.0,
+            retries=3,
+            headers=jup_headers(),
+        )
 
         tx_b64 = swap.get("swapTransaction") if isinstance(swap, dict) else None
         if not tx_b64:
@@ -439,29 +425,31 @@ async def wait_confirm(sig: str) -> bool:
 async def reconcile_wallet_state() -> None:
     while True:
         try:
-            # Pending buys: if balance appears, create/repair position
+            # Pending buys -> promote to bot_positions when balance appears
             for sig, info in list(pending_buys.items()):
                 mint = info["mint"]
                 bal = await get_token_balance(mint)
                 if has_position_balance(bal):
-                    if mint not in positions:
+                    wallet_holdings[mint] = bal
+                    if mint not in bot_positions:
                         entry = float(info.get("entry_hint") or 0.0)
                         if entry <= 0:
                             td = dexscreener_token_data(mint)
                             entry = float(td.get("priceUsd") or 0.0)
-                        positions[mint] = entry if entry > 0 else 0.0
-                        monitored.add(mint)
-                        if entry > 0 and len(positions) <= MAX_MONITORS:
+                        bot_positions[mint] = entry if entry > 0 else 0.0
+                        log(f"RECONCILE: BUY detected by balance mint={mint} bal={bal} -> BOT position (entry={entry:.10f})")
+                        if mint not in monitored and entry > 0 and len(monitored) < MAX_MONITORS:
+                            monitored.add(mint)
                             asyncio.create_task(price_monitor(mint, entry))
-                        log(f"RECONCILE: BUY detected by balance mint={mint} bal={bal} -> tracking (entry={entry:.10f})")
                     pending_buys.pop(sig, None)
 
-            # Pending sells: if balance hits 0, clear
+            # Pending sells -> clear bot position when balance hits 0
             for sig, info in list(pending_sells.items()):
                 mint = info["mint"]
                 bal = await get_token_balance(mint)
                 if bal == 0:
-                    positions.pop(mint, None)
+                    wallet_holdings.pop(mint, None)
+                    bot_positions.pop(mint, None)
                     monitored.discard(mint)
                     pending_sells.pop(sig, None)
                     log(f"RECONCILE: SELL detected by balance mint={mint} -> cleared")
@@ -482,33 +470,42 @@ async def reconcile_wallet_state() -> None:
 
         await asyncio.sleep(8)
 
-# ===================== SELL MONITOR =====================
+# ===================== SELL MONITOR (BOT POSITIONS ONLY) =====================
 
 async def price_monitor(mint: str, entry_price: float) -> None:
-    while True:
-        await asyncio.sleep(PRICE_POLL_SEC)
-        data = dexscreener_token_data(mint)
-        px = float(data.get("priceUsd") or 0.0)
-        if px <= 0:
-            continue
+    try:
+        while True:
+            await asyncio.sleep(PRICE_POLL_SEC)
 
-        mult = px / entry_price if entry_price > 0 else 0.0
+            # If bot no longer tracks this mint, stop monitoring
+            if mint not in bot_positions:
+                monitored.discard(mint)
+                return
 
-        if mult >= TAKE_PROFIT_X:
-            log(f"TP hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
-            await send_swap("sell", mint)
-            return
+            data = dexscreener_token_data(mint)
+            px = float(data.get("priceUsd") or 0.0)
+            if px <= 0:
+                continue
 
-        if mult <= STOP_LOSS_X:
-            log(f"SL hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
-            await send_swap("sell", mint)
-            return
+            mult = px / entry_price if entry_price > 0 else 0.0
 
-# ===================== RISK =====================
+            if mult >= TAKE_PROFIT_X:
+                log(f"TP hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
+                await send_swap("sell", mint)
+                return
+
+            if mult <= STOP_LOSS_X:
+                log(f"SL hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
+                await send_swap("sell", mint)
+                return
+    finally:
+        monitored.discard(mint)
+
+# ===================== RISK (BOT POSITIONS ONLY) =====================
 
 def can_buy_now() -> bool:
     global _last_buy_ts
-    if len(positions) >= MAX_OPEN_POSITIONS:
+    if len(bot_positions) >= MAX_OPEN_POSITIONS:
         return False
     if (time.time() - _last_buy_ts) < BUY_COOLDOWN_SEC:
         return False
@@ -532,7 +529,8 @@ async def scan_existing_tokens() -> None:
 
         skipped_chain = 0
         skipped_invalid = 0
-        skipped_held = 0
+        skipped_held_wallet = 0
+        skipped_already_bot = 0
         skipped_filters = 0
         skipped_confirm = 0
         skipped_cooldown = 0
@@ -589,25 +587,24 @@ async def scan_existing_tokens() -> None:
                 candidates += 1
                 log(f"EXISTING candidate {mint} | chg1h={change1h:.2f}% vol1h=${vol1h:.2f} liq=${liq:.2f} buys1h={buys1h} px=${px:.10f}")
 
-                if mint in monitored or mint in positions:
-                    skipped_held += 1
+                # If bot already manages it, skip
+                if mint in bot_positions:
+                    skipped_already_bot += 1
+                    continue
+
+                # If wallet already holds it, record for reporting but don't block buys for other tokens
+                bal = await get_token_balance(mint)
+                if has_position_balance(bal):
+                    wallet_holdings[mint] = bal
+                    log(f"HOLDING detected mint={mint} raw_bal={bal} -> wallet_holdings only (no bot slot consumed)")
+                    skipped_held_wallet += 1
                     continue
 
                 if not can_buy_now():
-                    if len(positions) >= MAX_OPEN_POSITIONS:
+                    if len(bot_positions) >= MAX_OPEN_POSITIONS:
                         skipped_maxpos += 1
                     else:
                         skipped_cooldown += 1
-                    continue
-
-                bal = await get_token_balance(mint)
-                if has_position_balance(bal):
-                    log(f"HOLDING detected mint={mint} raw_bal={bal} -> tracking as position (no buy)")
-                    monitored.add(mint)
-                    positions[mint] = px if px > 0 else 0.0
-                    if px > 0 and len(positions) <= MAX_MONITORS:
-                        asyncio.create_task(price_monitor(mint, px))
-                    skipped_held += 1
                     continue
 
                 sig = await send_swap("buy", mint, entry_hint=px)
@@ -626,13 +623,12 @@ async def scan_existing_tokens() -> None:
                     td = dexscreener_token_data(mint)
                     entry = float(td.get("priceUsd") or 0.0)
 
-                monitored.add(mint)
                 mark_bought()
                 buys += 1
-                if entry > 0:
-                    positions[mint] = entry
-                    if len(positions) <= MAX_MONITORS:
-                        asyncio.create_task(price_monitor(mint, entry))
+                bot_positions[mint] = entry if entry > 0 else 0.0
+                if mint not in monitored and entry > 0 and len(monitored) < MAX_MONITORS:
+                    monitored.add(mint)
+                    asyncio.create_task(price_monitor(mint, entry))
 
         except Exception as e:
             log(f"ExistingScan error: {e}")
@@ -640,8 +636,9 @@ async def scan_existing_tokens() -> None:
         log(
             "ExistingScan "
             f"cycle={cycle} scanned={scanned} candidates={candidates} buys={buys} "
-            f"skipped(chain={skipped_chain}, invalid={skipped_invalid}, held={skipped_held}, "
-            f"filters={skipped_filters}, confirm={skipped_confirm}, cooldown={skipped_cooldown}, maxpos={skipped_maxpos}) "
+            f"skipped(chain={skipped_chain}, invalid={skipped_invalid}, held_wallet={skipped_held_wallet}, "
+            f"already_bot={skipped_already_bot}, filters={skipped_filters}, confirm={skipped_confirm}, "
+            f"cooldown={skipped_cooldown}, maxpos={skipped_maxpos}) "
             f"thresholds(chg1h>={EXISTING_MIN_CHG_1H}, vol1h>={EXISTING_MIN_VOL_1H_USD}, liq>={EXISTING_MIN_LIQ_USD}, buys1h>={EXISTING_MIN_BUYS_1H})"
         )
 
@@ -684,18 +681,14 @@ async def monitor_new_launches() -> None:
                     if vol1h < NEW_MIN_VOL_1H_USD or liq < NEW_MIN_LIQ_USD or buys1h < NEW_MIN_BUYS_1H or px <= 0:
                         continue
 
-                    if mint in monitored or mint in positions:
+                    if mint in bot_positions:
                         continue
                     if not can_buy_now():
                         continue
 
                     bal = await get_token_balance(mint)
                     if has_position_balance(bal):
-                        log(f"HOLDING detected (new stream) mint={mint} raw_bal={bal} -> tracking as position (no buy)")
-                        monitored.add(mint)
-                        positions[mint] = px
-                        if len(positions) <= MAX_MONITORS:
-                            asyncio.create_task(price_monitor(mint, px))
+                        wallet_holdings[mint] = bal
                         continue
 
                     log(f"NEW candidate {mint} | vol1h=${vol1h:.2f} liq=${liq:.2f} buys1h={buys1h} px=${px:.10f} socials={socials_ok}")
@@ -710,10 +703,10 @@ async def monitor_new_launches() -> None:
                             log(f"NEW BUY NOT confirmed mint={mint} sig={sig} reason=timeout (reconcile will detect if landed)")
                             continue
 
-                    positions[mint] = px
-                    monitored.add(mint)
                     mark_bought()
-                    if len(positions) <= MAX_MONITORS:
+                    bot_positions[mint] = px
+                    if mint not in monitored and len(monitored) < MAX_MONITORS:
+                        monitored.add(mint)
                         asyncio.create_task(price_monitor(mint, px))
 
         except websockets.exceptions.ConnectionClosedError as e:
@@ -730,7 +723,10 @@ async def monitor_new_launches() -> None:
 async def heartbeat() -> None:
     while True:
         await asyncio.sleep(60)
-        log(f"Heartbeat: monitored={len(monitored)} open_positions={len(positions)} pending_buys={len(pending_buys)} pending_sells={len(pending_sells)}")
+        log(
+            f"Heartbeat: bot_positions={len(bot_positions)} monitored={len(monitored)} "
+            f"wallet_holdings_seen={len(wallet_holdings)} pending_buys={len(pending_buys)} pending_sells={len(pending_sells)}"
+        )
 
 # ===================== MAIN =====================
 
