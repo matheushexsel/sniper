@@ -3,6 +3,7 @@ import json
 import os
 import time
 import base64
+import binascii
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import base58
@@ -44,30 +45,79 @@ def env_bool(name: str, default: bool) -> bool:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
+
+def _strip_wrappers(s: str) -> str:
+    s = s.strip()
+    # Remove accidental "PRIVATE_KEY=" prefix if user pasted raw line
+    if s.upper().startswith("PRIVATE_KEY="):
+        s = s.split("=", 1)[1].strip()
+    # Remove surrounding quotes
+    if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in ("'", '"')):
+        s = s[1:-1].strip()
+    return s
+
+
 def parse_keypair(private_key_env: str) -> Keypair:
     """
-    Accepts:
-      - base58 secret key (typical Phantom export)
-      - JSON array string of ints (some exports)
+    Accepts common Solana secret formats:
+      1) base58 64-byte secret key (most common)
+      2) base58 32-byte seed (also common) -> Keypair.from_seed
+      3) JSON array of ints (len 64 or 32)
+      4) base64 of 64/32 bytes
+      5) hex string of 64/32 bytes
     """
-    pk = private_key_env.strip()
-    # Try base58 first
-    try:
-        raw = base58.b58decode(pk)
-        return Keypair.from_bytes(raw)
-    except Exception:
-        pass
+    pk = _strip_wrappers(private_key_env)
 
-    # Try JSON array
+    # 1) JSON array format
     try:
         arr = json.loads(pk)
         if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
             raw = bytes(arr)
-            return Keypair.from_bytes(raw)
+            if len(raw) == 64:
+                return Keypair.from_bytes(raw)
+            if len(raw) == 32:
+                return Keypair.from_seed(raw)
     except Exception:
         pass
 
-    raise RuntimeError("PRIVATE_KEY must be base58 secret key OR JSON array of ints")
+    # 2) base58 decode
+    try:
+        raw = base58.b58decode(pk)
+        if len(raw) == 64:
+            return Keypair.from_bytes(raw)
+        if len(raw) == 32:
+            return Keypair.from_seed(raw)
+    except Exception:
+        pass
+
+    # 3) base64 decode (often ends with '=')
+    try:
+        raw = base64.b64decode(pk, validate=True)
+        if len(raw) == 64:
+            return Keypair.from_bytes(raw)
+        if len(raw) == 32:
+            return Keypair.from_seed(raw)
+    except Exception:
+        pass
+
+    # 4) hex decode
+    try:
+        # allow "0x" prefix
+        hx = pk[2:] if pk.lower().startswith("0x") else pk
+        raw = binascii.unhexlify(hx)
+        if len(raw) == 64:
+            return Keypair.from_bytes(raw)
+        if len(raw) == 32:
+            return Keypair.from_seed(raw)
+    except Exception:
+        pass
+
+    # If user mistakenly pasted a public key (wallet address), it will decode base58 to 32 bytes,
+    # but it's NOT a seed. There's no reliable way to detect that, so we fail hard.
+    raise RuntimeError(
+        "PRIVATE_KEY format invalid. Use: base58 64-byte secret key OR base58 32-byte seed OR JSON array (32/64) OR base64/hex (32/64). "
+        "Also ensure you did NOT paste the wallet address/public key."
+    )
 
 
 def http_get_json(url: str, timeout: float = 8.0, retries: int = 3) -> Dict[str, Any]:
@@ -115,7 +165,7 @@ SLIPPAGE_BPS = env_int("SLIPPAGE_BPS", 150)  # 1.5%
 PRIORITY_FEE_MICRO_LAMPORTS = env_int("PRIORITY_FEE_MICRO_LAMPORTS", 8000)  # 0 = none
 SKIP_PREFLIGHT = env_bool("SKIP_PREFLIGHT", False)
 
-# New launches filters (use 1h metrics from Dexscreener after warmup)
+# New launches filters
 NEW_WARMUP_SEC = env_int("NEW_WARMUP_SEC", 75)
 NEW_MIN_VOL_1H_USD = env_float("NEW_MIN_VOL_1H_USD", 500.0)
 NEW_MIN_LIQ_USD = env_float("NEW_MIN_LIQ_USD", 12000.0)
@@ -137,8 +187,8 @@ BUY_COOLDOWN_SEC = env_int("BUY_COOLDOWN_SEC", 20)
 MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 5)
 
 # Sell logic
-TAKE_PROFIT_X = env_float("TAKE_PROFIT_X", 1.6)  # 60% gain
-STOP_LOSS_X = env_float("STOP_LOSS_X", 0.75)     # -25%
+TAKE_PROFIT_X = env_float("TAKE_PROFIT_X", 1.6)
+STOP_LOSS_X = env_float("STOP_LOSS_X", 0.75)
 PRICE_POLL_SEC = env_int("PRICE_POLL_SEC", 5)
 MAX_MONITORS = env_int("MAX_MONITORS", 20)
 
@@ -161,20 +211,14 @@ WALLET_PUBKEY = wallet.pubkey()
 
 BUY_AMOUNT_LAMPORTS = int(BUY_SOL * 1e9)
 
-# Track positions: mint -> entry_price_usd
 positions: Dict[str, float] = {}
-# Track held/monitored tokens to avoid repeats
 monitored: Set[str] = set()
-
 _last_buy_ts = 0.0
 
 
 # ===================== DEXSCREENER DATA =====================
 
 def dexscreener_token_data(mint: str) -> Dict[str, Any]:
-    """
-    Returns best available SOLANA pair info for this token mint.
-    """
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
     data = http_get_json(url)
     pairs = data.get("pairs") or []
@@ -182,7 +226,6 @@ def dexscreener_token_data(mint: str) -> Dict[str, Any]:
     for p in pairs:
         if p.get("chainId") != "solana":
             continue
-        # Prefer pair with highest liquidity
         liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
         if best is None or liq > float((best.get("liquidity") or {}).get("usd") or 0.0):
             best = p
@@ -208,7 +251,6 @@ def dexscreener_search(query: str, limit: int) -> List[Dict[str, Any]]:
     url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
     data = http_get_json(url)
     pairs = data.get("pairs") or []
-    # Keep only solana pairs
     out = [p for p in pairs if p.get("chainId") == "solana"]
     return out[:limit]
 
@@ -216,10 +258,6 @@ def dexscreener_search(query: str, limit: int) -> List[Dict[str, Any]]:
 # ===================== BALANCE =====================
 
 async def get_token_balance(mint: str) -> int:
-    """
-    Returns raw token amount for first token account found.
-    If RPC rejects params (seen sometimes), return 0 and log once.
-    """
     if not is_valid_solana_mint(mint):
         return 0
     try:
@@ -235,7 +273,6 @@ async def get_token_balance(mint: str) -> int:
         amt = int(bal.value.amount)  # type: ignore
         return amt
     except Exception as e:
-        # This is where people see InvalidParamsMessage weirdness.
         if "InvalidParams" in str(type(e)) or "InvalidParamsMessage" in str(type(e)):
             log(f"Balance RPC returned non-standard response for {mint}: {type(e)}")
             return 0
@@ -255,9 +292,6 @@ def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> s
     )
 
 async def send_swap(action: str, mint: str) -> Optional[str]:
-    """
-    Returns tx signature string if sent, else None.
-    """
     try:
         if action == "buy":
             input_mint = SOL_MINT
@@ -303,9 +337,6 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
             return None
 
         raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
-
-        # Correct solders signing: create a NEW VersionedTransaction with keypairs.
-        # This avoids MessageV0.serialize() and avoids VersionedTransaction.sign() (which doesn't exist in solders).
         signed_tx = VersionedTransaction(raw_tx.message, [wallet])
 
         opts = TxOpts(skip_preflight=SKIP_PREFLIGHT, preflight_commitment="processed")
@@ -320,25 +351,19 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
 
 
 async def wait_confirm(sig: str) -> bool:
-    """
-    Confirm by polling getSignatureStatuses. If it times out, return False.
-    """
     deadline = time.time() + CONFIRM_TIMEOUT_SEC
     while time.time() < deadline:
         try:
             st = await client.get_signature_statuses([sig], search_transaction_history=True)
             v = st.value[0] if st and getattr(st, "value", None) else None
             if v is not None:
-                # If there's an error field, treat as failed
                 if getattr(v, "err", None):
                     return False
-                # Confirmation: any status is fine, but prefer confirmation_status if present
                 cs = getattr(v, "confirmation_status", None)
                 if cs in ("confirmed", "finalized"):
                     return True
-                # Sometimes only confirmations count exists
                 confs = getattr(v, "confirmations", None)
-                if confs is None:  # finalized
+                if confs is None:
                     return True
         except Exception:
             pass
@@ -421,12 +446,10 @@ async def scan_existing_tokens() -> None:
                         skipped_invalid += 1
                         continue
 
-                    # de-dupe
                     if mint in seen_pairs:
                         continue
                     seen_pairs[mint] = p
 
-            # Score + sort by 1h change desc
             ranked: List[Tuple[float, Dict[str, Any]]] = []
             for mint, p in seen_pairs.items():
                 change1h = float((p.get("priceChange") or {}).get("h1") or 0.0)
@@ -483,26 +506,19 @@ async def scan_existing_tokens() -> None:
                         log(f"BUY NOT confirmed for {mint}: sig={sig} reason=timeout waiting confirmation")
                         continue
 
-                # Set entry from dexscreener pair price; if 0, refetch token endpoint once
                 entry = px
                 if entry <= 0:
                     td = dexscreener_token_data(mint)
                     entry = float(td.get("priceUsd") or 0.0)
 
-                if entry <= 0:
-                    # can't monitor without entry price
-                    monitored.add(mint)
-                    mark_bought()
-                    buys += 1
-                    continue
-
-                positions[mint] = entry
                 monitored.add(mint)
                 mark_bought()
                 buys += 1
 
-                if len(positions) <= MAX_MONITORS:
-                    asyncio.create_task(price_monitor(mint, entry))
+                if entry > 0:
+                    positions[mint] = entry
+                    if len(positions) <= MAX_MONITORS:
+                        asyncio.create_task(price_monitor(mint, entry))
 
         except Exception as e:
             log(f"ExistingScan error: {e}")
@@ -540,17 +556,12 @@ async def monitor_new_launches() -> None:
                     if not mint:
                         continue
                     if not is_valid_solana_mint(mint):
-                        if LOG_SKIPS:
-                            log(f"NEW skip invalid mint={mint}")
                         continue
 
                     socials_ok = bool(data.get("twitter") or data.get("telegram") or data.get("website"))
                     if NEW_REQUIRE_SOCIALS and not socials_ok:
-                        if LOG_SKIPS:
-                            log(f"NEW skip no socials mint={mint}")
                         continue
 
-                    # Avoid spamming buys on fresh mints with no data
                     await asyncio.sleep(NEW_WARMUP_SEC)
 
                     td = dexscreener_token_data(mint)
@@ -560,8 +571,6 @@ async def monitor_new_launches() -> None:
                     px = float(td.get("priceUsd") or 0.0)
 
                     if vol1h < NEW_MIN_VOL_1H_USD or liq < NEW_MIN_LIQ_USD or buys1h < NEW_MIN_BUYS_1H or px <= 0:
-                        if LOG_SKIPS:
-                            log(f"NEW skip mint={mint} vol1h=${vol1h:.2f} liq=${liq:.2f} buys1h={buys1h} px=${px:.10f}")
                         continue
 
                     if mint in monitored or mint in positions:
