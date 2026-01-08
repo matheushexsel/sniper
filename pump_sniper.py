@@ -4,7 +4,7 @@ import json
 import base64
 import random
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 import websockets
@@ -45,6 +45,9 @@ STOP_LOSS_X = float(os.environ.get("STOP_LOSS_X", "0.5"))
 PRICE_POLL_SEC = int(os.environ.get("PRICE_POLL_SEC", "5"))
 
 MAX_CONCURRENT_MONITORS = int(os.environ.get("MAX_CONCURRENT_MONITORS", "25"))
+
+# Optional: reduce log spam
+LOG_SKIPS = os.environ.get("LOG_SKIPS", "false").lower() == "true"
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -103,6 +106,7 @@ async def fetch_json(
     for attempt in range(retries):
         try:
             timeout = aiohttp.ClientTimeout(total=timeout_sec)
+
             if method.upper() == "GET":
                 async with session.get(url, headers=headers, timeout=timeout) as r:
                     text = await r.text()
@@ -137,7 +141,6 @@ async def fetch_json(
 
 
 async def get_token_data_dexscreener(session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
-    # Solana-scoped endpoint prevents non-solana junk
     url = f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
     try:
         pools = await fetch_json(session, url, method="GET", headers={"Accept": "application/json"}, retries=2)
@@ -170,13 +173,12 @@ async def search_pairs_dexscreener(session: aiohttp.ClientSession, q: str, limit
 async def get_token_balance(client: AsyncClient, owner: Pubkey, mint: str) -> int:
     if not is_valid_solana_pubkey(mint):
         return 0
-
     try:
         opts = TokenAccountOpts(mint=Pubkey.from_string(mint), program_id=TOKEN_PROGRAM_ID)
         resp = await client.get_token_accounts_by_owner(owner, opts)
 
         if not hasattr(resp, "value"):
-            log(f"Balance RPC returned non-standard response for {mint}: {type(resp)}")
+            # Helius sometimes returns an error-shaped object for invalid params
             return 0
 
         if not resp.value:
@@ -186,13 +188,11 @@ async def get_token_balance(client: AsyncClient, owner: Pubkey, mint: str) -> in
         bal = await client.get_token_account_balance(ata)
 
         if not hasattr(bal, "value") or not hasattr(bal.value, "amount"):
-            log(f"Balance amount missing for {mint}: {bal}")
             return 0
 
         return int(bal.value.amount)
 
-    except Exception as e:
-        log(f"Balance error for {mint}: {e}")
+    except Exception:
         return 0
 
 
@@ -236,7 +236,8 @@ async def send_swap(
         else:
             bal = await get_token_balance(client, owner, mint)
             if bal <= 0:
-                log(f"No balance to sell for {mint}")
+                if LOG_SKIPS:
+                    log(f"Sell skipped: no balance for {mint}")
                 return None
             input_mint, output_mint, amount = mint, SOL_MINT, bal
 
@@ -254,7 +255,6 @@ async def send_swap(
         tx_bytes = base64.b64decode(swap_tx_b64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # FIX: MessageV0 has no serialize() here; use bytes(message)
         msg_bytes = bytes(tx.message)
         sig = keypair.sign_message(msg_bytes)
         signed = VersionedTransaction(tx.message, [sig])
@@ -277,6 +277,12 @@ async def send_swap(
 
 monitored_tokens: Dict[str, float] = {}
 monitor_semaphore: asyncio.Semaphore
+
+
+async def heartbeat_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        log(f"Heartbeat: monitored={len(monitored_tokens)} | scanEvery={SCAN_INTERVAL_SEC}s | warmup={NEW_TOKEN_WARMUP_SEC}s")
 
 
 async def price_monitor(session: aiohttp.ClientSession, client: AsyncClient, keypair: Keypair, mint: str, entry_price: float) -> None:
@@ -310,20 +316,38 @@ async def price_monitor(session: aiohttp.ClientSession, client: AsyncClient, key
 
 async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClient, keypair: Keypair) -> None:
     owner = keypair.pubkey()
+    cycle = 0
+
     while True:
+        cycle += 1
+        scanned = 0
+        candidates = 0
+        skipped_chain = 0
+        skipped_invalid = 0
+        skipped_held = 0
+        skipped_filters = 0
+
         try:
-            pairs = await search_pairs_dexscreener(session, q="SOL", limit=150)
+            pairs = await search_pairs_dexscreener(session, q="SOL", limit=200)
+
             for p in pairs:
+                scanned += 1
+
                 if (p.get("chainId") or "").lower() != "solana":
+                    skipped_chain += 1
                     continue
 
                 mint = ((p.get("baseToken") or {}).get("address") or "").strip()
                 if not mint or not is_valid_solana_pubkey(mint):
+                    skipped_invalid += 1
                     continue
+
                 if mint in monitored_tokens:
+                    skipped_held += 1
                     continue
 
                 if await get_token_balance(client, owner, mint) > 0:
+                    skipped_held += 1
                     continue
 
                 change1h = float((p.get("priceChange") or {}).get("h1", 0) or 0)
@@ -331,12 +355,28 @@ async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClie
                 liq = float((p.get("liquidity") or {}).get("usd", 0) or 0)
                 px = float(p.get("priceUsd", 0) or 0)
 
-                if change1h >= MIN_PRICE_CHANGE_1H and vol1h >= MIN_VOLUME_USD_EXISTING and liq >= MIN_LIQUIDITY_USD_EXISTING:
-                    log(f"EXISTING snipe candidate {mint} | chg1h={change1h:.2f}% vol1h=${vol1h:.2f} liq=${liq:.2f}")
+                if (
+                    change1h >= MIN_PRICE_CHANGE_1H
+                    and vol1h >= MIN_VOLUME_USD_EXISTING
+                    and liq >= MIN_LIQUIDITY_USD_EXISTING
+                    and px > 0
+                ):
+                    candidates += 1
+                    log(f"EXISTING candidate {mint} | chg1h={change1h:.2f}% vol1h=${vol1h:.2f} liq=${liq:.2f} px=${px:.8f}")
                     sig = await send_swap(session, client, keypair, "buy", mint, lamports(BUY_SOL))
-                    if sig and px > 0:
+                    if sig:
                         monitored_tokens[mint] = px
                         asyncio.create_task(price_monitor(session, client, keypair, mint, px))
+                else:
+                    skipped_filters += 1
+                    if LOG_SKIPS:
+                        log(f"EXISTING skipped {mint} | chg1h={change1h:.2f}% vol1h=${vol1h:.2f} liq=${liq:.2f} px={px}")
+
+            log(
+                f"ExistingScan cycle={cycle} scanned={scanned} candidates={candidates} "
+                f"skipped(chain={skipped_chain}, invalid={skipped_invalid}, held={skipped_held}, filters={skipped_filters}) "
+                f"thresholds(chg1h>={MIN_PRICE_CHANGE_1H}, vol1h>={MIN_VOLUME_USD_EXISTING}, liq>={MIN_LIQUIDITY_USD_EXISTING})"
+            )
 
         except Exception as e:
             log(f"Existing scan loop error: {e}")
@@ -368,7 +408,6 @@ async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClie
                     if not mint or not is_valid_solana_pubkey(mint):
                         continue
 
-                    # Reduce noisy RPC calls: do warmup + Dex gating first, then balance check.
                     has_social = bool(data.get("twitter") or data.get("telegram") or data.get("website"))
                     if REQUIRE_SOCIALS and not has_social:
                         continue
@@ -381,19 +420,25 @@ async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClie
                     liq = float(tdata.get("liquidity_usd", 0) or 0)
                     buys = int(tdata.get("buys_h1", 0) or 0)
 
-                    if vol < MIN_VOLUME_USD_NEW or liq < MIN_LIQUIDITY_USD_NEW or buys < MIN_BUYS_H1_NEW or px <= 0:
+                    if px <= 0:
+                        if LOG_SKIPS:
+                            log(f"NEW skipped {mint}: no price yet")
+                        continue
+
+                    if vol < MIN_VOLUME_USD_NEW or liq < MIN_LIQUIDITY_USD_NEW or buys < MIN_BUYS_H1_NEW:
+                        if LOG_SKIPS:
+                            log(f"NEW skipped {mint} | vol1h=${vol:.2f} liq=${liq:.2f} buys1h={buys}")
                         continue
 
                     if mint in monitored_tokens:
                         continue
 
-                    # Only now check if we already hold it
                     if await get_token_balance(client, owner, mint) > 0:
                         continue
 
-                    log(f"NEW snipe candidate {mint} | vol1h=${vol:.2f} liq=${liq:.2f} buys1h={buys} social={has_social}")
+                    log(f"NEW candidate {mint} | vol1h=${vol:.2f} liq=${liq:.2f} buys1h={buys} social={has_social}")
                     sig = await send_swap(session, client, keypair, "buy", mint, lamports(BUY_SOL))
-                    if sig and px > 0:
+                    if sig:
                         monitored_tokens[mint] = px
                         asyncio.create_task(price_monitor(session, client, keypair, mint, px))
 
@@ -414,8 +459,18 @@ async def main() -> None:
     global monitor_semaphore
     monitor_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MONITORS)
 
+    # Print active config at boot so you can confirm Railway vars are actually loaded
+    log("BOOT CONFIG:")
+    log(f"  WS_URL={WS_URL}")
+    log(f"  BUY_SOL={BUY_SOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIORITY_FEE_MICRO_LAMPORTS={PRIORITY_FEE_MICRO_LAMPORTS} SKIP_PREFLIGHT={SKIP_PREFLIGHT}")
+    log(f"  NEW: warmup={NEW_TOKEN_WARMUP_SEC}s minVol={MIN_VOLUME_USD_NEW} minLiq={MIN_LIQUIDITY_USD_NEW} minBuys={MIN_BUYS_H1_NEW} requireSocials={REQUIRE_SOCIALS}")
+    log(f"  EXISTING: scanEvery={SCAN_INTERVAL_SEC}s minChg1h={MIN_PRICE_CHANGE_1H}% minVol1h={MIN_VOLUME_USD_EXISTING} minLiq={MIN_LIQUIDITY_USD_EXISTING}")
+    log(f"  SELL: tp={PROFIT_TARGET_X}x sl={STOP_LOSS_X}x poll={PRICE_POLL_SEC}s maxMonitors={MAX_CONCURRENT_MONITORS}")
+    log(f"  LOG_SKIPS={LOG_SKIPS}")
+
     async with aiohttp.ClientSession() as session:
         try:
+            asyncio.create_task(heartbeat_loop())
             asyncio.create_task(scan_existing_tokens(session, sol_client, keypair))
             await monitor_new_launches(session, sol_client, keypair)
         finally:
