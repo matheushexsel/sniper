@@ -48,11 +48,7 @@ MAX_CONCURRENT_MONITORS = int(os.environ.get("MAX_CONCURRENT_MONITORS", "25"))
 
 LOG_SKIPS = os.environ.get("LOG_SKIPS", "false").lower() == "true"
 
-# Existing discovery: multi-query to get real Solana coverage
-EXISTING_QUERIES = os.environ.get(
-    "EXISTING_QUERIES",
-    "raydium,solana,pump,SOL/USDC"
-)
+EXISTING_QUERIES = os.environ.get("EXISTING_QUERIES", "raydium,solana,pump,SOL/USDC")
 EXISTING_LIMIT_PER_QUERY = int(os.environ.get("EXISTING_LIMIT_PER_QUERY", "80"))
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -76,6 +72,7 @@ def lamports(sol: float) -> int:
 
 
 def is_valid_solana_pubkey(s: str) -> bool:
+    # Strict: must decode to exactly 32 bytes for a Solana Pubkey
     try:
         raw = base58.b58decode(s)
         if len(raw) != 32:
@@ -248,15 +245,15 @@ async def send_swap(
             log(f"Jupiter swap response missing swapTransaction: {str(swap)[:220]}")
             return None
 
+        # Build tx from Jupiter
         tx_bytes = base64.b64decode(swap_tx_b64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        msg_bytes = bytes(tx.message)
-        sig = keypair.sign_message(msg_bytes)
-        signed = VersionedTransaction(tx.message, [sig])
+        # ✅ FIX: sign using solders transaction method (expects Keypair Signer, not Signature)
+        tx.sign([keypair])
 
         opts = TxOpts(skip_preflight=SKIP_PREFLIGHT, preflight_commitment="processed")
-        resp = await client.send_raw_transaction(bytes(signed), opts=opts)
+        resp = await client.send_raw_transaction(bytes(tx), opts=opts)
 
         signature = resp.value if hasattr(resp, "value") else None
         if not signature:
@@ -338,7 +335,6 @@ async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClie
                     seen_pair_ids.add(pid)
                     all_pairs.append(p)
 
-            # cap to avoid huge scans
             all_pairs = all_pairs[:250]
 
             for p in all_pairs:
