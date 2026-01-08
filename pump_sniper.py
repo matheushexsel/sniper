@@ -249,11 +249,12 @@ async def send_swap(
         tx_bytes = base64.b64decode(swap_tx_b64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # ✅ FIX: sign using solders transaction method (expects Keypair Signer, not Signature)
-        tx.sign([keypair])
+        # ✅ FIX for older solders: manual signature + populate
+        sig = keypair.sign_message(bytes(tx.message))
+        signed_tx = VersionedTransaction.populate(tx.message, [sig])
 
         opts = TxOpts(skip_preflight=SKIP_PREFLIGHT, preflight_commitment="processed")
-        resp = await client.send_raw_transaction(bytes(tx), opts=opts)
+        resp = await client.send_raw_transaction(bytes(signed_tx), opts=opts)
 
         signature = resp.value if hasattr(resp, "value") else None
         if not signature:
@@ -370,8 +371,8 @@ async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClie
                 ):
                     candidates += 1
                     log(f"EXISTING candidate {mint} | chg1h={change1h:.2f}% vol1h=${vol1h:.2f} liq=${liq:.2f} px=${px:.8f}")
-                    sig = await send_swap(session, client, keypair, "buy", mint, lamports(BUY_SOL))
-                    if sig:
+                    sig_tx = await send_swap(session, client, keypair, "buy", mint, lamports(BUY_SOL))
+                    if sig_tx:
                         monitored_tokens[mint] = px
                         asyncio.create_task(price_monitor(session, client, keypair, mint, px))
                 else:
@@ -440,8 +441,8 @@ async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClie
                         continue
 
                     log(f"NEW candidate {mint} | vol1h=${vol:.2f} liq=${liq:.2f} buys1h={buys} social={has_social}")
-                    sig = await send_swap(session, client, keypair, "buy", mint, lamports(BUY_SOL))
-                    if sig:
+                    sig_tx = await send_swap(session, client, keypair, "buy", mint, lamports(BUY_SOL))
+                    if sig_tx:
                         monitored_tokens[mint] = px
                         asyncio.create_task(price_monitor(session, client, keypair, mint, px))
 
