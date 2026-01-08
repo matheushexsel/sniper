@@ -66,9 +66,13 @@ def lamports(sol: float) -> int:
     return int(sol * 1_000_000_000)
 
 
+# STRICT validator: Solana pubkeys decode to exactly 32 bytes
 def is_valid_solana_pubkey(s: str) -> bool:
     try:
-        Pubkey.from_string(s)
+        raw = base58.b58decode(s)
+        if len(raw) != 32:
+            return False
+        Pubkey.from_bytes(raw)
         return True
     except Exception:
         return False
@@ -133,6 +137,7 @@ async def fetch_json(
 
 
 async def get_token_data_dexscreener(session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
+    # Solana-scoped endpoint prevents non-solana junk
     url = f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
     try:
         pools = await fetch_json(session, url, method="GET", headers={"Accept": "application/json"}, retries=2)
@@ -363,12 +368,7 @@ async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClie
                     if not mint or not is_valid_solana_pubkey(mint):
                         continue
 
-                    if mint in monitored_tokens:
-                        continue
-
-                    if await get_token_balance(client, owner, mint) > 0:
-                        continue
-
+                    # Reduce noisy RPC calls: do warmup + Dex gating first, then balance check.
                     has_social = bool(data.get("twitter") or data.get("telegram") or data.get("website"))
                     if REQUIRE_SOCIALS and not has_social:
                         continue
@@ -381,7 +381,14 @@ async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClie
                     liq = float(tdata.get("liquidity_usd", 0) or 0)
                     buys = int(tdata.get("buys_h1", 0) or 0)
 
-                    if vol < MIN_VOLUME_USD_NEW or liq < MIN_LIQUIDITY_USD_NEW or buys < MIN_BUYS_H1_NEW:
+                    if vol < MIN_VOLUME_USD_NEW or liq < MIN_LIQUIDITY_USD_NEW or buys < MIN_BUYS_H1_NEW or px <= 0:
+                        continue
+
+                    if mint in monitored_tokens:
+                        continue
+
+                    # Only now check if we already hold it
+                    if await get_token_balance(client, owner, mint) > 0:
                         continue
 
                     log(f"NEW snipe candidate {mint} | vol1h=${vol:.2f} liq=${liq:.2f} buys1h={buys} social={has_social}")
