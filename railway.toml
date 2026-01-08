@@ -4,4 +4,3 @@ builder = "NIXPACKS"
 [deploy]
 startCommand = "python pump_sniper.py"
 restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
