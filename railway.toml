@@ -2,5 +2,5 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python pump_sniper.py"
+startCommand = "python -u pump_sniper.py"
 restartPolicyType = "ON_FAILURE"
