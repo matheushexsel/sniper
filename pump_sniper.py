@@ -1,5 +1,13 @@
 # pump_sniper.py
-# Pump Sniper (Solana) - PumpPortal WS + DexScreener filters + Jupiter Metis swap/v1 swaps (api.jup.ag w/ x-api-key)
+# Pump Sniper (Solana) - PumpPortal WS + DexScreener filters + Jupiter Metis swap/v1
+# Key fixes included:
+#  1) Jupiter endpoints updated to /swap/v1/quote and /swap/v1/swap
+#  2) Hard guardrails so you NEVER trade with the wrong wallet again:
+#       - EXPECTED_WALLET (must match derived pubkey)
+#       - MIN_SOL_BALANCE_SOL (must have enough SOL to pay fees + ATA rent)
+#
+# NOTE: Setting SKIP_PREFLIGHT=true does NOT fix wrong-wallet issues.
+# It only bypasses simulation and can cause "BUY sent" + "not confirmed" timeouts.
 
 import os
 import json
@@ -59,10 +67,8 @@ def env_bool(name: str, default: bool) -> bool:
 
 def _strip_wrappers(s: str) -> str:
     s = s.strip()
-    # Remove accidental "PRIVATE_KEY=" prefix if user pasted raw line
     if s.upper().startswith("PRIVATE_KEY="):
         s = s.split("=", 1)[1].strip()
-    # Remove surrounding quotes
     if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in ("'", '"')):
         s = s[1:-1].strip()
     return s
@@ -136,18 +142,16 @@ def is_valid_solana_mint(mint: str) -> bool:
         return False
 
 
-# ===================== HTTP (WITH JUP API KEY SUPPORT) =====================
+# ===================== HTTP =====================
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "pump-sniper/1.0"})
-
 
 def _host(url: str) -> str:
     try:
         return (urlparse(url).hostname or "").lower()
     except Exception:
         return ""
-
 
 def http_get_json(
     url: str,
@@ -168,7 +172,6 @@ def http_get_json(
             last = e
             time.sleep(0.4 * (2 ** i))
     raise RuntimeError(f"GET failed after {retries} retries: {url} err={last}")
-
 
 def http_post_json(
     url: str,
@@ -199,8 +202,11 @@ WS_URL = os.getenv("WS_URL", "wss://pumpportal.fun/api/data")
 
 PRIVATE_KEY = env_str("PRIVATE_KEY")
 
+# Guardrails
+EXPECTED_WALLET = (os.getenv("EXPECTED_WALLET") or "").strip()  # set this to your funded mainnet wallet pubkey
+MIN_SOL_BALANCE_SOL = env_float("MIN_SOL_BALANCE_SOL", 0.02)    # minimum SOL to allow trading
+
 # Jupiter
-# IMPORTANT: base must be https://api.jup.ag (no trailing slash required)
 JUP_BASE_URL = os.getenv("JUP_BASE_URL", "https://api.jup.ag").strip().rstrip("/")
 JUP_API_KEY = (os.getenv("JUP_API_KEY") or os.getenv("JUPITER_API_KEY") or "").strip()
 if not JUP_API_KEY:
@@ -263,9 +269,8 @@ monitored: Set[str] = set()
 _last_buy_ts = 0.0
 
 
-# ===================== JUP RATE LIMIT (FREE TIER SAFETY) =====================
+# ===================== JUP RATE LIMIT =====================
 
-# Free tier is commonly tight; enforce ~1 request/sec to avoid bursts.
 _JUP_LOCK = asyncio.Lock()
 _JUP_NEXT_TS = 0.0
 
@@ -279,7 +284,6 @@ async def jup_throttle() -> None:
 
 
 def jup_headers() -> Dict[str, str]:
-    # Jupiter on api.jup.ag requires x-api-key for Metis endpoints.
     return {
         "x-api-key": JUP_API_KEY,
         "Content-Type": "application/json",
@@ -287,7 +291,7 @@ def jup_headers() -> Dict[str, str]:
     }
 
 
-# ===================== DEXSCREENER DATA =====================
+# ===================== DEXSCREENER =====================
 
 def dexscreener_token_data(mint: str) -> Dict[str, Any]:
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
@@ -318,7 +322,6 @@ def dexscreener_token_data(mint: str) -> Dict[str, Any]:
         "change_h1": f((best.get("priceChange") or {}).get("h1")),
     }
 
-
 def dexscreener_search(query: str, limit: int) -> List[Dict[str, Any]]:
     url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
     data = http_get_json(url, timeout=8.0, retries=3)
@@ -327,7 +330,11 @@ def dexscreener_search(query: str, limit: int) -> List[Dict[str, Any]]:
     return out[:limit]
 
 
-# ===================== BALANCE =====================
+# ===================== BALANCES =====================
+
+async def get_sol_balance(pubkey: Pubkey) -> int:
+    resp = await client.get_balance(pubkey)
+    return int(resp.value)
 
 async def get_token_balance(mint: str) -> int:
     if not is_valid_solana_mint(mint):
@@ -349,11 +356,9 @@ async def get_token_balance(mint: str) -> int:
         return 0
 
 
-# ===================== JUPITER SWAP (Metis swap/v1) =====================
+# ===================== JUPITER (Metis swap/v1) =====================
 
 def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
-    # Updated endpoints to avoid 404s:
-    # Quote: /swap/v1/quote
     return (
         f"{JUP_BASE_URL}/swap/v1/quote"
         f"?inputMint={input_mint}"
@@ -363,11 +368,7 @@ def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> s
         f"&restrictIntermediateTokens=true"
     )
 
-
 async def send_swap(action: str, mint: str) -> Optional[str]:
-    """
-    Uses Jupiter Metis Quote API + Swap API on https://api.jup.ag (requires x-api-key)
-    """
     try:
         if action == "buy":
             input_mint = SOL_MINT
@@ -384,7 +385,6 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
         quote_url = build_jupiter_quote_url(input_mint, output_mint, amount)
 
         await jup_throttle()
-
         try:
             quote = http_get_json(quote_url, timeout=12.0, retries=3, headers=jup_headers())
         except Exception as e:
@@ -404,7 +404,6 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
             swap_payload["computeUnitPriceMicroLamports"] = int(PRIORITY_FEE_MICRO_LAMPORTS)
 
         await jup_throttle()
-
         try:
             swap = http_post_json(
                 f"{JUP_BASE_URL}/swap/v1/swap",
@@ -438,11 +437,14 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
 
 async def wait_confirm(sig: str) -> bool:
     deadline = time.time() + CONFIRM_TIMEOUT_SEC
+    seen_any_status = False
+
     while time.time() < deadline:
         try:
             st = await client.get_signature_statuses([sig], search_transaction_history=True)
             v = st.value[0] if st and getattr(st, "value", None) else None
             if v is not None:
+                seen_any_status = True
                 if getattr(v, "err", None):
                     return False
                 cs = getattr(v, "confirmation_status", None)
@@ -454,6 +456,10 @@ async def wait_confirm(sig: str) -> bool:
         except Exception:
             pass
         await asyncio.sleep(CONFIRM_POLL_SEC)
+
+    # If we never saw a status, it was likely dropped / never landed.
+    if not seen_any_status:
+        log(f"CONFIRM WARN: signature {sig} never showed up in status lookup (likely dropped).")
     return False
 
 
@@ -706,6 +712,7 @@ async def heartbeat() -> None:
 # ===================== MAIN =====================
 
 async def main() -> None:
+    # BOOT CONFIG FIRST (before tasks)
     log("BOOT CONFIG:")
     log(f"  WALLET={WALLET_PUBKEY}")
     log(f"  WS_URL={WS_URL}")
@@ -720,6 +727,24 @@ async def main() -> None:
     log(f"  SELL: tp={TAKE_PROFIT_X}x sl={STOP_LOSS_X}x poll={PRICE_POLL_SEC}s maxMonitors={MAX_MONITORS}")
     log(f"  LOG_SKIPS={LOG_SKIPS}")
 
+    # Hard guardrail: ensure expected wallet is loaded (prevents trading with wrong env/private key)
+    if EXPECTED_WALLET:
+        if str(WALLET_PUBKEY) != EXPECTED_WALLET:
+            raise RuntimeError(
+                f"Wrong wallet loaded. EXPECTED_WALLET={EXPECTED_WALLET} but derived WALLET={WALLET_PUBKEY}. "
+                f"Fix PRIVATE_KEY env var."
+            )
+
+    # Hard guardrail: ensure there is enough SOL to trade
+    bal_lamports = await get_sol_balance(WALLET_PUBKEY)
+    bal_sol = bal_lamports / 1e9
+    log(f"  SOL_BALANCE={bal_sol:.6f} SOL")
+    if bal_sol < MIN_SOL_BALANCE_SOL:
+        raise RuntimeError(
+            f"SOL balance too low for trading: {bal_sol:.6f} SOL. "
+            f"Need at least MIN_SOL_BALANCE_SOL={MIN_SOL_BALANCE_SOL:.6f} SOL (fees + ATA rent + priority fees)."
+        )
+
     asyncio.create_task(scan_existing_tokens())
     asyncio.create_task(heartbeat())
     await monitor_new_launches()
@@ -730,7 +755,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     finally:
         try:
-            # best-effort close
             loop = asyncio.new_event_loop()
             loop.run_until_complete(client.close())
             loop.close()
