@@ -4,7 +4,7 @@ import json
 import base64
 import random
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, List
 
 import aiohttp
 import websockets
@@ -46,8 +46,14 @@ PRICE_POLL_SEC = int(os.environ.get("PRICE_POLL_SEC", "5"))
 
 MAX_CONCURRENT_MONITORS = int(os.environ.get("MAX_CONCURRENT_MONITORS", "25"))
 
-# Optional: reduce log spam
 LOG_SKIPS = os.environ.get("LOG_SKIPS", "false").lower() == "true"
+
+# Existing discovery: multi-query to get real Solana coverage
+EXISTING_QUERIES = os.environ.get(
+    "EXISTING_QUERIES",
+    "raydium,solana,pump,SOL/USDC"
+)
+EXISTING_LIMIT_PER_QUERY = int(os.environ.get("EXISTING_LIMIT_PER_QUERY", "80"))
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -69,7 +75,6 @@ def lamports(sol: float) -> int:
     return int(sol * 1_000_000_000)
 
 
-# STRICT validator: Solana pubkeys decode to exactly 32 bytes
 def is_valid_solana_pubkey(s: str) -> bool:
     try:
         raw = base58.b58decode(s)
@@ -166,7 +171,7 @@ async def search_pairs_dexscreener(session: aiohttp.ClientSession, q: str, limit
         pairs = r.get("pairs") or []
         return pairs[:limit]
     except Exception as e:
-        log(f"Dexscreener search error: {e}")
+        log(f"Dexscreener search error (q={q}): {e}")
         return []
 
 
@@ -176,22 +181,13 @@ async def get_token_balance(client: AsyncClient, owner: Pubkey, mint: str) -> in
     try:
         opts = TokenAccountOpts(mint=Pubkey.from_string(mint), program_id=TOKEN_PROGRAM_ID)
         resp = await client.get_token_accounts_by_owner(owner, opts)
-
-        if not hasattr(resp, "value"):
-            # Helius sometimes returns an error-shaped object for invalid params
+        if not hasattr(resp, "value") or not resp.value:
             return 0
-
-        if not resp.value:
-            return 0
-
         ata = resp.value[0].pubkey
         bal = await client.get_token_account_balance(ata)
-
         if not hasattr(bal, "value") or not hasattr(bal.value, "amount"):
             return 0
-
         return int(bal.value.amount)
-
     except Exception:
         return 0
 
@@ -320,6 +316,7 @@ async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClie
 
     while True:
         cycle += 1
+
         scanned = 0
         candidates = 0
         skipped_chain = 0
@@ -328,9 +325,23 @@ async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClie
         skipped_filters = 0
 
         try:
-            pairs = await search_pairs_dexscreener(session, q="SOL", limit=200)
+            queries = [q.strip() for q in EXISTING_QUERIES.split(",") if q.strip()]
+            all_pairs: List[dict] = []
+            seen_pair_ids: Set[str] = set()
 
-            for p in pairs:
+            for q in queries:
+                pairs = await search_pairs_dexscreener(session, q=q, limit=EXISTING_LIMIT_PER_QUERY)
+                for p in pairs:
+                    pid = p.get("pairAddress") or (p.get("url") or "") or json.dumps(p, sort_keys=True)[:120]
+                    if pid in seen_pair_ids:
+                        continue
+                    seen_pair_ids.add(pid)
+                    all_pairs.append(p)
+
+            # cap to avoid huge scans
+            all_pairs = all_pairs[:250]
+
+            for p in all_pairs:
                 scanned += 1
 
                 if (p.get("chainId") or "").lower() != "solana":
@@ -375,7 +386,7 @@ async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClie
             log(
                 f"ExistingScan cycle={cycle} scanned={scanned} candidates={candidates} "
                 f"skipped(chain={skipped_chain}, invalid={skipped_invalid}, held={skipped_held}, filters={skipped_filters}) "
-                f"thresholds(chg1h>={MIN_PRICE_CHANGE_1H}, vol1h>={MIN_VOLUME_USD_EXISTING}, liq>={MIN_LIQUIDITY_USD_EXISTING})"
+                f"queries={queries} thresholds(chg1h>={MIN_PRICE_CHANGE_1H}, vol1h>={MIN_VOLUME_USD_EXISTING}, liq>={MIN_LIQUIDITY_USD_EXISTING})"
             )
 
         except Exception as e:
@@ -421,13 +432,9 @@ async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClie
                     buys = int(tdata.get("buys_h1", 0) or 0)
 
                     if px <= 0:
-                        if LOG_SKIPS:
-                            log(f"NEW skipped {mint}: no price yet")
                         continue
 
                     if vol < MIN_VOLUME_USD_NEW or liq < MIN_LIQUIDITY_USD_NEW or buys < MIN_BUYS_H1_NEW:
-                        if LOG_SKIPS:
-                            log(f"NEW skipped {mint} | vol1h=${vol:.2f} liq=${liq:.2f} buys1h={buys}")
                         continue
 
                     if mint in monitored_tokens:
@@ -459,12 +466,11 @@ async def main() -> None:
     global monitor_semaphore
     monitor_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MONITORS)
 
-    # Print active config at boot so you can confirm Railway vars are actually loaded
     log("BOOT CONFIG:")
     log(f"  WS_URL={WS_URL}")
     log(f"  BUY_SOL={BUY_SOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIORITY_FEE_MICRO_LAMPORTS={PRIORITY_FEE_MICRO_LAMPORTS} SKIP_PREFLIGHT={SKIP_PREFLIGHT}")
     log(f"  NEW: warmup={NEW_TOKEN_WARMUP_SEC}s minVol={MIN_VOLUME_USD_NEW} minLiq={MIN_LIQUIDITY_USD_NEW} minBuys={MIN_BUYS_H1_NEW} requireSocials={REQUIRE_SOCIALS}")
-    log(f"  EXISTING: scanEvery={SCAN_INTERVAL_SEC}s minChg1h={MIN_PRICE_CHANGE_1H}% minVol1h={MIN_VOLUME_USD_EXISTING} minLiq={MIN_LIQUIDITY_USD_EXISTING}")
+    log(f"  EXISTING: queries={EXISTING_QUERIES} limitPerQuery={EXISTING_LIMIT_PER_QUERY} scanEvery={SCAN_INTERVAL_SEC}s minChg1h={MIN_PRICE_CHANGE_1H}% minVol1h={MIN_VOLUME_USD_EXISTING} minLiq={MIN_LIQUIDITY_USD_EXISTING}")
     log(f"  SELL: tp={PROFIT_TARGET_X}x sl={STOP_LOSS_X}x poll={PRICE_POLL_SEC}s maxMonitors={MAX_CONCURRENT_MONITORS}")
     log(f"  LOG_SKIPS={LOG_SKIPS}")
 
