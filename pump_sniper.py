@@ -1,5 +1,5 @@
 # pump_sniper.py
-# Pump Sniper (Solana) - PumpPortal WS + DexScreener filters + Jupiter v6 swaps (api.jup.ag w/ x-api-key)
+# Pump Sniper (Solana) - PumpPortal WS + DexScreener filters + Jupiter Metis swap/v1 swaps (api.jup.ag w/ x-api-key)
 
 import os
 import json
@@ -149,7 +149,12 @@ def _host(url: str) -> str:
         return ""
 
 
-def http_get_json(url: str, timeout: float = 10.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def http_get_json(
+    url: str,
+    timeout: float = 10.0,
+    retries: int = 3,
+    headers: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
     last = None
     for i in range(retries):
         try:
@@ -164,7 +169,14 @@ def http_get_json(url: str, timeout: float = 10.0, retries: int = 3, headers: Op
             time.sleep(0.4 * (2 ** i))
     raise RuntimeError(f"GET failed after {retries} retries: {url} err={last}")
 
-def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 15.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+
+def http_post_json(
+    url: str,
+    payload: Dict[str, Any],
+    timeout: float = 15.0,
+    retries: int = 3,
+    headers: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
     last = None
     for i in range(retries):
         try:
@@ -253,7 +265,7 @@ _last_buy_ts = 0.0
 
 # ===================== JUP RATE LIMIT (FREE TIER SAFETY) =====================
 
-# Free tier is 60 RPM. Enforce ~1 request/sec to avoid 429s and also reduce burst.
+# Free tier is commonly tight; enforce ~1 request/sec to avoid bursts.
 _JUP_LOCK = asyncio.Lock()
 _JUP_NEXT_TS = 0.0
 
@@ -267,8 +279,12 @@ async def jup_throttle() -> None:
 
 
 def jup_headers() -> Dict[str, str]:
-    # Jupiter requires x-api-key for api.jup.ag
-    return {"x-api-key": JUP_API_KEY}
+    # Jupiter on api.jup.ag requires x-api-key for Metis endpoints.
+    return {
+        "x-api-key": JUP_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
 
 # ===================== DEXSCREENER DATA =====================
@@ -302,6 +318,7 @@ def dexscreener_token_data(mint: str) -> Dict[str, Any]:
         "change_h1": f((best.get("priceChange") or {}).get("h1")),
     }
 
+
 def dexscreener_search(query: str, limit: int) -> List[Dict[str, Any]]:
     url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
     data = http_get_json(url, timeout=8.0, retries=3)
@@ -332,21 +349,24 @@ async def get_token_balance(mint: str) -> int:
         return 0
 
 
-# ===================== JUPITER SWAP (v6) =====================
+# ===================== JUPITER SWAP (Metis swap/v1) =====================
 
 def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
-    # MUST include /v6/quote (not just base)
+    # Updated endpoints to avoid 404s:
+    # Quote: /swap/v1/quote
     return (
-        f"{JUP_BASE_URL}/v6/quote"
+        f"{JUP_BASE_URL}/swap/v1/quote"
         f"?inputMint={input_mint}"
         f"&outputMint={output_mint}"
         f"&amount={amount}"
         f"&slippageBps={SLIPPAGE_BPS}"
+        f"&restrictIntermediateTokens=true"
     )
+
 
 async def send_swap(action: str, mint: str) -> Optional[str]:
     """
-    Uses Jupiter Quote API v6 + Swap API v6 on https://api.jup.ag (requires x-api-key)
+    Uses Jupiter Metis Quote API + Swap API on https://api.jup.ag (requires x-api-key)
     """
     try:
         if action == "buy":
@@ -363,7 +383,6 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
 
         quote_url = build_jupiter_quote_url(input_mint, output_mint, amount)
 
-        # Throttle to stay within free-tier limits (and reduce 429/401 edge cases)
         await jup_throttle()
 
         try:
@@ -387,7 +406,13 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
         await jup_throttle()
 
         try:
-            swap = http_post_json(f"{JUP_BASE_URL}/v6/swap", swap_payload, timeout=20.0, retries=3, headers=jup_headers())
+            swap = http_post_json(
+                f"{JUP_BASE_URL}/swap/v1/swap",
+                swap_payload,
+                timeout=20.0,
+                retries=3,
+                headers=jup_headers(),
+            )
         except Exception as e:
             log(f"Swap error ({action}) mint={mint}: swap_error={e}")
             return None
