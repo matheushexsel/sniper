@@ -1,7 +1,7 @@
 # pump_sniper.py
-# Pump Sniper (Solana) - PumpPortal WS + DexScreener filters + Jupiter swap/v1
-# Micro-scalp mode: TP/SL in percent. Reconcile by on-chain balance.
-# UPDATE: Time-based exits REMOVED (no MAX_HOLD exit). Positions only exit on TP or SL.
+# Strategy A (swing continuation): high-liquidity only, wider TP/SL, no time exits
+# PumpPortal WS (new tokens) + DexScreener filters + Jupiter swap/v1
+# Exits only on TP/SL. Adds per-mint cooldown to stop churn.
 
 import os
 import json
@@ -11,6 +11,7 @@ import binascii
 import socket
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple, Set
+from urllib.parse import urlparse
 
 import requests
 import base58
@@ -23,6 +24,7 @@ from solana.rpc.types import TokenAccountOpts, TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
+
 
 # Force IPv4 DNS resolution (helps in some cloud runtimes)
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
@@ -136,7 +138,7 @@ def is_valid_solana_mint(mint: str) -> bool:
 # ===================== HTTP =====================
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "pump-sniper/2.0"})
+SESSION.headers.update({"User-Agent": "pump-sniper/strategyA"})
 
 def http_get_json(url: str, timeout: float = 10.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     last = None
@@ -186,42 +188,51 @@ if not JUP_API_KEY:
     raise RuntimeError("Missing required env var: JUP_API_KEY (or JUPITER_API_KEY)")
 
 # Trading
-BUY_SOL = env_float("BUY_SOL", 0.01)
-SLIPPAGE_BPS = env_int("SLIPPAGE_BPS", 150)  # 1.5%
-PRIORITY_FEE_MICRO_LAMPORTS = env_int("PRIORITY_FEE_MICRO_LAMPORTS", 8000)
+BUY_SOL = env_float("BUY_SOL", 0.05)
+
+# Keep slippage reasonable; too low = failed fills, too high = bleed.
+SLIPPAGE_BPS = env_int("SLIPPAGE_BPS", 60)  # 0.60%
+PRIORITY_FEE_MICRO_LAMPORTS = env_int("PRIORITY_FEE_MICRO_LAMPORTS", 0)
 SKIP_PREFLIGHT = env_bool("SKIP_PREFLIGHT", True)
 
-# Micro exits (percent-based) - time exits removed
-TP_PCT = env_float("TP_PCT", 0.012)  # 1.2%
-SL_PCT = env_float("SL_PCT", 0.008)  # 0.8%
-MONITOR_POLL_SEC = env_float("MONITOR_POLL_SEC", 2.0)
+# Strategy A exits (no time exits)
+TP_PCT = env_float("TP_PCT", 0.06)   # 6% default (recommended range 4% to 8%)
+SL_PCT = env_float("SL_PCT", 0.02)   # 2% default
+MONITOR_POLL_SEC = env_float("MONITOR_POLL_SEC", 5.0)
 
-# New launches filters
-NEW_WARMUP_SEC = env_int("NEW_WARMUP_SEC", 75)
-NEW_MIN_VOL_1H_USD = env_float("NEW_MIN_VOL_1H_USD", 500.0)
-NEW_MIN_LIQ_USD = env_float("NEW_MIN_LIQ_USD", 12000.0)
-NEW_MIN_BUYS_1H = env_int("NEW_MIN_BUYS_1H", 15)
-NEW_REQUIRE_SOCIALS = env_bool("NEW_REQUIRE_SOCIALS", False)
+# High-liquidity gate (your request)
+MIN_LIQ_USD_GLOBAL = env_float("MIN_LIQ_USD_GLOBAL", 150000.0)
 
-# Existing movers filters
-EXISTING_SCAN_EVERY_SEC = env_int("EXISTING_SCAN_EVERY_SEC", 12)
+# New launches filters (still apply, but now high-liq only)
+NEW_WARMUP_SEC = env_int("NEW_WARMUP_SEC", 90)
+NEW_MIN_VOL_1H_USD = env_float("NEW_MIN_VOL_1H_USD", 3000.0)
+NEW_MIN_LIQ_USD = env_float("NEW_MIN_LIQ_USD", MIN_LIQ_USD_GLOBAL)
+NEW_MIN_BUYS_1H = env_int("NEW_MIN_BUYS_1H", 40)
+NEW_REQUIRE_SOCIALS = env_bool("NEW_REQUIRE_SOCIALS", True)
+
+# Existing movers filters (high-liq only)
+EXISTING_SCAN_EVERY_SEC = env_int("EXISTING_SCAN_EVERY_SEC", 20)
 EXISTING_QUERIES = os.getenv("EXISTING_QUERIES", "raydium,solana,pump,SOL/USDC")
-EXISTING_LIMIT_PER_QUERY = env_int("EXISTING_LIMIT_PER_QUERY", 80)
-EXISTING_MIN_CHG_1H = env_float("EXISTING_MIN_CHG_1H", 3.0)
-EXISTING_MIN_VOL_1H_USD = env_float("EXISTING_MIN_VOL_1H_USD", 8000.0)
-EXISTING_MIN_LIQ_USD = env_float("EXISTING_MIN_LIQ_USD", 25000.0)
-EXISTING_MIN_BUYS_1H = env_int("EXISTING_MIN_BUYS_1H", 40)
+EXISTING_LIMIT_PER_QUERY = env_int("EXISTING_LIMIT_PER_QUERY", 100)
 
-# Risk controls
+EXISTING_MIN_CHG_1H = env_float("EXISTING_MIN_CHG_1H", 3.0)
+EXISTING_MIN_VOL_1H_USD = env_float("EXISTING_MIN_VOL_1H_USD", 20000.0)
+EXISTING_MIN_LIQ_USD = env_float("EXISTING_MIN_LIQ_USD", MIN_LIQ_USD_GLOBAL)
+EXISTING_MIN_BUYS_1H = env_int("EXISTING_MIN_BUYS_1H", 120)
+
+# Risk controls (swing: fewer positions, less churn)
 MAX_BUYS_PER_SCAN = env_int("MAX_BUYS_PER_SCAN", 1)
-BUY_COOLDOWN_SEC = env_int("BUY_COOLDOWN_SEC", 20)
-MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 5)
+BUY_COOLDOWN_SEC = env_int("BUY_COOLDOWN_SEC", 60)
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 2)
+
+# Per-mint cooldown (prevents re-buying the same mint repeatedly)
+MINT_COOLDOWN_SEC = env_int("MINT_COOLDOWN_SEC", 1800)  # 30 minutes default
 
 # Jupiter throttle
-JUP_MIN_INTERVAL_SEC = env_float("JUP_MIN_INTERVAL_SEC", 0.9)
+JUP_MIN_INTERVAL_SEC = env_float("JUP_MIN_INTERVAL_SEC", 1.1)
 
 # Reconcile
-RECONCILE_SEC = env_int("RECONCILE_SEC", 15)
+RECONCILE_SEC = env_int("RECONCILE_SEC", 8)
 
 LOG_SKIPS = env_bool("LOG_SKIPS", False)
 
@@ -242,13 +253,15 @@ if EXPECTED_WALLET and str(WALLET_PUBKEY) != EXPECTED_WALLET:
 
 BUY_AMOUNT_LAMPORTS = int(BUY_SOL * 1e9)
 
-# bot_positions: mint -> dict(entry_usd, opened_ts, size_raw_at_detect, last_px_usd)
+# bot_positions: mint -> dict(entry_usd, opened_ts, size_raw, last_px_usd)
 bot_positions: Dict[str, Dict[str, Any]] = {}
-# monitored mints (bot-related)
 monitored: Set[str] = set()
 
 pending_buys: Dict[str, float] = {}   # mint -> started_ts
 pending_sells: Dict[str, float] = {}  # mint -> started_ts
+
+# per-mint cooldown timestamps
+mint_last_trade_ts: Dict[str, float] = {}
 
 _last_buy_ts = 0.0
 _pos_lock = asyncio.Lock()
@@ -350,7 +363,7 @@ def build_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
 
 async def send_swap(action: str, mint: str) -> Optional[str]:
     """
-    Uses Jupiter Quote + Swap endpoint:
+    Jupiter Quote + Swap endpoint:
       GET  /swap/v1/quote
       POST /swap/v1/swap
     Signs and submits the returned VersionedTransaction.
@@ -391,13 +404,7 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
 
         await jup_throttle()
         try:
-            swap = http_post_json(
-                f"{JUP_BASE_URL}/swap/v1/swap",
-                swap_payload,
-                timeout=20.0,
-                retries=3,
-                headers=jup_headers(),
-            )
+            swap = http_post_json(f"{JUP_BASE_URL}/swap/v1/swap", swap_payload, timeout=20.0, retries=3, headers=jup_headers())
         except Exception as e:
             log(f"Swap error ({action}) mint={mint}: swap_error={e}")
             return None
@@ -425,13 +432,18 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
 
 def can_buy_now() -> bool:
     global _last_buy_ts
-    if (time.time() - _last_buy_ts) < BUY_COOLDOWN_SEC:
-        return False
-    return True
+    return (time.time() - _last_buy_ts) >= BUY_COOLDOWN_SEC
 
 def mark_bought() -> None:
     global _last_buy_ts
     _last_buy_ts = time.time()
+
+def mint_on_cooldown(mint: str) -> bool:
+    last = mint_last_trade_ts.get(mint, 0.0)
+    return (time.time() - last) < MINT_COOLDOWN_SEC
+
+def mark_mint_traded(mint: str) -> None:
+    mint_last_trade_ts[mint] = time.time()
 
 
 # ===================== POSITION TRACKING =====================
@@ -463,10 +475,8 @@ async def monitor_position(mint: str) -> None:
     Exits:
       - TP: price >= entry*(1+TP_PCT)
       - SL: price <= entry*(1-SL_PCT)
-
-    NOTE: Time exits removed by request.
-
-    Uses DexScreener priceUsd as the signal.
+    No time exits (Strategy A).
+    Uses DexScreener priceUsd as signal.
     Executes SELL via Jupiter and relies on reconcile to confirm removal.
     """
     while True:
@@ -475,7 +485,7 @@ async def monitor_position(mint: str) -> None:
         snap = await get_bot_positions_snapshot()
         pos = snap.get(mint)
         if not pos:
-            return  # already closed
+            return
 
         entry = float(pos.get("entry_usd") or 0.0)
         if entry <= 0:
@@ -487,13 +497,13 @@ async def monitor_position(mint: str) -> None:
         if px <= 0:
             continue
 
-        tp_level = entry * (1.0 + TP_PCT)
-        sl_level = entry * (1.0 - SL_PCT)
-
         # update last price
         async with _pos_lock:
             if mint in bot_positions:
                 bot_positions[mint]["last_px_usd"] = px
+
+        tp_level = entry * (1.0 + TP_PCT)
+        sl_level = entry * (1.0 - SL_PCT)
 
         reason = None
         if px >= tp_level:
@@ -522,8 +532,7 @@ async def reconcile_loop() -> None:
     """
     Makes the bot truthful:
       - If we sent a BUY and balance shows up -> track position + start monitor
-      - If we sent a SELL and balance is gone -> untrack position
-      - If we hold tokens without tracking (manual or old bags) -> ignore by default
+      - If we sent a SELL and balance is gone -> untrack position + mark mint cooldown
     """
     while True:
         await asyncio.sleep(RECONCILE_SEC)
@@ -539,6 +548,7 @@ async def reconcile_loop() -> None:
                 await track_position(mint, entry_usd=entry, opened_ts=time.time(), size_raw=bal)
                 asyncio.create_task(monitor_position(mint))
                 pending_buys.pop(mint, None)
+                mark_mint_traded(mint)
                 log(f"RECONCILE: BUY confirmed by balance mint={mint} bal={bal} entry={entry:.10f}")
 
         # confirm sells by balance
@@ -547,6 +557,7 @@ async def reconcile_loop() -> None:
             if bal <= 0:
                 await untrack_position(mint)
                 pending_sells.pop(mint, None)
+                mark_mint_traded(mint)
                 log(f"RECONCILE: SELL confirmed by balance mint={mint} bal=0 -> closed")
 
 
@@ -560,11 +571,21 @@ async def try_buy(mint: str, px_usd: float) -> None:
         return
     if not can_buy_now():
         return
+    if mint_on_cooldown(mint):
+        if LOG_SKIPS:
+            log(f"SKIP mint cooldown mint={mint}")
+        return
+
+    # avoid doubling into bags
+    bal = await get_token_balance(mint)
+    if bal > 0:
+        return
 
     pending_buys[mint] = time.time()
     sig = await send_swap("buy", mint)
     if sig:
         mark_bought()
+        mark_mint_traded(mint)
         log(f"BUY submitted mint={mint} px=${px_usd:.10f} sig={sig} (reconcile will confirm by balance)")
     else:
         pending_buys.pop(mint, None)
@@ -607,11 +628,12 @@ async def scan_existing_tokens() -> None:
                 liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
                 buys1h = int(((p.get("txns") or {}).get("h1") or {}).get("buys") or 0)
 
+                # Strategy A gate: high liquidity (>= 150k), plus activity filters
                 if (
-                    change1h >= EXISTING_MIN_CHG_1H and
-                    vol1h >= EXISTING_MIN_VOL_1H_USD and
                     liq >= EXISTING_MIN_LIQ_USD and
-                    buys1h >= EXISTING_MIN_BUYS_1H
+                    vol1h >= EXISTING_MIN_VOL_1H_USD and
+                    buys1h >= EXISTING_MIN_BUYS_1H and
+                    change1h >= EXISTING_MIN_CHG_1H
                 ):
                     ranked.append((change1h, p))
                 else:
@@ -642,10 +664,8 @@ async def scan_existing_tokens() -> None:
                     skipped_risk += 1
                     continue
 
-                # If already holding it, don't buy (avoid doubling into bags)
-                bal = await get_token_balance(mint)
-                if bal > 0:
-                    skipped_tracked += 1
+                if mint_on_cooldown(mint):
+                    skipped_risk += 1
                     continue
 
                 await try_buy(mint, px_usd=px)
@@ -688,6 +708,9 @@ async def monitor_new_launches() -> None:
                     if NEW_REQUIRE_SOCIALS and not socials_ok:
                         continue
 
+                    if mint_on_cooldown(mint):
+                        continue
+
                     await asyncio.sleep(NEW_WARMUP_SEC)
 
                     td = dexscreener_token_data(mint)
@@ -696,7 +719,13 @@ async def monitor_new_launches() -> None:
                     buys1h = int(td.get("buys_h1") or 0)
                     px = float(td.get("priceUsd") or 0.0)
 
-                    if vol1h < NEW_MIN_VOL_1H_USD or liq < NEW_MIN_LIQ_USD or buys1h < NEW_MIN_BUYS_1H or px <= 0:
+                    # Strategy A gate: liq >= 150k
+                    if (
+                        liq < NEW_MIN_LIQ_USD or
+                        vol1h < NEW_MIN_VOL_1H_USD or
+                        buys1h < NEW_MIN_BUYS_1H or
+                        px <= 0
+                    ):
                         continue
 
                     snap = await get_bot_positions_snapshot()
@@ -731,7 +760,9 @@ async def heartbeat() -> None:
         log(
             f"Heartbeat: bot_positions={len(snap)} monitored={len(monitored)} "
             f"pending_buys={len(pending_buys)} pending_sells={len(pending_sells)} "
-            f"TP_PCT={TP_PCT} SL_PCT={SL_PCT} MONITOR_POLL_SEC={MONITOR_POLL_SEC}"
+            f"TP_PCT={TP_PCT} SL_PCT={SL_PCT} MONITOR_POLL_SEC={MONITOR_POLL_SEC} "
+            f"BUY_SOL={BUY_SOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIORITY_FEE_MICRO_LAMPORTS={PRIORITY_FEE_MICRO_LAMPORTS} "
+            f"MINT_COOLDOWN_SEC={MINT_COOLDOWN_SEC}"
         )
 
 
@@ -746,11 +777,13 @@ async def main() -> None:
     log(f"  RPC_URL={RPC_URL}")
     log(f"  JUP_BASE_URL={JUP_BASE_URL}")
     log(f"  BUY_SOL={BUY_SOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIORITY_FEE_MICRO_LAMPORTS={PRIORITY_FEE_MICRO_LAMPORTS} SKIP_PREFLIGHT={SKIP_PREFLIGHT}")
-    log(f"  MICRO: TP_PCT={TP_PCT} SL_PCT={SL_PCT} MONITOR_POLL_SEC={MONITOR_POLL_SEC} (NO TIME EXITS)")
+    log(f"  STRATEGY_A: TP_PCT={TP_PCT} SL_PCT={SL_PCT} MONITOR_POLL_SEC={MONITOR_POLL_SEC} (NO TIME EXITS)")
+    log(f"  GLOBAL LIQ GATE: MIN_LIQ_USD_GLOBAL={MIN_LIQ_USD_GLOBAL}")
     log(f"  NEW: warmup={NEW_WARMUP_SEC}s minVol1h={NEW_MIN_VOL_1H_USD} minLiq={NEW_MIN_LIQ_USD} minBuys1h={NEW_MIN_BUYS_1H} requireSocials={NEW_REQUIRE_SOCIALS}")
     log(f"  EXISTING: queries={EXISTING_QUERIES} limitPerQuery={EXISTING_LIMIT_PER_QUERY} scanEvery={EXISTING_SCAN_EVERY_SEC}s")
     log(f"           minChg1h={EXISTING_MIN_CHG_1H}% minVol1h={EXISTING_MIN_VOL_1H_USD} minLiq={EXISTING_MIN_LIQ_USD} minBuys1h={EXISTING_MIN_BUYS_1H}")
     log(f"  RISK: MAX_BUYS_PER_SCAN={MAX_BUYS_PER_SCAN} BUY_COOLDOWN_SEC={BUY_COOLDOWN_SEC} MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}")
+    log(f"  MINT_COOLDOWN_SEC={MINT_COOLDOWN_SEC}")
     log(f"  JUP_MIN_INTERVAL_SEC={JUP_MIN_INTERVAL_SEC}")
     log(f"  RECONCILE_SEC={RECONCILE_SEC}")
     log(f"  SOL_BALANCE={sol_bal:.6f} SOL")
