@@ -1,0 +1,6 @@
+solana
+solders
+websockets
+requests
+base58
+aiohttp
