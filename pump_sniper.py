@@ -1,28 +1,13 @@
 # pump_sniper.py
-# Pump Sniper -> Micro-Scalper (A-mode: bot positions only)
-# - PumpPortal WS (new tokens) + Dexscreener filters (candidates)
-# - Jupiter swap/v1 for quotes + swaps (requires x-api-key)
-# - Exit logic based on Jupiter SELL quotes (realistic PnL), not Dexscreener spot
+# Solana Micro-Scalper (Option A = NET profit per round-trip)
+# - PumpPortal WS (new tokens) + DexScreener (existing movers)
+# - Jupiter Swap API v1 endpoints (/swap/v1/quote + /swap/v1/swap)
+# - Cents-based exits: TARGET_PROFIT_USD / MAX_LOSS_USD / MAX_HOLD_SEC
+# - Pre-trade round-trip edge check (quote-driven) to avoid bag holds
+# - No bags: optional AUTO_LIQUIDATE_ON_BOOT sells all non-SOL/USDC holdings at startup
 #
-# ENV REQUIRED:
-#   RPC_URL
-#   PRIVATE_KEY
-#   JUP_API_KEY (or JUPITER_API_KEY)
-#
-# OPTIONAL / RECOMMENDED:
-#   EXPECTED_WALLET (public address safety check)
-#   SKIP_PREFLIGHT=true (many bots do this; reconcile confirms by balance)
-#
-# MICRO SETTINGS (defaults are conservative; tune for your style):
-#   TP_PCT=0.006      # +0.6%
-#   SL_PCT=0.004      # -0.4%
-#   MAX_HOLD_SEC=180  # 3 minutes
-#   MONITOR_POLL_SEC=2
-#   MIN_SOL_BALANCE_SOL=0.02
-#
-# IMPORTANT:
-# - Micro-scalping is extremely sensitive to fees/slippage/MEV.
-# - You should start with tiny size until you see stable behavior.
+# DISCLAIMER: This is a high-risk trading bot. You can lose SOL fast due to slippage,
+# MEV, route failures, token taxes, freezes, and rug mechanics. Run small size first.
 
 import os
 import json
@@ -32,6 +17,7 @@ import binascii
 import socket
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple, Set
+from urllib.parse import urlparse
 
 import requests
 import base58
@@ -45,8 +31,10 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
+
 # Force IPv4 DNS resolution (helps in some cloud runtimes)
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+
 
 # ===================== UTIL =====================
 
@@ -76,6 +64,7 @@ def env_bool(name: str, default: bool) -> bool:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
+
 def _strip_wrappers(s: str) -> str:
     s = s.strip()
     if s.upper().startswith("PRIVATE_KEY="):
@@ -84,18 +73,19 @@ def _strip_wrappers(s: str) -> str:
         s = s[1:-1].strip()
     return s
 
+
 def parse_keypair(private_key_env: str) -> Keypair:
     """
-    Accepts:
-      - base58 64-byte secret key
-      - base58 32-byte seed
-      - JSON array of ints (32/64)
-      - base64 (32/64)
-      - hex (32/64)
+    Accepts common Solana secret formats:
+      1) base58 64-byte secret key
+      2) base58 32-byte seed -> Keypair.from_seed
+      3) JSON array of ints (len 64 or 32)
+      4) base64 of 64/32 bytes
+      5) hex string of 64/32 bytes
     """
     pk = _strip_wrappers(private_key_env)
 
-    # JSON array
+    # 1) JSON array format
     try:
         arr = json.loads(pk)
         if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
@@ -107,7 +97,7 @@ def parse_keypair(private_key_env: str) -> Keypair:
     except Exception:
         pass
 
-    # base58
+    # 2) base58 decode
     try:
         raw = base58.b58decode(pk)
         if len(raw) == 64:
@@ -117,7 +107,7 @@ def parse_keypair(private_key_env: str) -> Keypair:
     except Exception:
         pass
 
-    # base64
+    # 3) base64 decode
     try:
         raw = base64.b64decode(pk, validate=True)
         if len(raw) == 64:
@@ -127,7 +117,7 @@ def parse_keypair(private_key_env: str) -> Keypair:
     except Exception:
         pass
 
-    # hex
+    # 4) hex decode
     try:
         hx = pk[2:] if pk.lower().startswith("0x") else pk
         raw = binascii.unhexlify(hx)
@@ -139,9 +129,10 @@ def parse_keypair(private_key_env: str) -> Keypair:
         pass
 
     raise RuntimeError(
-        "PRIVATE_KEY invalid. Provide a Solana secret (base58 64 bytes typical). "
-        "Do NOT paste the public wallet address."
+        "PRIVATE_KEY format invalid. Use: base58 64-byte secret key OR base58 32-byte seed OR JSON array (32/64) OR base64/hex (32/64). "
+        "Also ensure you did NOT paste the wallet address/public key."
     )
+
 
 def is_valid_solana_mint(mint: str) -> bool:
     try:
@@ -150,10 +141,12 @@ def is_valid_solana_mint(mint: str) -> bool:
     except Exception:
         return False
 
+
 # ===================== HTTP =====================
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "pump-micro-scalper/1.0"})
+
 
 def http_get_json(url: str, timeout: float = 10.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     last = None
@@ -185,15 +178,15 @@ def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 15.0, ret
             time.sleep(0.5 * (2 ** i))
     raise RuntimeError(f"POST failed after {retries} retries: {url} err={last}")
 
+
 # ===================== CONFIG =====================
 
 RPC_URL = env_str("RPC_URL")
 WS_URL = os.getenv("WS_URL", "wss://pumpportal.fun/api/data")
 
 PRIVATE_KEY = env_str("PRIVATE_KEY")
-EXPECTED_WALLET = (os.getenv("EXPECTED_WALLET") or "").strip()
 
-MIN_SOL_BALANCE_SOL = env_float("MIN_SOL_BALANCE_SOL", 0.02)
+EXPECTED_WALLET = (os.getenv("EXPECTED_WALLET") or "").strip()
 
 # Jupiter
 JUP_BASE_URL = os.getenv("JUP_BASE_URL", "https://api.jup.ag").strip().rstrip("/")
@@ -201,23 +194,32 @@ JUP_API_KEY = (os.getenv("JUP_API_KEY") or os.getenv("JUPITER_API_KEY") or "").s
 if not JUP_API_KEY:
     raise RuntimeError("Missing required env var: JUP_API_KEY (or JUPITER_API_KEY)")
 
-# Trading / swap params
+# Trading size / tx behavior
 BUY_SOL = env_float("BUY_SOL", 0.01)
-SLIPPAGE_BPS = env_int("SLIPPAGE_BPS", 150)
+SLIPPAGE_BPS = env_int("SLIPPAGE_BPS", 150)  # 1.5%
 PRIORITY_FEE_MICRO_LAMPORTS = env_int("PRIORITY_FEE_MICRO_LAMPORTS", 8000)
 SKIP_PREFLIGHT = env_bool("SKIP_PREFLIGHT", True)
 
-# Micro strategy thresholds (PnL based on Jupiter sell quote)
-TP_PCT = env_float("TP_PCT", 0.006)            # +0.6%
-SL_PCT = env_float("SL_PCT", 0.004)            # -0.4%
-MAX_HOLD_SEC = env_int("MAX_HOLD_SEC", 180)    # max holding time
+# Cents-based micro scalping (Option A = NET profit)
+TARGET_PROFIT_USD = env_float("TARGET_PROFIT_USD", 0.03)  # 3 cents net
+MAX_LOSS_USD = env_float("MAX_LOSS_USD", 0.03)            # 3 cents net loss cap
+MAX_HOLD_SEC = env_int("MAX_HOLD_SEC", 90)                # hard time stop
 MONITOR_POLL_SEC = env_float("MONITOR_POLL_SEC", 2.0)
+
+# Pre-trade edge gating (quote-driven)
+MIN_ROUNDTRIP_EDGE_USD = env_float("MIN_ROUNDTRIP_EDGE_USD", 0.02)  # must show >= 2c edge before buy
+EDGE_BUFFER_USD = env_float("EDGE_BUFFER_USD", 0.02)                # extra safety buffer (slippage/fees/MEV)
+
+# Risk controls
+MAX_BUYS_PER_SCAN = env_int("MAX_BUYS_PER_SCAN", 1)
+BUY_COOLDOWN_SEC = env_int("BUY_COOLDOWN_SEC", 10)  # for micro scalps, lower cooldown is normal
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 3)  # micro scalper should keep this small
 
 # New launches filters
 NEW_WARMUP_SEC = env_int("NEW_WARMUP_SEC", 75)
-NEW_MIN_VOL_1H_USD = env_float("NEW_MIN_VOL_1H_USD", 500.0)
-NEW_MIN_LIQ_USD = env_float("NEW_MIN_LIQ_USD", 12000.0)
-NEW_MIN_BUYS_1H = env_int("NEW_MIN_BUYS_1H", 15)
+NEW_MIN_VOL_1H_USD = env_float("NEW_MIN_VOL_1H_USD", 1500.0)
+NEW_MIN_LIQ_USD = env_float("NEW_MIN_LIQ_USD", 25000.0)
+NEW_MIN_BUYS_1H = env_int("NEW_MIN_BUYS_1H", 30)
 NEW_REQUIRE_SOCIALS = env_bool("NEW_REQUIRE_SOCIALS", False)
 
 # Existing movers filters
@@ -225,25 +227,21 @@ EXISTING_SCAN_EVERY_SEC = env_int("EXISTING_SCAN_EVERY_SEC", 12)
 EXISTING_QUERIES = os.getenv("EXISTING_QUERIES", "raydium,solana,pump,SOL/USDC")
 EXISTING_LIMIT_PER_QUERY = env_int("EXISTING_LIMIT_PER_QUERY", 80)
 EXISTING_MIN_CHG_1H = env_float("EXISTING_MIN_CHG_1H", 3.0)
-EXISTING_MIN_VOL_1H_USD = env_float("EXISTING_MIN_VOL_1H_USD", 8000.0)
-EXISTING_MIN_LIQ_USD = env_float("EXISTING_MIN_LIQ_USD", 25000.0)
-EXISTING_MIN_BUYS_1H = env_int("EXISTING_MIN_BUYS_1H", 40)
+EXISTING_MIN_VOL_1H_USD = env_float("EXISTING_MIN_VOL_1H_USD", 20000.0)
+EXISTING_MIN_LIQ_USD = env_float("EXISTING_MIN_LIQ_USD", 50000.0)
+EXISTING_MIN_BUYS_1H = env_int("EXISTING_MIN_BUYS_1H", 60)
 
-# Risk controls (bot positions only)
-MAX_BUYS_PER_SCAN = env_int("MAX_BUYS_PER_SCAN", 1)
-BUY_COOLDOWN_SEC = env_int("BUY_COOLDOWN_SEC", 15)
-MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 5)
-MAX_MONITORS = env_int("MAX_MONITORS", 20)
+# Operational
+LOG_SKIPS = env_bool("LOG_SKIPS", True)
+AUTO_LIQUIDATE_ON_BOOT = env_bool("AUTO_LIQUIDATE_ON_BOOT", True)
 
-# Confirmation behavior
-CONFIRM_BEFORE_BUY = env_bool("CONFIRM_BEFORE_BUY", False)  # for micro bots, reconcile is more reliable than status
-CONFIRM_TIMEOUT_SEC = env_int("CONFIRM_TIMEOUT_SEC", 120)
-CONFIRM_POLL_SEC = env_float("CONFIRM_POLL_SEC", 1.5)
+# Jupiter rate limit safety
+JUP_MIN_INTERVAL_SEC = env_float("JUP_MIN_INTERVAL_SEC", 0.9)
 
-LOG_SKIPS = env_bool("LOG_SKIPS", False)
-
-SOL_MINT = "So11111111111111111111111111111111111111112"  # wSOL mint
+SOL_MINT = "So11111111111111111111111111111111111111112"   # wSOL
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+
 
 # ===================== GLOBALS =====================
 
@@ -251,29 +249,27 @@ client = AsyncClient(RPC_URL)
 wallet = parse_keypair(PRIVATE_KEY)
 WALLET_PUBKEY = wallet.pubkey()
 
+if EXPECTED_WALLET:
+    if str(WALLET_PUBKEY) != EXPECTED_WALLET:
+        raise RuntimeError(
+            f"Wrong wallet loaded. EXPECTED_WALLET={EXPECTED_WALLET} but derived WALLET={WALLET_PUBKEY}. Fix PRIVATE_KEY env var."
+        )
+
 BUY_AMOUNT_LAMPORTS = int(BUY_SOL * 1e9)
 
-# bot_positions: mint -> position info
-# entry_in_lamports: lamports spent (from quote / or fallback)
-# amount_raw: token amount held (raw)
-# entry_ts: unix timestamp
-bot_positions: Dict[str, Dict[str, Any]] = {}
-
-# pending_buys: sig -> info (pre balances + quote)
-pending_buys: Dict[str, Dict[str, Any]] = {}
-
-# pending_sells: sig -> info
-pending_sells: Dict[str, Dict[str, Any]] = {}
-
-# monitors set to avoid duplicate tasks
+# positions keyed by mint:
+# {
+#   "entry_lamports": int,    # estimated SOL-in cost (lamports)
+#   "entry_ts": float,        # timestamp
+# }
+positions: Dict[str, Dict[str, Any]] = {}
 monitored: Set[str] = set()
-
+pending_buys: Dict[str, float] = {}   # mint -> ts
+pending_sells: Dict[str, float] = {}  # mint -> ts
 _last_buy_ts = 0.0
 
-# ===================== JUP THROTTLE =====================
 
-# Keep it slow to avoid rate limiting. If you need higher throughput, tune carefully.
-JUP_MIN_INTERVAL_SEC = env_float("JUP_MIN_INTERVAL_SEC", 0.9)
+# ===================== JUP THROTTLE =====================
 
 _JUP_LOCK = asyncio.Lock()
 _JUP_NEXT_TS = 0.0
@@ -284,20 +280,17 @@ async def jup_throttle() -> None:
         now = time.time()
         if now < _JUP_NEXT_TS:
             await asyncio.sleep(_JUP_NEXT_TS - now)
-        _JUP_NEXT_TS = time.time() + JUP_MIN_INTERVAL_SEC
+        _JUP_NEXT_TS = time.time() + float(JUP_MIN_INTERVAL_SEC)
 
 def jup_headers() -> Dict[str, str]:
-    return {
-        "x-api-key": JUP_API_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    return {"x-api-key": JUP_API_KEY}
 
-# ===================== DEXSCREENER (DISCOVERY ONLY) =====================
+
+# ===================== DEXSCREENER =====================
 
 def dexscreener_token_data(mint: str) -> Dict[str, Any]:
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-    data = http_get_json(url, timeout=8.0, retries=3)
+    data = http_get_json(url, timeout=8.0, retries=2)
     pairs = data.get("pairs") or []
     best = None
     for p in pairs:
@@ -326,88 +319,118 @@ def dexscreener_token_data(mint: str) -> Dict[str, Any]:
 
 def dexscreener_search(query: str, limit: int) -> List[Dict[str, Any]]:
     url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
-    data = http_get_json(url, timeout=8.0, retries=3)
+    data = http_get_json(url, timeout=8.0, retries=2)
     pairs = data.get("pairs") or []
-    return [p for p in pairs if p.get("chainId") == "solana"][:limit]
+    out = [p for p in pairs if p.get("chainId") == "solana"]
+    return out[:limit]
+
 
 # ===================== BALANCES =====================
 
-async def get_sol_balance_lamports(pubkey: Pubkey) -> int:
-    resp = await client.get_balance(pubkey)
-    return int(resp.value)
+async def get_sol_balance() -> float:
+    try:
+        resp = await client.get_balance(WALLET_PUBKEY)
+        lamports = int(resp.value) if resp and getattr(resp, "value", None) is not None else 0
+        return lamports / 1e9
+    except Exception:
+        return 0.0
 
 async def get_token_balance_raw(mint: str) -> int:
     if not is_valid_solana_mint(mint):
         return 0
     try:
-        opts = TokenAccountOpts(
-            mint=Pubkey.from_string(mint),
-            program_id=TOKEN_PROGRAM_ID
-        )
+        opts = TokenAccountOpts(mint=Pubkey.from_string(mint), program_id=TOKEN_PROGRAM_ID)
         resp = await client.get_token_accounts_by_owner(WALLET_PUBKEY, opts)
         if not resp or not getattr(resp, "value", None):
             return 0
-
-        total = 0
-        for item in resp.value:
-            acct = item.pubkey
-            bal = await client.get_token_account_balance(acct)
-            total += int(bal.value.amount)  # type: ignore
-        return total
-    except Exception as e:
-        log(f"Balance error for {mint}: {e}")
+        acct = resp.value[0].pubkey
+        bal = await client.get_token_account_balance(acct)
+        return int(bal.value.amount)  # type: ignore
+    except Exception:
         return 0
 
-# ===================== JUPITER QUOTES + SWAPS =====================
 
-def build_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
+# ===================== JUPITER SWAP V1 =====================
+
+def jup_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
     return (
         f"{JUP_BASE_URL}/swap/v1/quote"
         f"?inputMint={input_mint}"
         f"&outputMint={output_mint}"
         f"&amount={amount}"
         f"&slippageBps={SLIPPAGE_BPS}"
-        f"&restrictIntermediateTokens=true"
     )
 
-async def jup_quote(input_mint: str, output_mint: str, amount: int) -> Dict[str, Any]:
-    await jup_throttle()
-    url = build_quote_url(input_mint, output_mint, amount)
-    q = http_get_json(url, timeout=12.0, retries=3, headers=jup_headers())
-    if isinstance(q, dict) and q.get("error"):
-        raise RuntimeError(f"JUP quote error: {q.get('error')}")
-    return q
+def jup_swap_url() -> str:
+    return f"{JUP_BASE_URL}/swap/v1/swap"
 
-async def jup_swap(quote: Dict[str, Any]) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "quoteResponse": quote,
-        "userPublicKey": str(WALLET_PUBKEY),
-        "wrapAndUnwrapSol": True,
-    }
-    if PRIORITY_FEE_MICRO_LAMPORTS > 0:
-        payload["computeUnitPriceMicroLamports"] = int(PRIORITY_FEE_MICRO_LAMPORTS)
+async def sol_price_usdc() -> float:
+    # quote 1 SOL -> USDC
+    await jup_throttle()
+    q = http_get_json(jup_quote_url(SOL_MINT, USDC_MINT, 1_000_000_000), timeout=10, retries=2, headers=jup_headers())
+    out = int(q.get("outAmount") or 0)
+    return out / 1_000_000  # USDC decimals = 6
+
+async def roundtrip_edge_usd(output_mint: str, in_lamports: int) -> float:
+    # Simulate SOL->TOKEN then TOKEN->SOL using quoted outAmount, convert edge to USD using SOL->USDC quote
+    sp = await sol_price_usdc()
 
     await jup_throttle()
-    return http_post_json(
-        f"{JUP_BASE_URL}/swap/v1/swap",
-        payload,
-        timeout=20.0,
-        retries=3,
-        headers=jup_headers(),
-    )
+    buy_q = http_get_json(jup_quote_url(SOL_MINT, output_mint, in_lamports), timeout=10, retries=2, headers=jup_headers())
+    buy_out = int(buy_q.get("outAmount") or 0)
+    if buy_out <= 0:
+        return -999.0
 
-async def send_buy(mint: str) -> Optional[str]:
+    await jup_throttle()
+    sell_q = http_get_json(jup_quote_url(output_mint, SOL_MINT, buy_out), timeout=10, retries=2, headers=jup_headers())
+    sell_out = int(sell_q.get("outAmount") or 0)
+    if sell_out <= 0:
+        return -999.0
+
+    edge_sol = (sell_out - in_lamports) / 1e9
+    return edge_sol * sp
+
+async def send_swap(action: str, mint: str) -> Optional[str]:
+    """
+    Execute swap via Jupiter swap/v1.
+    - buy: SOL_MINT -> mint for BUY_AMOUNT_LAMPORTS
+    - sell: mint -> SOL_MINT for full token balance
+    """
     try:
-        # Pre balances for reconcile
-        pre_sol = await get_sol_balance_lamports(WALLET_PUBKEY)
-        pre_tok = await get_token_balance_raw(mint)
+        if action == "buy":
+            input_mint = SOL_MINT
+            output_mint = mint
+            amount = BUY_AMOUNT_LAMPORTS
+        else:
+            bal = await get_token_balance_raw(mint)
+            if bal <= 0:
+                return None
+            input_mint = mint
+            output_mint = SOL_MINT
+            amount = bal
 
-        quote = await jup_quote(SOL_MINT, mint, BUY_AMOUNT_LAMPORTS)
-        swap = await jup_swap(quote)
+        # Quote
+        await jup_throttle()
+        quote = http_get_json(jup_quote_url(input_mint, output_mint, amount), timeout=12.0, retries=2, headers=jup_headers())
+        if isinstance(quote, dict) and quote.get("error"):
+            log(f"Swap error ({action}) mint={mint}: quote_error={quote.get('error')}")
+            return None
 
-        tx_b64 = swap.get("swapTransaction")
+        swap_payload: Dict[str, Any] = {
+            "quoteResponse": quote,
+            "userPublicKey": str(WALLET_PUBKEY),
+            "wrapAndUnwrapSol": True,
+        }
+        if PRIORITY_FEE_MICRO_LAMPORTS > 0:
+            swap_payload["computeUnitPriceMicroLamports"] = int(PRIORITY_FEE_MICRO_LAMPORTS)
+
+        # Swap build
+        await jup_throttle()
+        swap = http_post_json(jup_swap_url(), swap_payload, timeout=20.0, retries=2, headers=jup_headers())
+
+        tx_b64 = swap.get("swapTransaction") if isinstance(swap, dict) else None
         if not tx_b64:
-            log(f"BUY swap error mint={mint}: no swapTransaction")
+            log(f"Swap error ({action}) mint={mint}: no swapTransaction")
             return None
 
         raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
@@ -416,71 +439,17 @@ async def send_buy(mint: str) -> Optional[str]:
         opts = TxOpts(skip_preflight=SKIP_PREFLIGHT, preflight_commitment="processed")
         res = await client.send_transaction(signed_tx, opts=opts)
         sig = str(res.value)
-
-        pending_buys[sig] = {
-            "mint": mint,
-            "sent_ts": time.time(),
-            "pre_sol": int(pre_sol),
-            "pre_tok": int(pre_tok),
-            "quote_in": int(quote.get("inAmount") or BUY_AMOUNT_LAMPORTS),
-            "quote_out": int(quote.get("outAmount") or 0),
-        }
-
-        log(f"BUY sent: https://solscan.io/tx/{sig} mint={mint} inLamports={pending_buys[sig]['quote_in']} expOutRaw={pending_buys[sig]['quote_out']}")
+        log(f"{action.upper()} sent: https://solscan.io/tx/{sig}")
         return sig
     except Exception as e:
-        log(f"BUY error mint={mint}: {e}")
+        log(f"Swap error ({action}) mint={mint}: {e}")
         return None
 
-async def send_sell(mint: str, amount_raw: Optional[int] = None) -> Optional[str]:
-    try:
-        bal = await get_token_balance_raw(mint)
-        if bal <= 0:
-            return None
 
-        sell_amt = int(amount_raw) if amount_raw is not None else bal
-        sell_amt = min(sell_amt, bal)
-        if sell_amt <= 0:
-            return None
-
-        pre_tok = bal
-        pre_sol = await get_sol_balance_lamports(WALLET_PUBKEY)
-
-        quote = await jup_quote(mint, SOL_MINT, sell_amt)
-        swap = await jup_swap(quote)
-
-        tx_b64 = swap.get("swapTransaction")
-        if not tx_b64:
-            log(f"SELL swap error mint={mint}: no swapTransaction")
-            return None
-
-        raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
-        signed_tx = VersionedTransaction(raw_tx.message, [wallet])
-
-        opts = TxOpts(skip_preflight=SKIP_PREFLIGHT, preflight_commitment="processed")
-        res = await client.send_transaction(signed_tx, opts=opts)
-        sig = str(res.value)
-
-        pending_sells[sig] = {
-            "mint": mint,
-            "sent_ts": time.time(),
-            "pre_tok": int(pre_tok),
-            "pre_sol": int(pre_sol),
-            "sell_amt": int(sell_amt),
-            "quote_out": int(quote.get("outAmount") or 0),
-        }
-
-        log(f"SELL sent: https://solscan.io/tx/{sig} mint={mint} sellRaw={sell_amt} expOutLamports={pending_sells[sig]['quote_out']}")
-        return sig
-    except Exception as e:
-        log(f"SELL error mint={mint}: {e}")
-        return None
-
-# ===================== RISK =====================
+# ===================== RISK / STATE =====================
 
 def can_buy_now() -> bool:
-    global _last_buy_ts
-    if len(bot_positions) >= MAX_OPEN_POSITIONS:
+    if len(positions) >= MAX_OPEN_POSITIONS:
         return False
     if (time.time() - _last_buy_ts) < BUY_COOLDOWN_SEC:
         return False
@@ -490,159 +459,216 @@ def mark_bought() -> None:
     global _last_buy_ts
     _last_buy_ts = time.time()
 
-# ===================== RECONCILE =====================
 
-async def reconcile_loop() -> None:
-    """
-    Reconcile pending buys/sells by checking wallet balances.
-    This is more reliable than signature status lookups under RPC lag.
-    """
-    while True:
-        try:
-            # Promote buys when token balance increases
-            for sig, info in list(pending_buys.items()):
-                mint = info["mint"]
-                pre_tok = int(info["pre_tok"])
-                pre_sol = int(info["pre_sol"])
-                now_tok = await get_token_balance_raw(mint)
-
-                if now_tok > pre_tok:
-                    delta = now_tok - pre_tok
-                    now_sol = await get_sol_balance_lamports(WALLET_PUBKEY)
-
-                    # Prefer quote inAmount; fallback to SOL delta (includes fees)
-                    entry_in = int(info.get("quote_in") or 0)
-                    sol_spent = pre_sol - now_sol
-                    if entry_in <= 0 and sol_spent > 0:
-                        entry_in = sol_spent
-                    if entry_in <= 0:
-                        entry_in = BUY_AMOUNT_LAMPORTS
-
-                    bot_positions[mint] = {
-                        "mint": mint,
-                        "amount_raw": int(delta),
-                        "entry_in_lamports": int(entry_in),
-                        "entry_ts": time.time(),
-                        "last_quote_ts": 0.0,
-                    }
-
-                    log(f"RECONCILE BUY: mint={mint} receivedRaw={delta} entryInLamports={entry_in} sig={sig}")
-
-                    pending_buys.pop(sig, None)
-                    mark_bought()
-
-                    # Start monitor
-                    if mint not in monitored and len(monitored) < MAX_MONITORS:
-                        monitored.add(mint)
-                        asyncio.create_task(position_monitor(mint))
-
-            # Clear sells when token balance drops
-            for sig, info in list(pending_sells.items()):
-                mint = info["mint"]
-                pre_tok = int(info["pre_tok"])
-                now_tok = await get_token_balance_raw(mint)
-
-                # If balance dropped materially, treat as exited (simple and effective)
-                if now_tok < pre_tok:
-                    log(f"RECONCILE SELL: mint={mint} preTok={pre_tok} nowTok={now_tok} sig={sig} -> clearing bot position")
-                    bot_positions.pop(mint, None)
-                    monitored.discard(mint)
-                    pending_sells.pop(sig, None)
-
-            # Expire stale pendings
-            now = time.time()
-            for sig, info in list(pending_buys.items()):
-                if now - float(info.get("sent_ts", now)) > 15 * 60:
-                    log(f"RECONCILE: expiring stale pending BUY sig={sig} mint={info.get('mint')}")
-                    pending_buys.pop(sig, None)
-
-            for sig, info in list(pending_sells.items()):
-                if now - float(info.get("sent_ts", now)) > 15 * 60:
-                    log(f"RECONCILE: expiring stale pending SELL sig={sig} mint={info.get('mint')}")
-                    pending_sells.pop(sig, None)
-
-        except Exception as e:
-            log(f"Reconcile error: {e}")
-
-        await asyncio.sleep(3)
-
-# ===================== MONITOR (JUP PNL-BASED) =====================
+# ===================== POSITION MONITOR (CENTS-BASED) =====================
 
 async def position_monitor(mint: str) -> None:
-    """
-    Monitor bot position using Jupiter SELL quotes.
-    Exits on:
-      - pnl_pct >= TP_PCT
-      - pnl_pct <= -SL_PCT
-      - hold time >= MAX_HOLD_SEC
-    """
     try:
         while True:
-            await asyncio.sleep(MONITOR_POLL_SEC)
+            await asyncio.sleep(float(MONITOR_POLL_SEC))
 
-            pos = bot_positions.get(mint)
+            pos = positions.get(mint)
             if not pos:
                 monitored.discard(mint)
                 return
 
-            entry_in = int(pos["entry_in_lamports"])
-            amt_raw = int(pos["amount_raw"])
-            entry_ts = float(pos["entry_ts"])
-
-            # If you no longer hold tokens, clear
             bal = await get_token_balance_raw(mint)
             if bal <= 0:
-                log(f"MONITOR: mint={mint} balance=0 -> clearing")
-                bot_positions.pop(mint, None)
+                # position closed externally or drained
+                positions.pop(mint, None)
                 monitored.discard(mint)
                 return
 
-            # Use current balance for realism (partial fills / airdrops)
-            amt_to_quote = min(amt_raw, bal)
-            if amt_to_quote <= 0:
-                bot_positions.pop(mint, None)
-                monitored.discard(mint)
-                return
-
-            # Get sell quote -> lamports out
-            try:
-                quote = await jup_quote(mint, SOL_MINT, amt_to_quote)
-            except Exception as e:
-                log(f"MONITOR quote error mint={mint}: {e}")
-                continue
-
-            out_lamports = int(quote.get("outAmount") or 0)
-            if out_lamports <= 0 or entry_in <= 0:
-                continue
-
-            pnl = out_lamports - entry_in
-            pnl_pct = pnl / entry_in
-
+            entry_lamports = int(pos["entry_lamports"])
+            entry_ts = float(pos["entry_ts"])
             age = time.time() - entry_ts
 
-            # Logging (lightweight)
-            log(f"PNL mint={mint} age={age:.0f}s in={entry_in} out={out_lamports} pnlLamports={pnl} pnlPct={pnl_pct*100:.2f}%")
+            # executable sell value (token -> SOL outAmount)
+            sp = await sol_price_usdc()
+            await jup_throttle()
+            q = http_get_json(jup_quote_url(mint, SOL_MINT, bal), timeout=10, retries=2, headers=jup_headers())
+            out_lamports = int(q.get("outAmount") or 0)
+            if out_lamports <= 0:
+                continue
 
-            # Exit rules
-            if pnl_pct >= TP_PCT:
-                log(f"EXIT TP mint={mint} pnlPct={pnl_pct*100:.2f}% -> SELL")
-                await send_sell(mint, amount_raw=amt_to_quote)
+            pnl_sol = (out_lamports - entry_lamports) / 1e9
+            pnl_usd = pnl_sol * sp
+
+            # Exit logic (Option A = net cents)
+            if pnl_usd >= TARGET_PROFIT_USD:
+                if mint not in pending_sells:
+                    pending_sells[mint] = time.time()
+                    log(f"EXIT TP mint={mint} pnl_usd={pnl_usd:.4f} age={age:.1f}s -> SELL")
+                    await send_swap("sell", mint)
                 return
 
-            if pnl_pct <= -SL_PCT:
-                log(f"EXIT SL mint={mint} pnlPct={pnl_pct*100:.2f}% -> SELL")
-                await send_sell(mint, amount_raw=amt_to_quote)
+            if pnl_usd <= -MAX_LOSS_USD:
+                if mint not in pending_sells:
+                    pending_sells[mint] = time.time()
+                    log(f"EXIT SL mint={mint} pnl_usd={pnl_usd:.4f} age={age:.1f}s -> SELL")
+                    await send_swap("sell", mint)
                 return
 
             if age >= MAX_HOLD_SEC:
-                log(f"EXIT TIME mint={mint} age={age:.0f}s -> SELL")
-                await send_sell(mint, amount_raw=amt_to_quote)
+                if mint not in pending_sells:
+                    pending_sells[mint] = time.time()
+                    log(f"EXIT TIME mint={mint} pnl_usd={pnl_usd:.4f} age={age:.1f}s -> SELL")
+                    await send_swap("sell", mint)
                 return
 
-    finally:
+            # (optional) periodic telemetry (keep it sparse)
+            if LOG_SKIPS and int(time.time()) % 15 == 0:
+                log(f"PNL mint={mint} bal={bal} outLamports={out_lamports} pnl_usd={pnl_usd:.4f} age={age:.1f}s")
+
+    except Exception as e:
+        log(f"Monitor error mint={mint}: {e}")
         monitored.discard(mint)
 
-# ===================== EXISTING MOVERS (DISCOVERY) =====================
+
+# ===================== RECONCILE (BALANCE-BASED, NO LIES) =====================
+
+async def reconcile_loop() -> None:
+    """
+    Solana RPC / status lookups can lag or miss.
+    For micro scalping, we treat "balance changed" as truth.
+    - If pending buy mint has balance > 0 => create position + start monitor
+    - If position mint has balance == 0 => close position
+    """
+    while True:
+        await asyncio.sleep(2.0)
+
+        # Promote pending buys to positions if they landed
+        for mint in list(pending_buys.keys()):
+            bal = await get_token_balance_raw(mint)
+            if bal > 0:
+                if mint not in positions:
+                    positions[mint] = {
+                        "entry_lamports": int(BUY_AMOUNT_LAMPORTS),  # conservative: assume full spend
+                        "entry_ts": time.time(),
+                    }
+                    log(f"RECONCILE: BUY landed mint={mint} bal={bal} -> tracking position")
+                    if mint not in monitored and len(monitored) < MAX_OPEN_POSITIONS:
+                        monitored.add(mint)
+                        asyncio.create_task(position_monitor(mint))
+                pending_buys.pop(mint, None)
+
+        # Clean pending sells once balance is gone
+        for mint in list(pending_sells.keys()):
+            bal = await get_token_balance_raw(mint)
+            if bal <= 0:
+                pending_sells.pop(mint, None)
+                positions.pop(mint, None)
+                monitored.discard(mint)
+                log(f"RECONCILE: SELL done mint={mint} -> closed")
+
+
+# ===================== NO-BAGS: LIQUIDATE ON BOOT =====================
+
+def _mint_from_token_account(item: Any) -> Optional[str]:
+    # best-effort extract mint from parsed token account response
+    try:
+        data = item.account.data
+        parsed = getattr(data, "parsed", None)
+        if parsed and isinstance(parsed, dict):
+            info = parsed.get("info") or {}
+            mint = info.get("mint")
+            if mint and isinstance(mint, str):
+                return mint
+    except Exception:
+        return None
+    return None
+
+async def liquidate_all_holdings_on_boot() -> None:
+    if not AUTO_LIQUIDATE_ON_BOOT:
+        return
+
+    # scan SPL token accounts for any non-zero holdings and sell them
+    try:
+        resp = await client.get_token_accounts_by_owner(
+            WALLET_PUBKEY,
+            TokenAccountOpts(program_id=TOKEN_PROGRAM_ID)
+        )
+        items = resp.value if resp and getattr(resp, "value", None) else []
+        sold = 0
+
+        for item in items:
+            mint = _mint_from_token_account(item)
+            if not mint or not is_valid_solana_mint(mint):
+                continue
+            if mint in (SOL_MINT, USDC_MINT):
+                continue
+
+            # check balance
+            try:
+                acct = item.pubkey
+                bal = await client.get_token_account_balance(acct)
+                amt_raw = int(bal.value.amount)  # type: ignore
+            except Exception:
+                continue
+
+            if amt_raw <= 0:
+                continue
+
+            log(f"BOOT LIQUIDATE: mint={mint} raw_bal={amt_raw} -> SELL")
+            await send_swap("sell", mint)
+            sold += 1
+            await asyncio.sleep(0.2)
+
+        if sold > 0:
+            log(f"BOOT LIQUIDATE complete: attempted_sells={sold} (reconcile will confirm closures)")
+        else:
+            log("BOOT LIQUIDATE: nothing to sell")
+
+    except Exception as e:
+        log(f"BOOT LIQUIDATE error: {e}")
+
+
+# ===================== ENTRY FLOW =====================
+
+async def maybe_buy_mint(mint: str, px_usd: float, context: str) -> None:
+    """
+    Core entry gate for micro scalper:
+    - must not already hold it
+    - must not already be tracked/pending
+    - must pass risk limits
+    - must pass quote-based round-trip edge test
+    """
+    if not is_valid_solana_mint(mint):
+        return
+    if mint in positions or mint in pending_buys or mint in pending_sells:
+        if LOG_SKIPS:
+            log(f"SKIP already_tracked mint={mint} ctx={context}")
+        return
+    if not can_buy_now():
+        if LOG_SKIPS:
+            log(f"SKIP risk mint={mint} ctx={context} positions={len(positions)} cooldown={(time.time()-_last_buy_ts):.1f}s")
+        return
+
+    # do not scale into existing holdings (no bags)
+    bal = await get_token_balance_raw(mint)
+    if bal > 0:
+        if LOG_SKIPS:
+            log(f"SKIP holding mint={mint} bal={bal} ctx={context}")
+        return
+
+    # quote-driven roundtrip edge gating (this is the key for "few cents net" strategy)
+    edge = await roundtrip_edge_usd(mint, BUY_AMOUNT_LAMPORTS)
+    need = MIN_ROUNDTRIP_EDGE_USD + EDGE_BUFFER_USD
+    if edge < need:
+        if LOG_SKIPS:
+            log(f"SKIP no_edge mint={mint} edge_usd={edge:.4f} need>={need:.4f} ctx={context}")
+        return
+
+    sig = await send_swap("buy", mint)
+    if not sig:
+        return
+
+    pending_buys[mint] = time.time()
+    mark_bought()
+    log(f"BUY queued mint={mint} edge_usd={edge:.4f} entry_px_usd={px_usd:.10f} ctx={context}")
+
+
+# ===================== EXISTING MOVERS =====================
 
 async def scan_existing_tokens() -> None:
     queries = [q.strip() for q in EXISTING_QUERIES.split(",") if q.strip()]
@@ -653,11 +679,10 @@ async def scan_existing_tokens() -> None:
         scanned = 0
         candidates = 0
         buys = 0
-
         skipped_invalid = 0
         skipped_filters = 0
         skipped_risk = 0
-        skipped_already_bot = 0
+        skipped_tracked = 0
 
         seen: Dict[str, Dict[str, Any]] = {}
 
@@ -670,8 +695,9 @@ async def scan_existing_tokens() -> None:
                     if not is_valid_solana_mint(mint):
                         skipped_invalid += 1
                         continue
-                    if mint not in seen:
-                        seen[mint] = p
+                    if mint in seen:
+                        continue
+                    seen[mint] = p
 
             ranked: List[Tuple[float, Dict[str, Any]]] = []
             for mint, p in seen.items():
@@ -679,7 +705,6 @@ async def scan_existing_tokens() -> None:
                 vol1h = float((p.get("volume") or {}).get("h1") or 0.0)
                 liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
                 buys1h = int(((p.get("txns") or {}).get("h1") or {}).get("buys") or 0)
-
                 if (change1h >= EXISTING_MIN_CHG_1H and
                     vol1h >= EXISTING_MIN_VOL_1H_USD and
                     liq >= EXISTING_MIN_LIQ_USD and
@@ -693,48 +718,39 @@ async def scan_existing_tokens() -> None:
             for _, p in ranked:
                 if buys >= MAX_BUYS_PER_SCAN:
                     break
-
                 mint = (p.get("baseToken") or {}).get("address") or ""
-                chg = float((p.get("priceChange") or {}).get("h1") or 0.0)
-                vol = float((p.get("volume") or {}).get("h1") or 0.0)
+                change1h = float((p.get("priceChange") or {}).get("h1") or 0.0)
+                vol1h = float((p.get("volume") or {}).get("h1") or 0.0)
                 liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
-                b1h = int(((p.get("txns") or {}).get("h1") or {}).get("buys") or 0)
+                buys1h = int(((p.get("txns") or {}).get("h1") or {}).get("buys") or 0)
                 px = float(p.get("priceUsd") or 0.0)
 
                 candidates += 1
-                log(f"EXISTING candidate {mint} | chg1h={chg:.2f}% vol1h=${vol:.2f} liq=${liq:.2f} buys1h={b1h} px=${px:.10f}")
+                log(f"EXISTING candidate {mint} | chg1h={change1h:.2f}% vol1h=${vol1h:.2f} liq=${liq:.2f} buys1h={buys1h} px=${px:.10f}")
 
-                if mint in bot_positions:
-                    skipped_already_bot += 1
+                if mint in positions or mint in pending_buys or mint in pending_sells:
+                    skipped_tracked += 1
                     continue
-
                 if not can_buy_now():
                     skipped_risk += 1
                     continue
 
-                # A-mode: do NOT adopt holdings; but avoid buying if already holding (basic safety)
-                bal = await get_token_balance_raw(mint)
-                if bal > 0:
-                    if LOG_SKIPS:
-                        log(f"SKIP holding mint={mint} bal={bal}")
-                    continue
-
-                sig = await send_buy(mint)
-                if not sig:
-                    continue
-
-                buys += 1
+                await maybe_buy_mint(mint, px, context="existing")
+                if mint in pending_buys:
+                    buys += 1
 
         except Exception as e:
             log(f"ExistingScan error: {e}")
 
         log(
-            f"ExistingScan cycle={cycle} scanned={scanned} candidates={candidates} buys={buys} "
-            f"skipped(invalid={skipped_invalid}, filters={skipped_filters}, already_bot={skipped_already_bot}, risk={skipped_risk}) "
-            f"bot_positions={len(bot_positions)} pending_buys={len(pending_buys)}"
+            "ExistingScan "
+            f"cycle={cycle} scanned={scanned} candidates={candidates} buys={buys} "
+            f"skipped(invalid={skipped_invalid}, filters={skipped_filters}, risk={skipped_risk}, tracked={skipped_tracked}) "
+            f"bot_positions={len(positions)} pending_buys={len(pending_buys)}"
         )
 
         await asyncio.sleep(EXISTING_SCAN_EVERY_SEC)
+
 
 # ===================== NEW LAUNCHES (WS) =====================
 
@@ -762,7 +778,7 @@ async def monitor_new_launches() -> None:
                     if NEW_REQUIRE_SOCIALS and not socials_ok:
                         continue
 
-                    # Warmup to avoid dead launches
+                    # Warmup to let liquidity form
                     await asyncio.sleep(NEW_WARMUP_SEC)
 
                     td = dexscreener_token_data(mint)
@@ -771,21 +787,15 @@ async def monitor_new_launches() -> None:
                     buys1h = int(td.get("buys_h1") or 0)
                     px = float(td.get("priceUsd") or 0.0)
 
-                    if vol1h < NEW_MIN_VOL_1H_USD or liq < NEW_MIN_LIQ_USD or buys1h < NEW_MIN_BUYS_1H or px <= 0:
+                    if px <= 0:
                         continue
-
-                    if mint in bot_positions:
-                        continue
-                    if not can_buy_now():
-                        continue
-
-                    bal = await get_token_balance_raw(mint)
-                    if bal > 0:
+                    if vol1h < NEW_MIN_VOL_1H_USD or liq < NEW_MIN_LIQ_USD or buys1h < NEW_MIN_BUYS_1H:
+                        if LOG_SKIPS:
+                            log(f"SKIP NEW filters mint={mint} vol1h={vol1h:.1f} liq={liq:.1f} buys1h={buys1h} px={px:.10f}")
                         continue
 
                     log(f"NEW candidate {mint} | vol1h=${vol1h:.2f} liq=${liq:.2f} buys1h={buys1h} px=${px:.10f} socials={socials_ok}")
-
-                    await send_buy(mint)
+                    await maybe_buy_mint(mint, px, context="new")
 
         except websockets.exceptions.ConnectionClosedError as e:
             log(f"WS closed: {e}. Reconnecting in {backoff}s...")
@@ -796,48 +806,49 @@ async def monitor_new_launches() -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
+
 # ===================== HEARTBEAT =====================
 
 async def heartbeat() -> None:
     while True:
         await asyncio.sleep(60)
         log(
-            f"Heartbeat: bot_positions={len(bot_positions)} monitored={len(monitored)} "
+            f"Heartbeat: bot_positions={len(positions)} monitored={len(monitored)} "
             f"pending_buys={len(pending_buys)} pending_sells={len(pending_sells)} "
-            f"TP_PCT={TP_PCT} SL_PCT={SL_PCT} MAX_HOLD_SEC={MAX_HOLD_SEC}"
+            f"TARGET_PROFIT_USD={TARGET_PROFIT_USD} MAX_LOSS_USD={MAX_LOSS_USD} MAX_HOLD_SEC={MAX_HOLD_SEC}"
         )
+
 
 # ===================== MAIN =====================
 
 async def main() -> None:
+    sol_bal = await get_sol_balance()
+
     log("BOOT CONFIG:")
     log(f"  WALLET={WALLET_PUBKEY}")
     log(f"  WS_URL={WS_URL}")
     log(f"  RPC_URL={RPC_URL}")
     log(f"  JUP_BASE_URL={JUP_BASE_URL}")
     log(f"  BUY_SOL={BUY_SOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIORITY_FEE_MICRO_LAMPORTS={PRIORITY_FEE_MICRO_LAMPORTS} SKIP_PREFLIGHT={SKIP_PREFLIGHT}")
-    log(f"  MICRO: TP_PCT={TP_PCT} SL_PCT={SL_PCT} MAX_HOLD_SEC={MAX_HOLD_SEC} MONITOR_POLL_SEC={MONITOR_POLL_SEC}")
+    log(f"  MICRO: TARGET_PROFIT_USD={TARGET_PROFIT_USD} MAX_LOSS_USD={MAX_LOSS_USD} MAX_HOLD_SEC={MAX_HOLD_SEC} MONITOR_POLL_SEC={MONITOR_POLL_SEC}")
+    log(f"  EDGE: MIN_ROUNDTRIP_EDGE_USD={MIN_ROUNDTRIP_EDGE_USD} EDGE_BUFFER_USD={EDGE_BUFFER_USD}")
     log(f"  NEW: warmup={NEW_WARMUP_SEC}s minVol1h={NEW_MIN_VOL_1H_USD} minLiq={NEW_MIN_LIQ_USD} minBuys1h={NEW_MIN_BUYS_1H} requireSocials={NEW_REQUIRE_SOCIALS}")
     log(f"  EXISTING: queries={EXISTING_QUERIES} limitPerQuery={EXISTING_LIMIT_PER_QUERY} scanEvery={EXISTING_SCAN_EVERY_SEC}s")
     log(f"           minChg1h={EXISTING_MIN_CHG_1H}% minVol1h={EXISTING_MIN_VOL_1H_USD} minLiq={EXISTING_MIN_LIQ_USD} minBuys1h={EXISTING_MIN_BUYS_1H}")
     log(f"  RISK: MAX_BUYS_PER_SCAN={MAX_BUYS_PER_SCAN} BUY_COOLDOWN_SEC={BUY_COOLDOWN_SEC} MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}")
     log(f"  JUP_MIN_INTERVAL_SEC={JUP_MIN_INTERVAL_SEC}")
+    log(f"  LOG_SKIPS={LOG_SKIPS}")
+    log(f"  AUTO_LIQUIDATE_ON_BOOT={AUTO_LIQUIDATE_ON_BOOT}")
+    log(f"  SOL_BALANCE={sol_bal:.6f} SOL")
 
-    if EXPECTED_WALLET and str(WALLET_PUBKEY) != EXPECTED_WALLET:
-        raise RuntimeError(
-            f"Wrong wallet loaded. EXPECTED_WALLET={EXPECTED_WALLET} but derived WALLET={WALLET_PUBKEY}. Fix PRIVATE_KEY env var."
-        )
-
-    sol_lamports = await get_sol_balance_lamports(WALLET_PUBKEY)
-    sol = sol_lamports / 1e9
-    log(f"  SOL_BALANCE={sol:.6f} SOL")
-    if sol < MIN_SOL_BALANCE_SOL:
-        raise RuntimeError(f"SOL balance too low: {sol:.6f} SOL. Need MIN_SOL_BALANCE_SOL={MIN_SOL_BALANCE_SOL:.6f} SOL")
+    # No bags: dump everything on boot (except SOL/USDC) so we only trade what this bot opens
+    await liquidate_all_holdings_on_boot()
 
     asyncio.create_task(reconcile_loop())
     asyncio.create_task(scan_existing_tokens())
     asyncio.create_task(heartbeat())
     await monitor_new_launches()
+
 
 if __name__ == "__main__":
     try:
