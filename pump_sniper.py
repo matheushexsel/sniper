@@ -27,33 +27,35 @@ WS_URL = os.environ.get("WS_URL", "wss://pumpportal.fun/api/data")
 BUY_SOL = float(os.environ.get("BUY_SOL", "0.01"))
 SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", "150"))
 PRIORITY_FEE_MICRO_LAMPORTS = int(os.environ.get("PRIORITY_FEE_MICRO_LAMPORTS", "0"))
-SKIP_PREFLIGHT = os.environ.get("SKIP_PREFLIGHT", "true").lower() == "true"
+
+# IMPORTANT: default to FALSE so we get real errors instead of “ghost sends”
+SKIP_PREFLIGHT = os.environ.get("SKIP_PREFLIGHT", "false").lower() == "true"
 
 # NEW token filters
-MIN_VOLUME_USD_NEW = float(os.environ.get("MIN_VOLUME_USD_NEW", "200"))
-MIN_LIQUIDITY_USD_NEW = float(os.environ.get("MIN_LIQUIDITY_USD_NEW", "3000"))
-MIN_BUYS_H1_NEW = int(os.environ.get("MIN_BUYS_H1_NEW", "5"))
+MIN_VOLUME_USD_NEW = float(os.environ.get("MIN_VOLUME_USD_NEW", "250"))
+MIN_LIQUIDITY_USD_NEW = float(os.environ.get("MIN_LIQUIDITY_USD_NEW", "5000"))
+MIN_BUYS_H1_NEW = int(os.environ.get("MIN_BUYS_H1_NEW", "8"))
 REQUIRE_SOCIALS = os.environ.get("REQUIRE_SOCIALS", "false").lower() == "true"
 NEW_TOKEN_WARMUP_SEC = int(os.environ.get("NEW_TOKEN_WARMUP_SEC", "60"))
 
 # EXISTING movers filters
-MIN_PRICE_CHANGE_1H = float(os.environ.get("MIN_PRICE_CHANGE_1H", "1"))
-MIN_VOLUME_USD_EXISTING = float(os.environ.get("MIN_VOLUME_USD_EXISTING", "1500"))
-MIN_LIQUIDITY_USD_EXISTING = float(os.environ.get("MIN_LIQUIDITY_USD_EXISTING", "8000"))
-MIN_BUYS_H1_EXISTING = int(os.environ.get("MIN_BUYS_H1_EXISTING", "15"))
+MIN_PRICE_CHANGE_1H = float(os.environ.get("MIN_PRICE_CHANGE_1H", "2"))
+MIN_VOLUME_USD_EXISTING = float(os.environ.get("MIN_VOLUME_USD_EXISTING", "3000"))
+MIN_LIQUIDITY_USD_EXISTING = float(os.environ.get("MIN_LIQUIDITY_USD_EXISTING", "15000"))
+MIN_BUYS_H1_EXISTING = int(os.environ.get("MIN_BUYS_H1_EXISTING", "25"))
 
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "15"))
 
 # Risk controls
 MAX_BUYS_PER_SCAN = int(os.environ.get("MAX_BUYS_PER_SCAN", "2"))
-BUY_COOLDOWN_SEC = int(os.environ.get("BUY_COOLDOWN_SEC", "8"))
+BUY_COOLDOWN_SEC = int(os.environ.get("BUY_COOLDOWN_SEC", "10"))
 CONFIRM_BEFORE_BUY = os.environ.get("CONFIRM_BEFORE_BUY", "true").lower() == "true"
 
 # Price sanity
 MIN_PRICE_USD = float(os.environ.get("MIN_PRICE_USD", "0.00000001"))  # 1e-8
-MAX_PRICE_USD = float(os.environ.get("MAX_PRICE_USD", "10000"))       # guard
+MAX_PRICE_USD = float(os.environ.get("MAX_PRICE_USD", "10000"))
 
-# TP/SL
+# Confirm + sell
 PROFIT_TARGET_X = float(os.environ.get("PROFIT_TARGET_X", "1.6"))
 STOP_LOSS_X = float(os.environ.get("STOP_LOSS_X", "0.75"))
 PRICE_POLL_SEC = int(os.environ.get("PRICE_POLL_SEC", "5"))
@@ -154,8 +156,11 @@ async def fetch_json(
     return {}
 
 
+def price_ok(px: float) -> bool:
+    return (px is not None) and (px >= MIN_PRICE_USD) and (px <= MAX_PRICE_USD)
+
+
 async def get_token_data_dexscreener(session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
-    # more reliable than "latest/dex/tokens/{mint}"
     url = f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
     try:
         pools = await fetch_json(session, url, method="GET", headers={"Accept": "application/json"}, retries=2)
@@ -175,7 +180,7 @@ async def get_token_data_dexscreener(session: aiohttp.ClientSession, mint: str) 
             "change_h1": chg1h,
         }
     except Exception as e:
-        log(f"Dexscreener token data error for {mint}: {e}")
+        log(f"Dexscreener token data error for {mint}: {repr(e)}")
         return {}
 
 
@@ -186,7 +191,7 @@ async def search_pairs_dexscreener(session: aiohttp.ClientSession, q: str, limit
         pairs = r.get("pairs") or []
         return pairs[:limit]
     except Exception as e:
-        log(f"Dexscreener search error (q={q}): {e}")
+        log(f"Dexscreener search error (q={q}): {repr(e)}")
         return []
 
 
@@ -230,7 +235,51 @@ async def jupiter_swap_tx(session: aiohttp.ClientSession, quote: Dict[str, Any],
     return await fetch_json(session, url, method="POST", headers=jup_headers(), payload=payload, retries=2)
 
 
+async def wait_signature_confirmed(client: AsyncClient, sig: str, timeout_sec: int = 25) -> Tuple[bool, str]:
+    """
+    Returns (confirmed, reason)
+    """
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        try:
+            st = await client.get_signature_statuses([sig], search_transaction_history=True)
+            val = getattr(st, "value", None)
+            if val and len(val) > 0 and val[0] is not None:
+                s0 = val[0]
+                err = getattr(s0, "err", None)
+                conf = getattr(s0, "confirmation_status", None)  # processed/confirmed/finalized
+                if err is not None:
+                    return False, f"status err={err}"
+                if conf in ("confirmed", "finalized"):
+                    return True, f"status={conf}"
+        except Exception as e:
+            # ignore and retry
+            _ = e
+        await asyncio.sleep(1.5)
+    return False, "timeout waiting confirmation"
+
+
 last_buy_ts = 0.0
+
+
+async def confirm_ok(session: aiohttp.ClientSession, mint: str, mode: str) -> Tuple[bool, str, Dict[str, Any]]:
+    t = await get_token_data_dexscreener(session, mint)
+    px = float(t.get("priceUsd", 0) or 0)
+    vol = float(t.get("volume_h1", 0) or 0)
+    liq = float(t.get("liquidity_usd", 0) or 0)
+    buys = int(t.get("buys_h1", 0) or 0)
+
+    if not price_ok(px):
+        return False, f"bad price {px}", t
+
+    if mode == "new":
+        if vol < MIN_VOLUME_USD_NEW or liq < MIN_LIQUIDITY_USD_NEW or buys < MIN_BUYS_H1_NEW:
+            return False, f"new confirm failed vol={vol} liq={liq} buys={buys}", t
+    else:
+        if vol < MIN_VOLUME_USD_EXISTING or liq < MIN_LIQUIDITY_USD_EXISTING or buys < MIN_BUYS_H1_EXISTING:
+            return False, f"existing confirm failed vol={vol} liq={liq} buys={buys}", t
+
+    return True, "ok", t
 
 
 async def send_swap(
@@ -243,7 +292,7 @@ async def send_swap(
 ) -> Optional[str]:
     global last_buy_ts
 
-    # Cooldown to avoid blasting swaps
+    # Cooldown
     if action == "buy":
         now = time.time()
         if now - last_buy_ts < BUY_COOLDOWN_SEC:
@@ -278,7 +327,6 @@ async def send_swap(
         tx_bytes = base64.b64decode(swap_tx_b64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # manual signature + populate (compatible with older solders)
         sig = keypair.sign_message(bytes(tx.message))
         signed_tx = VersionedTransaction.populate(tx.message, [sig])
 
@@ -290,47 +338,25 @@ async def send_swap(
             log(f"RPC send_raw_transaction unexpected response: {resp}")
             return None
 
+        # Now verify it actually exists / confirms
+        ok, reason = await wait_signature_confirmed(client, signature, timeout_sec=25)
+        if not ok:
+            log(f"{action.upper()} NOT confirmed for {mint}: sig={signature} reason={reason}")
+            return None
+
         if action == "buy":
             last_buy_ts = time.time()
 
-        log(f"{action.upper()} sent: https://solscan.io/tx/{signature}")
+        log(f"{action.upper()} confirmed: https://solscan.io/tx/{signature} ({reason})")
         return signature
 
     except Exception as e:
-        # print full repr to avoid blank messages
         log(f"Swap error ({action}) for {mint}: {repr(e)}")
         return None
 
 
 monitored_tokens: Dict[str, float] = {}
 monitor_semaphore: asyncio.Semaphore
-
-
-def price_ok(px: float) -> bool:
-    return (px is not None) and (px >= MIN_PRICE_USD) and (px <= MAX_PRICE_USD)
-
-
-async def confirm_ok(session: aiohttp.ClientSession, mint: str, mode: str) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    mode: 'new' or 'existing'
-    """
-    t = await get_token_data_dexscreener(session, mint)
-    px = float(t.get("priceUsd", 0) or 0)
-    vol = float(t.get("volume_h1", 0) or 0)
-    liq = float(t.get("liquidity_usd", 0) or 0)
-    buys = int(t.get("buys_h1", 0) or 0)
-
-    if not price_ok(px):
-        return False, f"bad price {px}", t
-
-    if mode == "new":
-        if vol < MIN_VOLUME_USD_NEW or liq < MIN_LIQUIDITY_USD_NEW or buys < MIN_BUYS_H1_NEW:
-            return False, f"new confirm failed vol={vol} liq={liq} buys={buys}", t
-    else:
-        if vol < MIN_VOLUME_USD_EXISTING or liq < MIN_LIQUIDITY_USD_EXISTING or buys < MIN_BUYS_H1_EXISTING:
-            return False, f"existing confirm failed vol={vol} liq={liq} buys={buys}", t
-
-    return True, "ok", t
 
 
 async def heartbeat_loop() -> None:
@@ -429,7 +455,6 @@ async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClie
                 liq = float((p.get("liquidity") or {}).get("usd", 0) or 0)
                 px = float(p.get("priceUsd", 0) or 0)
 
-                # First-pass filters from search payload
                 if not (change1h >= MIN_PRICE_CHANGE_1H and vol1h >= MIN_VOLUME_USD_EXISTING and liq >= MIN_LIQUIDITY_USD_EXISTING and price_ok(px)):
                     skipped_filters += 1
                     continue
@@ -444,9 +469,12 @@ async def scan_existing_tokens(session: aiohttp.ClientSession, client: AsyncClie
                         if LOG_SKIPS:
                             log(f"EXISTING confirm skip {mint}: {reason}")
                         continue
-                    px = float(t.get("priceUsd", px) or px)
+                    px2 = float(t.get("priceUsd", 0) or 0)
+                    if not price_ok(px2):
+                        skipped_confirm += 1
+                        continue
+                    px = px2
 
-                # Cooldown check before actually buying
                 now = time.time()
                 if now - last_buy_ts < BUY_COOLDOWN_SEC:
                     skipped_cooldown += 1
@@ -506,7 +534,6 @@ async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClie
                     if await get_token_balance(client, owner, mint) > 0:
                         continue
 
-                    # confirm from token endpoint
                     ok, reason, t = await confirm_ok(session, mint, "new")
                     if not ok:
                         if LOG_SKIPS:
@@ -514,6 +541,9 @@ async def monitor_new_launches(session: aiohttp.ClientSession, client: AsyncClie
                         continue
 
                     px = float(t.get("priceUsd", 0) or 0)
+                    if not price_ok(px):
+                        continue
+
                     vol = float(t.get("volume_h1", 0) or 0)
                     liq = float(t.get("liquidity_usd", 0) or 0)
                     buys = int(t.get("buys_h1", 0) or 0)
