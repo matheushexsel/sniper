@@ -14,7 +14,11 @@ from solders.transaction import VersionedTransaction
 
 # ===================== CONFIG =====================
 
-PRIVATE_KEY = "5j2MJsbFgCZfHXiAs7uSDPMukt8xKDDpj9vSQxigG9hZUd4aNVaMq4HcF4jBcP2Hxc3qRAuacyQmUs8SkmDq4qU5"
+import os
+
+PRIVATE_KEY = os.environ["PRIVATE_KEY"]
+RPC_URL = os.environ["RPC_URL"]
+JUP_API_KEY = os.environ.get("JUP_API_KEY")  # may be required
 RPC_URL = "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
 WS_URL = "wss://pumpportal.fun/api/data"
 
