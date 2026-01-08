@@ -1,20 +1,27 @@
-import asyncio
-import json
 import os
+import json
 import time
 import base64
+import random
 import binascii
+import socket
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import base58
 import requests
 import websockets
+import urllib3.util.connection as urllib3_cn
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TokenAccountOpts, TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
+
+
+# Force IPv4 DNS resolution (helps in some cloud runtimes)
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 
 # ===================== UTIL =====================
@@ -60,8 +67,8 @@ def _strip_wrappers(s: str) -> str:
 def parse_keypair(private_key_env: str) -> Keypair:
     """
     Accepts common Solana secret formats:
-      1) base58 64-byte secret key (most common)
-      2) base58 32-byte seed (also common) -> Keypair.from_seed
+      1) base58 64-byte secret key (common)
+      2) base58 32-byte seed -> Keypair.from_seed
       3) JSON array of ints (len 64 or 32)
       4) base64 of 64/32 bytes
       5) hex string of 64/32 bytes
@@ -102,7 +109,6 @@ def parse_keypair(private_key_env: str) -> Keypair:
 
     # 4) hex decode
     try:
-        # allow "0x" prefix
         hx = pk[2:] if pk.lower().startswith("0x") else pk
         raw = binascii.unhexlify(hx)
         if len(raw) == 64:
@@ -112,15 +118,13 @@ def parse_keypair(private_key_env: str) -> Keypair:
     except Exception:
         pass
 
-    # If user mistakenly pasted a public key (wallet address), it will decode base58 to 32 bytes,
-    # but it's NOT a seed. There's no reliable way to detect that, so we fail hard.
     raise RuntimeError(
         "PRIVATE_KEY format invalid. Use: base58 64-byte secret key OR base58 32-byte seed OR JSON array (32/64) OR base64/hex (32/64). "
-        "Also ensure you did NOT paste the wallet address/public key."
+        "Do NOT paste the wallet address/public key or a 12/24-word seed phrase."
     )
 
 
-def http_get_json(url: str, timeout: float = 8.0, retries: int = 3) -> Dict[str, Any]:
+def http_get_json(url: str, timeout: float = 10.0, retries: int = 3) -> Dict[str, Any]:
     last = None
     for i in range(retries):
         try:
@@ -129,10 +133,11 @@ def http_get_json(url: str, timeout: float = 8.0, retries: int = 3) -> Dict[str,
             return r.json()
         except Exception as e:
             last = e
-            time.sleep(0.4 * (2 ** i))
+            time.sleep(0.35 * (i + 1) + random.random() * 0.2)
     raise RuntimeError(f"GET failed after {retries} retries: {url} err={last}")
 
-def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 12.0, retries: int = 3) -> Dict[str, Any]:
+
+def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 15.0, retries: int = 3) -> Dict[str, Any]:
     last = None
     for i in range(retries):
         try:
@@ -141,8 +146,9 @@ def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 12.0, ret
             return r.json()
         except Exception as e:
             last = e
-            time.sleep(0.6 * (2 ** i))
+            time.sleep(0.35 * (i + 1) + random.random() * 0.2)
     raise RuntimeError(f"POST failed after {retries} retries: {url} err={last}")
+
 
 def is_valid_solana_mint(mint: str) -> bool:
     try:
@@ -152,10 +158,25 @@ def is_valid_solana_mint(mint: str) -> bool:
         return False
 
 
+def dns_diag() -> None:
+    # Fast, practical: tells you if the container can resolve common hosts
+    hosts = ["api.jup.ag", "quote-api.jup.ag", "api.dexscreener.com", "google.com"]
+    for host in hosts:
+        try:
+            infos = socket.getaddrinfo(host, 443)
+            addrs = sorted({i[4][0] for i in infos})
+            log(f"[DNS OK] {host} -> {addrs[:6]}")
+        except Exception as e:
+            log(f"[DNS FAIL] {host} -> {e}")
+
+
 # ===================== CONFIG (ENV VARS) =====================
 
 RPC_URL = env_str("RPC_URL")
-WS_URL = os.getenv("WS_URL", "wss://pumpportal.fun/api/data")
+WS_URL = os.getenv("WS_URL", "wss://pumpportal.fun/api/data").strip()
+
+# Jupiter base (critical: do NOT hardcode quote-api.jup.ag)
+JUP_BASE_URL = os.getenv("JUP_BASE_URL", "https://api.jup.ag").strip().rstrip("/")
 
 PRIVATE_KEY = env_str("PRIVATE_KEY")
 
@@ -273,9 +294,6 @@ async def get_token_balance(mint: str) -> int:
         amt = int(bal.value.amount)  # type: ignore
         return amt
     except Exception as e:
-        if "InvalidParams" in str(type(e)) or "InvalidParamsMessage" in str(type(e)):
-            log(f"Balance RPC returned non-standard response for {mint}: {type(e)}")
-            return 0
         log(f"Balance error for {mint}: {e}")
         return 0
 
@@ -283,13 +301,18 @@ async def get_token_balance(mint: str) -> int:
 # ===================== JUPITER SWAP =====================
 
 def build_jupiter_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
+    # Use api.jup.ag by default; allow override via JUP_BASE_URL env
     return (
-        "https://quote-api.jup.ag/v6/quote"
+        f"{JUP_BASE_URL}/v6/quote"
         f"?inputMint={input_mint}"
         f"&outputMint={output_mint}"
         f"&amount={amount}"
         f"&slippageBps={SLIPPAGE_BPS}"
     )
+
+def jupiter_swap_url() -> str:
+    return f"{JUP_BASE_URL}/v6/swap"
+
 
 async def send_swap(action: str, mint: str) -> Optional[str]:
     try:
@@ -308,16 +331,16 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
         quote_url = build_jupiter_quote_url(input_mint, output_mint, amount)
 
         try:
-            quote = http_get_json(quote_url, timeout=10.0, retries=3)
+            quote = http_get_json(quote_url, timeout=12.0, retries=3)
         except Exception as e:
             log(f"Swap error ({action}) mint={mint}: quote_error={e}")
             return None
 
-        if "error" in quote:
-            log(f"Swap error ({action}) mint={mint}: quote_error={quote.get('error')}")
+        if not isinstance(quote, dict) or quote.get("error"):
+            log(f"Swap error ({action}) mint={mint}: quote_error={quote.get('error') if isinstance(quote, dict) else 'bad quote'}")
             return None
 
-        swap_payload = {
+        swap_payload: Dict[str, Any] = {
             "quoteResponse": quote,
             "userPublicKey": str(WALLET_PUBKEY),
             "wrapAndUnwrapSol": True,
@@ -326,12 +349,12 @@ async def send_swap(action: str, mint: str) -> Optional[str]:
             swap_payload["computeUnitPriceMicroLamports"] = int(PRIORITY_FEE_MICRO_LAMPORTS)
 
         try:
-            swap = http_post_json("https://quote-api.jup.ag/v6/swap", swap_payload, timeout=15.0, retries=3)
+            swap = http_post_json(jupiter_swap_url(), swap_payload, timeout=18.0, retries=3)
         except Exception as e:
             log(f"Swap error ({action}) mint={mint}: swap_error={e}")
             return None
 
-        tx_b64 = swap.get("swapTransaction")
+        tx_b64 = swap.get("swapTransaction") if isinstance(swap, dict) else None
         if not tx_b64:
             log(f"Swap error ({action}) mint={mint}: no swapTransaction in response")
             return None
@@ -363,6 +386,7 @@ async def wait_confirm(sig: str) -> bool:
                 if cs in ("confirmed", "finalized"):
                     return True
                 confs = getattr(v, "confirmations", None)
+                # If confirmations is None, it's rooted/finalized in some RPC implementations
                 if confs is None:
                     return True
         except Exception:
@@ -380,13 +404,16 @@ async def price_monitor(mint: str, entry_price: float) -> None:
         px = float(data.get("priceUsd") or 0.0)
         if px <= 0:
             continue
+
         mult = px / entry_price if entry_price > 0 else 0.0
+
         if mult >= TAKE_PROFIT_X:
             log(f"TP hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
             await send_swap("sell", mint)
             positions.pop(mint, None)
             monitored.discard(mint)
             return
+
         if mult <= STOP_LOSS_X:
             log(f"SL hit mint={mint} entry={entry_price:.10f} now={px:.10f} x={mult:.2f} -> SELL")
             await send_swap("sell", mint)
@@ -456,9 +483,13 @@ async def scan_existing_tokens() -> None:
                 vol1h = float((p.get("volume") or {}).get("h1") or 0.0)
                 liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
                 buys1h = int(((p.get("txns") or {}).get("h1") or {}).get("buys") or 0)
-                px = float(p.get("priceUsd") or 0.0)
 
-                if change1h >= EXISTING_MIN_CHG_1H and vol1h >= EXISTING_MIN_VOL_1H_USD and liq >= EXISTING_MIN_LIQ_USD and buys1h >= EXISTING_MIN_BUYS_1H:
+                if (
+                    change1h >= EXISTING_MIN_CHG_1H
+                    and vol1h >= EXISTING_MIN_VOL_1H_USD
+                    and liq >= EXISTING_MIN_LIQ_USD
+                    and buys1h >= EXISTING_MIN_BUYS_1H
+                ):
                     ranked.append((change1h, p))
                 else:
                     skipped_filters += 1
@@ -553,9 +584,7 @@ async def monitor_new_launches() -> None:
                         continue
 
                     mint = data.get("mint")
-                    if not mint:
-                        continue
-                    if not is_valid_solana_mint(mint):
+                    if not mint or not is_valid_solana_mint(mint):
                         continue
 
                     socials_ok = bool(data.get("twitter") or data.get("telegram") or data.get("website"))
@@ -623,6 +652,8 @@ async def main() -> None:
     log("BOOT CONFIG:")
     log(f"  WALLET={WALLET_PUBKEY}")
     log(f"  WS_URL={WS_URL}")
+    log(f"  RPC_URL={(RPC_URL[:40] + '...') if len(RPC_URL) > 40 else RPC_URL}")
+    log(f"  JUP_BASE_URL={JUP_BASE_URL}")
     log(f"  BUY_SOL={BUY_SOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIORITY_FEE_MICRO_LAMPORTS={PRIORITY_FEE_MICRO_LAMPORTS} SKIP_PREFLIGHT={SKIP_PREFLIGHT}")
     log(f"  CONFIRM: enabled={CONFIRM_BEFORE_BUY} timeout={CONFIRM_TIMEOUT_SEC}s poll={CONFIRM_POLL_SEC}s")
     log(f"  NEW: warmup={NEW_WARMUP_SEC}s minVol1h={NEW_MIN_VOL_1H_USD} minLiq={NEW_MIN_LIQ_USD} minBuys1h={NEW_MIN_BUYS_1H} requireSocials={NEW_REQUIRE_SOCIALS}")
@@ -632,10 +663,21 @@ async def main() -> None:
     log(f"  SELL: tp={TAKE_PROFIT_X}x sl={STOP_LOSS_X}x poll={PRICE_POLL_SEC}s maxMonitors={MAX_MONITORS}")
     log(f"  LOG_SKIPS={LOG_SKIPS}")
 
+    dns_diag()
+
     asyncio.create_task(scan_existing_tokens())
     asyncio.create_task(heartbeat())
     await monitor_new_launches()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        # Best-effort close; avoids noisy warnings in some environments
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(client.close())
+            loop.close()
+        except Exception:
+            pass
