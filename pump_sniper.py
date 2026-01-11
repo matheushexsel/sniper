@@ -1,11 +1,39 @@
 # pump_sniper.py
-# Polymarket Copy Trader + Auto-Close (sell before 15-min boundary)
+# Polymarket Copy Trader + Auto-Close Scheduler (sell near 15-min boundary)
 #
-# Adds:
-# - Track positions (shares) per token_id from order responses
-# - Auto-close: at ET boundary - CLOSE_BEFORE_BOUNDARY_SEC, sell all tracked positions (FOK)
-# - Retries inside the close window with MAX_CLOSE_ATTEMPTS
-# - Marks events as "seen" only after a successful copy order (prevents losing signals on auth errors)
+# What it does:
+# - Polls Polymarket Data API for TARGET_USER public trade activity (type=TRADE)
+# - Dedupes events to avoid double-copying across restarts
+# - Copies BUY trades (SELL optional) with your own sizing rules (SIZE_MULT, MIN_USDC, MAX_USDC)
+# - Places orders on Polymarket CLOB via py-clob-client
+# - Uses FOK (fill-or-kill) to avoid hanging exposure
+# - Tracks your filled shares per token_id in state["positions"]
+# - Optional auto-close: sells tracked positions starting exactly CLOSE_BEFORE_BOUNDARY_SEC before each INTERVAL_MINUTES boundary
+#   (armed earlier for reliability; execution is still at T-30 if you set CLOSE_BEFORE_BOUNDARY_SEC=30)
+#
+# Required env vars:
+#   TARGET_USER         0x... (target wallet address observed by Data API)
+#   PM_PRIVATE_KEY      your Polygon private key for signing orders
+#   PM_FUNDER           your Polymarket funder/proxy wallet address holding USDC.e
+#
+# Your current vars (example):
+#   MAX_USDC=2
+#   COPY_SELLS=false
+#   MAX_SIGNAL_AGE_SEC=35
+#
+# Auto-close vars (optional):
+#   AUTO_CLOSE_ON_INTERVAL=true
+#   INTERVAL_MINUTES=15
+#   CLOSE_BEFORE_BOUNDARY_SEC=30
+#   ARM_BEFORE_BOUNDARY_SEC=120
+#   STOP_TRYING_BEFORE_BOUNDARY_SEC=3
+#   CLOSE_LOOP_SEC=0.25
+#   MAX_CLOSE_ATTEMPTS=200
+#   INTERVAL_TZ_OFFSET_SEC=0   # optional: shift boundary schedule to match ET, etc.
+#                              # e.g. ET standard = -18000, ET DST = -14400
+#
+# Install deps:
+#   pip install requests py-clob-client
 
 import os
 import time
@@ -14,8 +42,6 @@ import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
@@ -66,10 +92,10 @@ COPY_SELLS = env_bool("COPY_SELLS", False)  # default off
 # Position sizing
 SIZE_MULT = env_float("SIZE_MULT", 1.0)
 MIN_USDC = env_float("MIN_USDC", 1.0)
-MAX_USDC = env_float("MAX_USDC", 2.0)
+MAX_USDC = env_float("MAX_USDC", 2.0)  # cap at $2
 
 # Latency / staleness protection
-MAX_SIGNAL_AGE_SEC = env_int("MAX_SIGNAL_AGE_SEC", 15)
+MAX_SIGNAL_AGE_SEC = env_int("MAX_SIGNAL_AGE_SEC", 35)
 
 # Risk controls
 MAX_TRADES_PER_MIN = env_int("MAX_TRADES_PER_MIN", 6)
@@ -80,14 +106,7 @@ CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").strip().rstrip
 CHAIN_ID = env_int("CHAIN_ID", 137)  # Polygon
 PM_PRIVATE_KEY = env_str("PM_PRIVATE_KEY")
 PM_FUNDER = env_str("PM_FUNDER")
-PM_SIGNATURE_TYPE = env_int("PM_SIGNATURE_TYPE", 2)
-
-# Auto-close behavior (new)
-AUTO_CLOSE_ON_INTERVAL = env_bool("AUTO_CLOSE_ON_INTERVAL", True)
-INTERVAL_MINUTES = env_int("INTERVAL_MINUTES", 15)
-CLOSE_BEFORE_BOUNDARY_SEC = env_int("CLOSE_BEFORE_BOUNDARY_SEC", 30)
-MAX_CLOSE_ATTEMPTS = env_int("MAX_CLOSE_ATTEMPTS", 20)
-CLOSE_LOOP_SEC = env_float("CLOSE_LOOP_SEC", 1.0)
+PM_SIGNATURE_TYPE = env_int("PM_SIGNATURE_TYPE", 1)
 
 # State
 STATE_PATH = os.getenv("STATE_PATH", "./copy_state.json").strip()
@@ -95,7 +114,19 @@ STATE_PATH = os.getenv("STATE_PATH", "./copy_state.json").strip()
 # Safety / verbosity
 LOG_SKIPS = env_bool("LOG_SKIPS", True)
 
-ET = ZoneInfo("America/New_York")
+# Auto-close (optional)
+AUTO_CLOSE_ON_INTERVAL = env_bool("AUTO_CLOSE_ON_INTERVAL", False)
+INTERVAL_MINUTES = env_int("INTERVAL_MINUTES", 15)
+CLOSE_BEFORE_BOUNDARY_SEC = env_int("CLOSE_BEFORE_BOUNDARY_SEC", 30)
+
+ARM_BEFORE_BOUNDARY_SEC = env_int("ARM_BEFORE_BOUNDARY_SEC", 120)   # "armed" window starts here (no selling yet)
+STOP_TRYING_BEFORE_BOUNDARY_SEC = env_int("STOP_TRYING_BEFORE_BOUNDARY_SEC", 3)  # stop trying at T-3
+
+MAX_CLOSE_ATTEMPTS = env_int("MAX_CLOSE_ATTEMPTS", 200)
+CLOSE_LOOP_SEC = env_float("CLOSE_LOOP_SEC", 0.25)
+
+# Optional: shift boundaries to match a timezone clock (e.g., ET)
+INTERVAL_TZ_OFFSET_SEC = env_int("INTERVAL_TZ_OFFSET_SEC", 0)
 
 
 # ===================== HTTP =====================
@@ -123,25 +154,16 @@ def load_state() -> Dict[str, Any]:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             s = json.load(f)
             if not isinstance(s, dict):
-                s = {}
+                return {"seen": [], "positions": {}, "close_window": {}}
+            if "seen" not in s or not isinstance(s["seen"], list):
+                s["seen"] = []
+            if "positions" not in s or not isinstance(s["positions"], dict):
+                s["positions"] = {}
+            if "close_window" not in s or not isinstance(s["close_window"], dict):
+                s["close_window"] = {}
+            return s
     except Exception:
-        s = {}
-
-    if "seen" not in s or not isinstance(s["seen"], list):
-        s["seen"] = []
-
-    # Track positions: token_id -> shares (float)
-    if "positions" not in s or not isinstance(s["positions"], dict):
-        s["positions"] = {}
-
-    # Auto-close bookkeeping
-    if "last_close_boundary_id" not in s:
-        s["last_close_boundary_id"] = ""
-
-    if "close_attempts" not in s or not isinstance(s["close_attempts"], dict):
-        s["close_attempts"] = {}
-
-    return s
+        return {"seen": [], "positions": {}, "close_window": {}}
 
 def save_state(state: Dict[str, Any]) -> None:
     tmp = STATE_PATH + ".tmp"
@@ -150,6 +172,7 @@ def save_state(state: Dict[str, Any]) -> None:
     os.replace(tmp, STATE_PATH)
 
 def event_key(e: Dict[str, Any]) -> str:
+    # Use transactionHash when present; combine with key fields to be safe
     tx = str(e.get("transactionHash") or "")
     asset = str(e.get("asset") or "")
     side = str(e.get("side") or "")
@@ -168,25 +191,12 @@ def seen_add(state: Dict[str, Any], k: str, max_keep: int = 3000) -> None:
         seen = seen[-max_keep:]
     state["seen"] = seen
 
-def pos_add(state: Dict[str, Any], token_id: str, delta_shares: float) -> None:
-    p = state.get("positions") or {}
-    cur = float(p.get(token_id, 0.0))
-    cur += float(delta_shares)
-    if cur <= 1e-9:
-        p.pop(token_id, None)
-    else:
-        p[token_id] = float(f"{cur:.12f}")
-    state["positions"] = p
-
-def pos_snapshot(state: Dict[str, Any]) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    p = state.get("positions") or {}
-    for k, v in p.items():
-        try:
-            out[str(k)] = float(v)
-        except Exception:
-            continue
-    return out
+def positions_get(state: Dict[str, Any]) -> Dict[str, Any]:
+    p = state.get("positions")
+    if not isinstance(p, dict):
+        state["positions"] = {}
+        return state["positions"]
+    return p
 
 
 # ===================== POLYMARKET CLIENT =====================
@@ -226,6 +236,7 @@ def compute_my_usdc(target_usdc: float) -> float:
     return float(f"{my:.6f}")
 
 def normalize_timestamp_to_seconds(tstamp: int) -> int:
+    # Heuristic: ms if huge
     return int(tstamp / 1000) if tstamp > 10_000_000_000 else tstamp
 
 def rate_limit_ok(trade_times: List[float]) -> bool:
@@ -238,53 +249,51 @@ def clamp_price_01_99(px: float) -> float:
         return 0.0
     return max(0.01, min(0.99, float(px)))
 
-def extract_filled_shares_from_resp(resp: Dict[str, Any]) -> float:
-    """
-    For your BUY logs:
-      takingAmount ~ shares
-      makingAmount ~ USDC
-    We'll use takingAmount when it looks valid.
-    """
+def safe_float(x: Any) -> float:
     try:
-        ta = float(resp.get("takingAmount") or 0.0)
-        if ta > 0:
-            return ta
+        return float(x)
     except Exception:
-        pass
-    return 0.0
+        return 0.0
 
 
-def place_copy_trade(client: ClobClient, e: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def place_copy_trade(client: ClobClient, e: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], float]:
+    """
+    Returns: (order_resp, shares_executed_estimate)
+
+    Preferred: MarketOrderArgs FOK
+    Fallback: limit order (OrderArgs) with FOK at current price
+
+    shares_executed_estimate:
+      - For BUY market orders, we read resp["takingAmount"] when present.
+      - For BUY limit fallback, we use submitted size_shares when resp success.
+      - For SELL (if enabled), we cannot reliably infer from resp across versions,
+        so we return 0 here and handle SELL share accounting using what we submitted.
+    """
     asset = str(e.get("asset") or "").strip()
     side = str(e.get("side") or "").strip().upper()
 
     if not asset or side not in ("BUY", "SELL"):
         if LOG_SKIPS:
             log(f"SKIP: missing asset/side asset={asset} side={side}")
-        return None
+        return None, 0.0
 
     if not should_copy_side(side):
         if LOG_SKIPS:
             log(f"SKIP: side not enabled side={side}")
-        return None
+        return None, 0.0
 
     raw_usdc = e.get("usdcSize")
     if raw_usdc is None:
         raw_usdc = e.get("size")
 
-    try:
-        target_usdc = float(raw_usdc)
-    except Exception:
-        if LOG_SKIPS:
-            log(f"SKIP: bad usdcSize/size raw={raw_usdc}")
-        return None
-
+    target_usdc = safe_float(raw_usdc)
     if target_usdc <= 0:
         if LOG_SKIPS:
             log("SKIP: target_usdc<=0")
-        return None
+        return None, 0.0
 
     # Staleness
+    tstamp = 0
     try:
         tstamp = int(e.get("timestamp") or 0)
     except Exception:
@@ -296,17 +305,17 @@ def place_copy_trade(client: ClobClient, e: Dict[str, Any]) -> Optional[Dict[str
         if age > int(MAX_SIGNAL_AGE_SEC):
             if LOG_SKIPS:
                 log(f"SKIP: stale age={age}s > {MAX_SIGNAL_AGE_SEC}s asset={asset} side={side}")
-            return None
+            return None, 0.0
 
     my_usdc = compute_my_usdc(target_usdc)
     if my_usdc < float(MIN_USDC):
         if LOG_SKIPS:
             log(f"SKIP: my_usdc<{MIN_USDC} my_usdc={my_usdc}")
-        return None
+        return None, 0.0
 
     order_side = BUY if side == "BUY" else SELL
 
-    # PATH A: Market order (FOK) -- this is working in your current setup
+    # PATH A: Market order (FOK)
     try:
         mo = MarketOrderArgs(
             token_id=asset,
@@ -316,26 +325,34 @@ def place_copy_trade(client: ClobClient, e: Dict[str, Any]) -> Optional[Dict[str
         )
         signed = client.create_market_order(mo)
         resp = client.post_order(signed, OrderType.FOK)
-        return resp
+
+        shares_exec = 0.0
+        if isinstance(resp, dict) and resp.get("success"):
+            # For BUY this is typically the shares you received
+            if side == "BUY":
+                shares_exec = safe_float(resp.get("takingAmount"))
+        return resp, shares_exec
 
     except TypeError as te:
         log(f"MarketOrderArgs incompatibility: {te} -> fallback to limit FOK")
 
+        # Pull current price
         try:
             px_side = "BUY" if side == "BUY" else "SELL"
-            px = float(client.get_price(asset, side=px_side) or 0.0)
+            px = safe_float(client.get_price(asset, side=px_side))
             px = clamp_price_01_99(px)
             if px <= 0:
                 log(f"SKIP: could not fetch valid price for asset={asset}")
-                return None
+                return None, 0.0
         except Exception as ex:
             log(f"SKIP: get_price failed asset={asset} err={ex}")
-            return None
+            return None, 0.0
 
+        # Convert USDC -> shares
         size_shares = float(my_usdc) / float(px)
         if size_shares <= 0:
             log(f"SKIP: size_shares<=0 my_usdc={my_usdc} px={px}")
-            return None
+            return None, 0.0
 
         try:
             from py_clob_client.clob_types import OrderArgs
@@ -347,53 +364,79 @@ def place_copy_trade(client: ClobClient, e: Dict[str, Any]) -> Optional[Dict[str
             )
             signed = client.create_order(order)
             resp = client.post_order(signed, OrderType.FOK)
-            return resp
+
+            shares_exec = 0.0
+            if isinstance(resp, dict) and resp.get("success") and side == "BUY":
+                # FOK means full fill or kill; treat submitted shares as filled
+                shares_exec = float(size_shares)
+
+            return resp, shares_exec
+
         except Exception as ex:
             log(f"ORDER fallback error: {ex}")
-            return None
+            return None, 0.0
 
     except Exception as ex:
         log(f"ORDER error: {ex}")
-        return None
+        return None, 0.0
 
 
-# ===================== AUTO CLOSE =====================
+# ===================== POSITION TRACKING =====================
 
-def next_boundary_et(now: datetime) -> datetime:
-    # boundaries at :00 :15 :30 :45
-    minute = now.minute
-    next_q = ((minute // 15) + 1) * 15
-    if next_q >= 60:
-        return (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-    return now.replace(minute=next_q, second=0, microsecond=0)
+def pos_add_shares(state: Dict[str, Any], token_id: str, shares_delta: float, title: str = "") -> None:
+    if shares_delta == 0:
+        return
+    positions = positions_get(state)
+    p = positions.get(token_id) or {}
+    cur = safe_float(p.get("shares"))
+    new = cur + float(shares_delta)
 
-def boundary_id(dt: datetime) -> str:
-    return dt.strftime("%Y%m%d-%H%M")
+    if new <= 0.0000001:
+        positions.pop(token_id, None)
+    else:
+        p["shares"] = float(f"{new:.12f}")
+        if title:
+            p["title"] = title
+        p["updated_ts"] = int(time.time())
+        positions[token_id] = p
 
-def in_close_window(now: datetime, boundary: datetime, close_before_sec: int) -> bool:
-    trigger = boundary - timedelta(seconds=int(close_before_sec))
-    return now >= trigger and now < boundary
+    state["positions"] = positions
+    save_state(state)
 
-def place_sell_shares_fok(client: ClobClient, token_id: str, shares: float) -> Optional[Dict[str, Any]]:
-    """
-    Place SELL for 'shares' using limit-FOK at current SELL price (best executable),
-    because MarketOrderArgs takes 'amount' in USDC, not shares.
-    We'll query price and convert shares->usdc target.
-    """
+def pos_snapshot(state: Dict[str, Any]) -> List[Tuple[str, float, str]]:
+    positions = positions_get(state)
+    out: List[Tuple[str, float, str]] = []
+    for token_id, p in positions.items():
+        shares = safe_float((p or {}).get("shares"))
+        title = str((p or {}).get("title") or "")
+        if shares > 0:
+            out.append((str(token_id), float(shares), title))
+    return out
+
+
+# ===================== AUTO-CLOSE =====================
+
+def next_interval_boundary(now_ts: float, minutes: int, tz_offset_sec: int) -> int:
+    # Build boundaries relative to a shifted clock (tz_offset_sec), then shift back.
+    step = minutes * 60
+    shifted = int(now_ts) + int(tz_offset_sec)
+    next_shifted = ((shifted // step) + 1) * step
+    return int(next_shifted - int(tz_offset_sec))
+
+def close_position_limit_fok(client: ClobClient, token_id: str, shares: float) -> Optional[Dict[str, Any]]:
+    # Sell hits bid: use BUY side to get best bid price
     if shares <= 0:
         return None
 
-    # Fetch a sell-side price reference
     try:
-        px = float(client.get_price(token_id, side="SELL") or 0.0)
+        px = safe_float(client.get_price(token_id, side="BUY"))  # bid
         px = clamp_price_01_99(px)
         if px <= 0:
             return None
     except Exception as ex:
-        log(f"AUTO-CLOSE: get_price failed token={token_id} err={ex}")
+        log(f"CLOSE get_price failed token_id={token_id} err={ex}")
         return None
 
-    # Use OrderArgs limit order for SELL shares
     try:
         from py_clob_client.clob_types import OrderArgs
         order = OrderArgs(
@@ -403,87 +446,83 @@ def place_sell_shares_fok(client: ClobClient, token_id: str, shares: float) -> O
             side=SELL,
         )
         signed = client.create_order(order)
-        resp = client.post_order(signed, OrderType.FOK)
-        return resp
+        return client.post_order(signed, OrderType.FOK)
     except Exception as ex:
-        log(f"AUTO-CLOSE: SELL order error token={token_id} err={ex}")
+        log(f"CLOSE order failed token_id={token_id} err={ex}")
         return None
 
-
 def maybe_auto_close(client: ClobClient, state: Dict[str, Any]) -> None:
-    """
-    Called each loop iteration. If we're inside the close window,
-    attempt to sell all tracked positions. Retry up to MAX_CLOSE_ATTEMPTS for that boundary.
-    """
     if not AUTO_CLOSE_ON_INTERVAL:
         return
 
-    now = datetime.now(tz=ET)
-    boundary = next_boundary_et(now)
-    bid = boundary_id(boundary)
+    now = time.time()
+    boundary = next_interval_boundary(now, INTERVAL_MINUTES, INTERVAL_TZ_OFFSET_SEC)
 
-    if not in_close_window(now, boundary, CLOSE_BEFORE_BOUNDARY_SEC):
+    arm_ts = boundary - int(ARM_BEFORE_BOUNDARY_SEC)
+    fire_ts = boundary - int(CLOSE_BEFORE_BOUNDARY_SEC)
+    stop_ts = boundary - int(STOP_TRYING_BEFORE_BOUNDARY_SEC)
+
+    # Track per-boundary window to avoid spam
+    w = state.get("close_window") or {}
+    last_boundary = int(w.get("boundary") or 0)
+
+    if last_boundary != boundary:
+        w = {"boundary": boundary, "armed_logged": False, "fired_logged": False, "attempts": 0}
+        state["close_window"] = w
+        save_state(state)
+
+    # Too early
+    if now < arm_ts:
         return
 
-    attempts_map = state.get("close_attempts") or {}
-    attempts = int(attempts_map.get(bid, 0))
-    if attempts >= int(MAX_CLOSE_ATTEMPTS):
+    if not w.get("armed_logged"):
+        log(
+            "AUTO-CLOSE ARMED: "
+            f"boundary_utc={time.strftime('%H:%M:%S', time.gmtime(boundary))} "
+            f"fire_in={max(0, int(fire_ts - now))}s stop_in={max(0, int(stop_ts - now))}s "
+            f"(CLOSE_BEFORE_BOUNDARY_SEC={CLOSE_BEFORE_BOUNDARY_SEC})"
+        )
+        w["armed_logged"] = True
+        state["close_window"] = w
+        save_state(state)
+
+    # Not time to fire yet (this is the key: you still execute only at T-30)
+    if now < fire_ts:
         return
 
-    # Increment attempt counter and persist (so restarts keep behavior)
-    attempts_map[bid] = attempts + 1
-    state["close_attempts"] = attempts_map
-    save_state(state)
+    # Past stop time
+    if now > stop_ts:
+        return
+
+    if not w.get("fired_logged"):
+        log(f"AUTO-CLOSE FIRING: now_utc={time.strftime('%H:%M:%S', time.gmtime(int(now)))} T-{int(boundary-now)}s")
+        w["fired_logged"] = True
+        state["close_window"] = w
+        save_state(state)
 
     positions = pos_snapshot(state)
     if not positions:
-        state["last_close_boundary_id"] = bid
-        save_state(state)
         return
 
-    # Sell everything we currently track
-    for token_id, shares in positions.items():
-        if shares <= 0:
-            continue
+    # Try closing everything we think we still hold
+    for token_id, shares, title in positions:
+        if int(w.get("attempts") or 0) >= int(MAX_CLOSE_ATTEMPTS):
+            return
 
-        resp = place_sell_shares_fok(client, token_id, shares)
-        if resp is None:
-            if LOG_SKIPS:
-                log(f"AUTO-CLOSE: NO-EXEC SELL token={token_id} shares={shares:.6f}")
-            continue
+        resp = close_position_limit_fok(client, token_id, shares)
+        w["attempts"] = int(w.get("attempts") or 0) + 1
+        state["close_window"] = w
+        save_state(state)
 
-        ok = bool(resp.get("success"))
-        status = str(resp.get("status") or "")
+        if isinstance(resp, dict) and resp.get("success"):
+            log(f"AUTO-CLOSE SOLD token_id={token_id} shares={shares:.12f} title={title[:70]}")
+            # We submitted an FOK sell of all shares; treat as closed.
+            pos_add_shares(state, token_id, -shares, title=title)
+        else:
+            if resp is not None:
+                log(f"AUTO-CLOSE RETRY token_id={token_id} shares={shares:.12f} resp={resp}")
 
-        log(f"AUTO-CLOSE: SELL token={token_id} shares={shares:.6f} resp_success={ok} status={status}")
-        log(f"  sell_resp={resp}")
-
-        # If matched, subtract shares (best-effort)
-        if ok and status == "matched":
-            # Often, for limit SELL, making/taking amounts can vary by API.
-            # We assume 'makingAmount' ~ shares when SELLing outcome tokens.
-            # If your logs show otherwise, we can swap this.
-            sold_shares = 0.0
-            try:
-                sold_shares = float(resp.get("makingAmount") or 0.0)
-            except Exception:
-                sold_shares = 0.0
-
-            # Fallback: if makingAmount looks like USDC (~<=2) but shares are larger, use takingAmount.
-            if sold_shares <= 3.0:
-                try:
-                    ta = float(resp.get("takingAmount") or 0.0)
-                    if ta > sold_shares:
-                        sold_shares = ta
-                except Exception:
-                    pass
-
-            if sold_shares <= 0:
-                # worst-case: assume we sold what we asked (FOK matched usually implies full)
-                sold_shares = shares
-
-            pos_add(state, token_id, -sold_shares)
-            save_state(state)
+        time.sleep(float(CLOSE_LOOP_SEC))
 
 
 # ===================== MAIN LOOP =====================
@@ -500,17 +539,29 @@ def main() -> None:
     log(f"  CLOB_HOST={CLOB_HOST} CHAIN_ID={CHAIN_ID} SIGNATURE_TYPE={PM_SIGNATURE_TYPE}")
     log(f"  FUNDER={PM_FUNDER}")
     log(f"  STATE_PATH={STATE_PATH}")
-    log(f"  AUTO_CLOSE_ON_INTERVAL={AUTO_CLOSE_ON_INTERVAL} INTERVAL_MINUTES={INTERVAL_MINUTES} CLOSE_BEFORE_BOUNDARY_SEC={CLOSE_BEFORE_BOUNDARY_SEC}")
-    log(f"  MAX_CLOSE_ATTEMPTS={MAX_CLOSE_ATTEMPTS} CLOSE_LOOP_SEC={CLOSE_LOOP_SEC}")
     log(f"  LOG_SKIPS={LOG_SKIPS}")
+
+    log("AUTO-CLOSE CONFIG:")
+    log(f"  AUTO_CLOSE_ON_INTERVAL={AUTO_CLOSE_ON_INTERVAL}")
+    log(f"  INTERVAL_MINUTES={INTERVAL_MINUTES} CLOSE_BEFORE_BOUNDARY_SEC={CLOSE_BEFORE_BOUNDARY_SEC}")
+    log(f"  ARM_BEFORE_BOUNDARY_SEC={ARM_BEFORE_BOUNDARY_SEC} STOP_TRYING_BEFORE_BOUNDARY_SEC={STOP_TRYING_BEFORE_BOUNDARY_SEC}")
+    log(f"  CLOSE_LOOP_SEC={CLOSE_LOOP_SEC} MAX_CLOSE_ATTEMPTS={MAX_CLOSE_ATTEMPTS}")
+    log(f"  INTERVAL_TZ_OFFSET_SEC={INTERVAL_TZ_OFFSET_SEC}")
 
     state = load_state()
     client = init_clob_client()
     trade_times: List[float] = []
 
+    # One-time position snapshot
+    ps = pos_snapshot(state)
+    if ps:
+        log(f"STATE positions loaded: {len(ps)} open tokens")
+        for token_id, shares, title in ps[:8]:
+            log(f"  token_id={token_id} shares={shares:.12f} title={title[:70]}")
+
     while True:
         try:
-            # Auto-close runs every loop
+            # Auto-close checks even if no new trades appear
             maybe_auto_close(client, state)
 
             events = fetch_target_trades(int(FETCH_LIMIT))
@@ -523,12 +574,20 @@ def main() -> None:
                     return 0
 
             events_sorted = sorted(events, key=_ts_sort)
+
             did_work = False
 
             for e in events_sorted:
+                # Keep auto-close responsive during heavy event bursts
+                maybe_auto_close(client, state)
+
                 k = event_key(e)
                 if seen_has(state, k):
                     continue
+
+                # Mark seen first (idempotency)
+                seen_add(state, k)
+                save_state(state)
 
                 side = str(e.get("side") or "").upper()
                 asset = str(e.get("asset") or "")
@@ -545,44 +604,44 @@ def main() -> None:
                     log("RISK: rate limit hit, skipping remaining events this cycle")
                     break
 
-                resp = place_copy_trade(client, e)
+                resp, shares_exec = place_copy_trade(client, e)
                 if resp is None:
                     if LOG_SKIPS:
                         log(f"NO-EXEC: side={side} asset={asset} usdcSize={usdc_size} title={title[:80]}")
                     continue
 
-                # Only mark as seen after we actually placed an order (prevents losing signals on errors)
-                seen_add(state, k)
-                save_state(state)
-
-                # Track positions for BUYs so we can close later
-                if side == "BUY" and bool(resp.get("success")) and str(resp.get("status") or "") == "matched":
-                    filled_shares = extract_filled_shares_from_resp(resp)
-                    if filled_shares > 0:
-                        pos_add(state, asset, filled_shares)
-                        save_state(state)
+                if isinstance(resp, dict) and not resp.get("success"):
+                    if LOG_SKIPS:
+                        log(f"NO-EXEC: side={side} asset={asset} title={title[:80]} resp={resp}")
+                    continue
 
                 trade_times.append(time.time())
                 did_work = True
 
-                try:
-                    target_usdc_f = float(usdc_size or 0.0)
-                except Exception:
-                    target_usdc_f = 0.0
+                target_usdc_f = safe_float(usdc_size)
+                my_usdc = compute_my_usdc(target_usdc_f)
 
                 log(
                     f"COPIED {side} | asset(token_id)={asset} | target_usdc={target_usdc_f:.6f} "
-                    f"-> my_usdc={compute_my_usdc(target_usdc_f):.6f} | ref_price={price} | title={title[:80]}"
+                    f"-> my_usdc={my_usdc:.6f} | ref_price={price} | title={title[:80]}"
                 )
                 log(f"  order_resp={resp}")
 
+                # Update positions (only reliable for BUY unless you enable SELL + add explicit logic)
+                if side == "BUY" and shares_exec > 0:
+                    pos_add_shares(state, asset, +shares_exec, title=title)
+                    log(f"  POSITION +shares={shares_exec:.12f} token_id={asset}")
+
                 time.sleep(float(COOLDOWN_SEC))
 
-            # pacing
+            # Auto-close again after processing
+            maybe_auto_close(client, state)
+
+            # backoff
             if not did_work:
                 time.sleep(float(POLL_SEC))
             else:
-                time.sleep(max(float(CLOSE_LOOP_SEC), 0.25))
+                time.sleep(max(0.25, float(POLL_SEC) / 2.0))
 
         except Exception as ex:
             log(f"LOOP error: {ex}")
