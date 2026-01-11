@@ -1,33 +1,31 @@
-# pump_sniper.py
-# Strategy A (swing continuation): high-liquidity only, wider TP/SL, no time exits
-# PumpPortal WS (new tokens) + DexScreener filters + Jupiter swap/v1
-# Exits only on TP/SL. Adds per-mint cooldown to stop churn.
+# polymarket_copytrader.py
+# Copy-trades a target Polymarket wallet/profile activity (public) with your own sizing.
+#
+# Data source: Polymarket Data API /activity (public) for target wallet trades.
+# Execution: Polymarket CLOB via py-clob-client.
+#
+# Requirements:
+#   pip install py-clob-client requests
+#
+# IMPORTANT OP NOTES:
+# - You need a Polygon-compatible private key for trading (EOA OR Polymarket/Magic signature type).
+# - You must have USDC.e funded in your Polymarket proxy wallet ("funder") and allowances set.
+#   Polymarket docs explain funder/proxy wallet and allowances. (See CLOB quickstart / py-clob-client README.)
+#
+# This bot intentionally uses FOK orders to avoid hanging exposure from stale copy signals.
 
 import os
-import json
 import time
-import base64
-import binascii
-import socket
-import asyncio
-from typing import Any, Dict, List, Optional, Tuple, Set
-from urllib.parse import urlparse
+import json
+import math
+import hashlib
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-import base58
-import websockets
-import urllib3.util.connection as urllib3_cn
 
-from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TokenAccountOpts, TxOpts
-
-from solders.keypair import Keypair
-from solders.pubkey import Pubkey
-from solders.transaction import VersionedTransaction
-
-
-# Force IPv4 DNS resolution (helps in some cloud runtimes)
-urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
 
 
 # ===================== UTIL =====================
@@ -40,9 +38,9 @@ def log(msg: str) -> None:
 
 def env_str(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name, default)
-    if v is None or v == "":
+    if v is None or v.strip() == "":
         raise RuntimeError(f"Missing required env var: {name}")
-    return v
+    return v.strip()
 
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
@@ -59,749 +57,300 @@ def env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _strip_wrappers(s: str) -> str:
-    s = s.strip()
-    if s.upper().startswith("PRIVATE_KEY="):
-        s = s.split("=", 1)[1].strip()
-    if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in ("'", '"')):
-        s = s[1:-1].strip()
-    return s
+# ===================== CONFIG =====================
 
+# Target (public)
+TARGET_USER = env_str("TARGET_USER")  # target "user profile address" 0x... (proxy wallet or user wallet)
+DATA_API_BASE = os.getenv("DATA_API_BASE", "https://data-api.polymarket.com").strip().rstrip("/")
+POLL_SEC = env_float("POLL_SEC", 2.0)
+FETCH_LIMIT = env_int("FETCH_LIMIT", 50)
 
-def parse_keypair(private_key_env: str) -> Keypair:
-    """
-    Accepts common Solana secret formats:
-      1) base58 64-byte secret key
-      2) base58 32-byte seed -> Keypair.from_seed
-      3) JSON array of ints (len 64 or 32)
-      4) base64 of 64/32 bytes
-      5) hex string of 64/32 bytes
-    """
-    pk = _strip_wrappers(private_key_env)
+# Copy behavior
+COPY_BUYS = env_bool("COPY_BUYS", True)
+COPY_SELLS = env_bool("COPY_SELLS", False)  # off by default (selling requires you hold the same tokens)
 
-    # 1) JSON array
-    try:
-        arr = json.loads(pk)
-        if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
-            raw = bytes(arr)
-            if len(raw) == 64:
-                return Keypair.from_bytes(raw)
-            if len(raw) == 32:
-                return Keypair.from_seed(raw)
-    except Exception:
-        pass
+SIZE_MULT = env_float("SIZE_MULT", 1.0)     # my_usdc = target_usdc * SIZE_MULT
+MIN_USDC = env_float("MIN_USDC", 1.0)       # ignore tiny signals
+MAX_USDC = env_float("MAX_USDC", 50.0)      # cap per copied trade
 
-    # 2) base58
-    try:
-        raw = base58.b58decode(pk)
-        if len(raw) == 64:
-            return Keypair.from_bytes(raw)
-        if len(raw) == 32:
-            return Keypair.from_seed(raw)
-    except Exception:
-        pass
+# Latency / staleness protection
+MAX_SIGNAL_AGE_SEC = env_int("MAX_SIGNAL_AGE_SEC", 20)  # if we see a trade older than this, skip
 
-    # 3) base64
-    try:
-        raw = base64.b64decode(pk, validate=True)
-        if len(raw) == 64:
-            return Keypair.from_bytes(raw)
-        if len(raw) == 32:
-            return Keypair.from_seed(raw)
-    except Exception:
-        pass
+# Risk controls
+MAX_TRADES_PER_MIN = env_int("MAX_TRADES_PER_MIN", 6)
+COOLDOWN_SEC = env_float("COOLDOWN_SEC", 0.25)  # throttle between orders
 
-    # 4) hex
-    try:
-        hx = pk[2:] if pk.lower().startswith("0x") else pk
-        raw = binascii.unhexlify(hx)
-        if len(raw) == 64:
-            return Keypair.from_bytes(raw)
-        if len(raw) == 32:
-            return Keypair.from_seed(raw)
-    except Exception:
-        pass
+# Trading (your account)
+CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").strip().rstrip("/")
+CHAIN_ID = env_int("CHAIN_ID", 137)  # Polygon mainnet
+PRIVATE_KEY = env_str("PM_PRIVATE_KEY")
+FUNDER = env_str("PM_FUNDER")  # your Polymarket proxy wallet address holding USDC.e
+SIGNATURE_TYPE = env_int("PM_SIGNATURE_TYPE", 1)  # 1 commonly used for email/Magic per py-clob-client examples
 
-    raise RuntimeError(
-        "PRIVATE_KEY format invalid. Use base58 64-byte secret key OR base58 32-byte seed OR JSON array (32/64) OR base64/hex (32/64)."
-    )
-
-
-def is_valid_solana_mint(mint: str) -> bool:
-    try:
-        Pubkey.from_string(mint)
-        return True
-    except Exception:
-        return False
+# Storage (lightweight local state)
+STATE_PATH = os.getenv("STATE_PATH", "./copy_state.json").strip()
 
 
 # ===================== HTTP =====================
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "pump-sniper/strategyA"})
+SESSION.headers.update({"User-Agent": "polymarket-copytrader/1.0"})
 
-def http_get_json(url: str, timeout: float = 10.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def http_get_json(url: str, timeout: float = 10.0, retries: int = 3) -> Any:
     last = None
     for i in range(retries):
         try:
-            h = dict(SESSION.headers)
-            if headers:
-                h.update(headers)
-            r = SESSION.get(url, timeout=timeout, headers=h)
+            r = SESSION.get(url, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last = e
-            time.sleep(0.4 * (2 ** i))
+            time.sleep(0.35 * (2 ** i))
     raise RuntimeError(f"GET failed after {retries} retries: {url} err={last}")
 
-def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 15.0, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    last = None
-    for i in range(retries):
-        try:
-            h = dict(SESSION.headers)
-            if headers:
-                h.update(headers)
-            r = SESSION.post(url, json=payload, timeout=timeout, headers=h)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last = e
-            time.sleep(0.6 * (2 ** i))
-    raise RuntimeError(f"POST failed after {retries} retries: {url} err={last}")
 
+# ===================== STATE / DEDUPE =====================
 
-# ===================== CONFIG =====================
-
-RPC_URL = env_str("RPC_URL")
-WS_URL = os.getenv("WS_URL", "wss://pumpportal.fun/api/data")
-
-PRIVATE_KEY = env_str("PRIVATE_KEY")
-
-# Wallet safety (optional)
-EXPECTED_WALLET = (os.getenv("EXPECTED_WALLET") or "").strip()
-
-# Jupiter
-JUP_BASE_URL = os.getenv("JUP_BASE_URL", "https://api.jup.ag").strip().rstrip("/")
-JUP_API_KEY = (os.getenv("JUP_API_KEY") or os.getenv("JUPITER_API_KEY") or "").strip()
-if not JUP_API_KEY:
-    raise RuntimeError("Missing required env var: JUP_API_KEY (or JUPITER_API_KEY)")
-
-# Trading
-BUY_SOL = env_float("BUY_SOL", 0.05)
-
-# Keep slippage reasonable; too low = failed fills, too high = bleed.
-SLIPPAGE_BPS = env_int("SLIPPAGE_BPS", 60)  # 0.60%
-PRIORITY_FEE_MICRO_LAMPORTS = env_int("PRIORITY_FEE_MICRO_LAMPORTS", 0)
-SKIP_PREFLIGHT = env_bool("SKIP_PREFLIGHT", True)
-
-# Strategy A exits (no time exits)
-TP_PCT = env_float("TP_PCT", 0.06)   # 6% default (recommended range 4% to 8%)
-SL_PCT = env_float("SL_PCT", 0.02)   # 2% default
-MONITOR_POLL_SEC = env_float("MONITOR_POLL_SEC", 5.0)
-
-# High-liquidity gate (your request)
-MIN_LIQ_USD_GLOBAL = env_float("MIN_LIQ_USD_GLOBAL", 150000.0)
-
-# New launches filters (still apply, but now high-liq only)
-NEW_WARMUP_SEC = env_int("NEW_WARMUP_SEC", 90)
-NEW_MIN_VOL_1H_USD = env_float("NEW_MIN_VOL_1H_USD", 3000.0)
-NEW_MIN_LIQ_USD = env_float("NEW_MIN_LIQ_USD", MIN_LIQ_USD_GLOBAL)
-NEW_MIN_BUYS_1H = env_int("NEW_MIN_BUYS_1H", 40)
-NEW_REQUIRE_SOCIALS = env_bool("NEW_REQUIRE_SOCIALS", True)
-
-# Existing movers filters (high-liq only)
-EXISTING_SCAN_EVERY_SEC = env_int("EXISTING_SCAN_EVERY_SEC", 20)
-EXISTING_QUERIES = os.getenv("EXISTING_QUERIES", "raydium,solana,pump,SOL/USDC")
-EXISTING_LIMIT_PER_QUERY = env_int("EXISTING_LIMIT_PER_QUERY", 100)
-
-EXISTING_MIN_CHG_1H = env_float("EXISTING_MIN_CHG_1H", 3.0)
-EXISTING_MIN_VOL_1H_USD = env_float("EXISTING_MIN_VOL_1H_USD", 20000.0)
-EXISTING_MIN_LIQ_USD = env_float("EXISTING_MIN_LIQ_USD", MIN_LIQ_USD_GLOBAL)
-EXISTING_MIN_BUYS_1H = env_int("EXISTING_MIN_BUYS_1H", 120)
-
-# Risk controls (swing: fewer positions, less churn)
-MAX_BUYS_PER_SCAN = env_int("MAX_BUYS_PER_SCAN", 1)
-BUY_COOLDOWN_SEC = env_int("BUY_COOLDOWN_SEC", 60)
-MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 2)
-
-# Per-mint cooldown (prevents re-buying the same mint repeatedly)
-MINT_COOLDOWN_SEC = env_int("MINT_COOLDOWN_SEC", 1800)  # 30 minutes default
-
-# Jupiter throttle
-JUP_MIN_INTERVAL_SEC = env_float("JUP_MIN_INTERVAL_SEC", 1.1)
-
-# Reconcile
-RECONCILE_SEC = env_int("RECONCILE_SEC", 8)
-
-LOG_SKIPS = env_bool("LOG_SKIPS", False)
-
-SOL_MINT = "So11111111111111111111111111111111111111112"  # wSOL mint
-TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-
-
-# ===================== GLOBALS =====================
-
-client = AsyncClient(RPC_URL)
-wallet = parse_keypair(PRIVATE_KEY)
-WALLET_PUBKEY = wallet.pubkey()
-
-if EXPECTED_WALLET and str(WALLET_PUBKEY) != EXPECTED_WALLET:
-    raise RuntimeError(
-        f"Wrong wallet loaded. EXPECTED_WALLET={EXPECTED_WALLET} but derived WALLET={WALLET_PUBKEY}. Fix PRIVATE_KEY env var."
-    )
-
-BUY_AMOUNT_LAMPORTS = int(BUY_SOL * 1e9)
-
-# bot_positions: mint -> dict(entry_usd, opened_ts, size_raw, last_px_usd)
-bot_positions: Dict[str, Dict[str, Any]] = {}
-monitored: Set[str] = set()
-
-pending_buys: Dict[str, float] = {}   # mint -> started_ts
-pending_sells: Dict[str, float] = {}  # mint -> started_ts
-
-# per-mint cooldown timestamps
-mint_last_trade_ts: Dict[str, float] = {}
-
-_last_buy_ts = 0.0
-_pos_lock = asyncio.Lock()
-
-
-# ===================== JUP THROTTLE =====================
-
-_JUP_LOCK = asyncio.Lock()
-_JUP_NEXT_TS = 0.0
-
-async def jup_throttle() -> None:
-    global _JUP_NEXT_TS
-    async with _JUP_LOCK:
-        now = time.time()
-        if now < _JUP_NEXT_TS:
-            await asyncio.sleep(_JUP_NEXT_TS - now)
-        _JUP_NEXT_TS = time.time() + float(JUP_MIN_INTERVAL_SEC)
-
-def jup_headers() -> Dict[str, str]:
-    return {"x-api-key": JUP_API_KEY}
-
-
-# ===================== DEXSCREENER =====================
-
-def dexscreener_token_data(mint: str) -> Dict[str, Any]:
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-    data = http_get_json(url, timeout=8.0, retries=3)
-    pairs = data.get("pairs") or []
-    best = None
-    for p in pairs:
-        if p.get("chainId") != "solana":
-            continue
-        liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
-        if best is None or liq > float((best.get("liquidity") or {}).get("usd") or 0.0):
-            best = p
-    if not best:
-        return {}
-
-    def f(x: Any) -> float:
-        try:
-            return float(x)
-        except Exception:
-            return 0.0
-
-    return {
-        "priceUsd": f(best.get("priceUsd")),
-        "volume_h1": f((best.get("volume") or {}).get("h1")),
-        "liquidity_usd": f((best.get("liquidity") or {}).get("usd")),
-        "buys_h1": int(((best.get("txns") or {}).get("h1") or {}).get("buys") or 0),
-        "sells_h1": int(((best.get("txns") or {}).get("h1") or {}).get("sells") or 0),
-        "change_h1": f((best.get("priceChange") or {}).get("h1")),
-    }
-
-def dexscreener_search(query: str, limit: int) -> List[Dict[str, Any]]:
-    url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
-    data = http_get_json(url, timeout=8.0, retries=3)
-    pairs = data.get("pairs") or []
-    out = [p for p in pairs if p.get("chainId") == "solana"]
-    return out[:limit]
-
-
-# ===================== BALANCES =====================
-
-async def get_sol_balance() -> float:
-    try:
-        r = await client.get_balance(WALLET_PUBKEY)
-        lamports = int(r.value) if r and getattr(r, "value", None) is not None else 0
-        return lamports / 1e9
-    except Exception:
-        return 0.0
-
-async def get_token_balance(mint: str) -> int:
-    if not is_valid_solana_mint(mint):
-        return 0
-    try:
-        opts = TokenAccountOpts(mint=Pubkey.from_string(mint), program_id=TOKEN_PROGRAM_ID)
-        resp = await client.get_token_accounts_by_owner(WALLET_PUBKEY, opts)
-        if not resp or not getattr(resp, "value", None):
-            return 0
-        total = 0
-        for v in resp.value:
-            bal = await client.get_token_account_balance(v.pubkey)
-            total += int(bal.value.amount)  # type: ignore
-        return total
-    except Exception:
-        return 0
-
-
-# ===================== JUPITER swap/v1 =====================
-
-def build_quote_url(input_mint: str, output_mint: str, amount: int) -> str:
-    return (
-        f"{JUP_BASE_URL}/swap/v1/quote"
-        f"?inputMint={input_mint}"
-        f"&outputMint={output_mint}"
-        f"&amount={amount}"
-        f"&slippageBps={SLIPPAGE_BPS}"
-    )
-
-async def send_swap(action: str, mint: str) -> Optional[str]:
+def _hash_event(e: Dict[str, Any]) -> str:
     """
-    Jupiter Quote + Swap endpoint:
-      GET  /swap/v1/quote
-      POST /swap/v1/swap
-    Signs and submits the returned VersionedTransaction.
+    Conservative dedupe key. Uses transactionHash when present.
+    Data-API activity includes transactionHash (example schema). :contentReference[oaicite:3]{index=3}
     """
+    tx = str(e.get("transactionHash") or "")
+    asset = str(e.get("asset") or "")
+    side = str(e.get("side") or "")
+    ts_ = str(e.get("timestamp") or "")
+    usdc = str(e.get("usdcSize") or e.get("size") or "")
+    raw = f"{tx}|{asset}|{side}|{ts_}|{usdc}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def load_state() -> Dict[str, Any]:
     try:
-        if action == "buy":
-            input_mint = SOL_MINT
-            output_mint = mint
-            amount = BUY_AMOUNT_LAMPORTS
-        else:
-            bal = await get_token_balance(mint)
-            if bal <= 0:
-                return None
-            input_mint = mint
-            output_mint = SOL_MINT
-            amount = bal
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"seen": [], "last_poll_ts": 0}
 
-        quote_url = build_quote_url(input_mint, output_mint, amount)
+def save_state(state: Dict[str, Any]) -> None:
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_PATH)
 
-        await jup_throttle()
-        try:
-            quote = http_get_json(quote_url, timeout=12.0, retries=3, headers=jup_headers())
-        except Exception as e:
-            log(f"Swap error ({action}) mint={mint}: quote_error={e}")
-            return None
+def seen_add(state: Dict[str, Any], key: str, max_keep: int = 3000) -> None:
+    seen = state.get("seen") or []
+    seen.append(key)
+    if len(seen) > max_keep:
+        seen = seen[-max_keep:]
+    state["seen"] = seen
 
-        if isinstance(quote, dict) and quote.get("error"):
-            log(f"Swap error ({action}) mint={mint}: quote_error={quote.get('error')}")
-            return None
+def seen_has(state: Dict[str, Any], key: str) -> bool:
+    seen = state.get("seen") or []
+    return key in seen
 
-        swap_payload: Dict[str, Any] = {
-            "quoteResponse": quote,
-            "userPublicKey": str(WALLET_PUBKEY),
-            "wrapAndUnwrapSol": True,
-        }
-        if PRIORITY_FEE_MICRO_LAMPORTS > 0:
-            swap_payload["computeUnitPriceMicroLamports"] = int(PRIORITY_FEE_MICRO_LAMPORTS)
 
-        await jup_throttle()
-        try:
-            swap = http_post_json(f"{JUP_BASE_URL}/swap/v1/swap", swap_payload, timeout=20.0, retries=3, headers=jup_headers())
-        except Exception as e:
-            log(f"Swap error ({action}) mint={mint}: swap_error={e}")
-            return None
+# ===================== POLYMARKET CLIENT =====================
 
-        tx_b64 = swap.get("swapTransaction") if isinstance(swap, dict) else None
-        if not tx_b64:
-            log(f"Swap error ({action}) mint={mint}: no swapTransaction in response")
-            return None
+def init_clob_client() -> ClobClient:
+    """
+    Uses py-clob-client standard setup:
+      - instantiate with host/key/chain_id/signature_type/funder
+      - derive api creds and set them
+    """
+    client = ClobClient(
+        CLOB_HOST,
+        key=PRIVATE_KEY,
+        chain_id=CHAIN_ID,
+        signature_type=SIGNATURE_TYPE,
+        funder=FUNDER,
+    )
+    client.set_api_creds(client.create_or_derive_api_creds())
+    return client
 
-        raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
-        signed_tx = VersionedTransaction(raw_tx.message, [wallet])
 
-        opts = TxOpts(skip_preflight=SKIP_PREFLIGHT, preflight_commitment="processed")
-        res = await client.send_transaction(signed_tx, opts=opts)
-        sig = str(res.value)
-        log(f"{action.upper()} sent: https://solscan.io/tx/{sig}")
-        return sig
+# ===================== COPY LOGIC =====================
 
-    except Exception as e:
-        log(f"Swap error ({action}) mint={mint}: {e}")
+def fetch_target_trades(limit: int) -> List[Dict[str, Any]]:
+    """
+    Pulls target activity and filters to type=TRADE.
+    Endpoint + response schema shown in docs. :contentReference[oaicite:4]{index=4}
+    """
+    url = f"{DATA_API_BASE}/activity?user={TARGET_USER}&limit={limit}&offset=0"
+    data = http_get_json(url, timeout=10.0, retries=3)
+    if not isinstance(data, list):
+        return []
+    # Data API returns mixed activity; keep only trades
+    out = [x for x in data if str(x.get("type", "")).upper() == "TRADE"]
+    return out
+
+def clamp_amount(x: float) -> float:
+    return max(0.0, float(x))
+
+def compute_my_usdc(target_usdc: float) -> float:
+    my = target_usdc * float(SIZE_MULT)
+    my = max(float(MIN_USDC), min(float(MAX_USDC), my))
+    # Keep sane precision (USDC has 6 decimals; exchange may accept float but this avoids noise)
+    return float(f"{my:.6f}")
+
+def should_copy_side(side: str) -> bool:
+    s = side.upper().strip()
+    if s == "BUY":
+        return COPY_BUYS
+    if s == "SELL":
+        return COPY_SELLS
+    return False
+
+def rate_limit_ok(trade_times: List[float]) -> bool:
+    """
+    Allows up to MAX_TRADES_PER_MIN in a rolling 60s window.
+    """
+    now = time.time()
+    trade_times[:] = [t for t in trade_times if (now - t) <= 60.0]
+    return len(trade_times) < MAX_TRADES_PER_MIN
+
+def place_copy_trade(client: ClobClient, e: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Places a FOK market order sized by USDC amount.
+    py-clob-client supports MarketOrderArgs(amount=USDC, token_id=..., side=BUY/SELL, order_type=FOK). :contentReference[oaicite:5]{index=5}
+    """
+    asset = str(e.get("asset") or "").strip()
+    side = str(e.get("side") or "").strip().upper()
+
+    # target amount
+    target_usdc = e.get("usdcSize")
+    if target_usdc is None:
+        # fallback to "size" if usdcSize absent (some endpoints show size/price; activity shows usdcSize) :contentReference[oaicite:6]{index=6}
+        target_usdc = e.get("size")
+
+    try:
+        target_usdc = float(target_usdc)
+    except Exception:
         return None
 
+    if target_usdc <= 0:
+        return None
 
-# ===================== RISK =====================
+    # staleness check (Data API timestamps are integers; docs show 'timestamp'). :contentReference[oaicite:7]{index=7}
+    try:
+        tstamp = int(e.get("timestamp") or 0)
+    except Exception:
+        tstamp = 0
 
-def can_buy_now() -> bool:
-    global _last_buy_ts
-    return (time.time() - _last_buy_ts) >= BUY_COOLDOWN_SEC
+    # timestamp unit can vary by API implementations (seconds vs ms). Normalize by heuristic.
+    now = int(time.time())
+    age = None
+    if tstamp > 0:
+        if tstamp > 10_000_000_000:  # likely ms
+            age = now - int(tstamp / 1000)
+        else:  # likely seconds
+            age = now - tstamp
 
-def mark_bought() -> None:
-    global _last_buy_ts
-    _last_buy_ts = time.time()
+    if age is not None and age > MAX_SIGNAL_AGE_SEC:
+        return None
 
-def mint_on_cooldown(mint: str) -> bool:
-    last = mint_last_trade_ts.get(mint, 0.0)
-    return (time.time() - last) < MINT_COOLDOWN_SEC
+    if not asset or side not in ("BUY", "SELL"):
+        return None
 
-def mark_mint_traded(mint: str) -> None:
-    mint_last_trade_ts[mint] = time.time()
+    if not should_copy_side(side):
+        return None
 
+    my_usdc = compute_my_usdc(target_usdc)
+    if my_usdc < float(MIN_USDC):
+        return None
 
-# ===================== POSITION TRACKING =====================
+    order_side = BUY if side == "BUY" else SELL
 
-async def track_position(mint: str, entry_usd: float, opened_ts: float, size_raw: int) -> None:
-    async with _pos_lock:
-        bot_positions[mint] = {
-            "entry_usd": float(entry_usd),
-            "opened_ts": float(opened_ts),
-            "size_raw": int(size_raw),
-            "last_px_usd": float(entry_usd),
-        }
-        monitored.add(mint)
-
-async def untrack_position(mint: str) -> None:
-    async with _pos_lock:
-        bot_positions.pop(mint, None)
-        monitored.discard(mint)
-
-async def get_bot_positions_snapshot() -> Dict[str, Dict[str, Any]]:
-    async with _pos_lock:
-        return dict(bot_positions)
-
-
-# ===================== MONITOR / EXIT =====================
-
-async def monitor_position(mint: str) -> None:
-    """
-    Exits:
-      - TP: price >= entry*(1+TP_PCT)
-      - SL: price <= entry*(1-SL_PCT)
-    No time exits (Strategy A).
-    Uses DexScreener priceUsd as signal.
-    Executes SELL via Jupiter and relies on reconcile to confirm removal.
-    """
-    while True:
-        await asyncio.sleep(MONITOR_POLL_SEC)
-
-        snap = await get_bot_positions_snapshot()
-        pos = snap.get(mint)
-        if not pos:
-            return
-
-        entry = float(pos.get("entry_usd") or 0.0)
-        if entry <= 0:
-            await untrack_position(mint)
-            return
-
-        td = dexscreener_token_data(mint)
-        px = float(td.get("priceUsd") or 0.0)
-        if px <= 0:
-            continue
-
-        # update last price
-        async with _pos_lock:
-            if mint in bot_positions:
-                bot_positions[mint]["last_px_usd"] = px
-
-        tp_level = entry * (1.0 + TP_PCT)
-        sl_level = entry * (1.0 - SL_PCT)
-
-        reason = None
-        if px >= tp_level:
-            reason = f"TP hit entry={entry:.10f} now={px:.10f} (+{(px/entry-1)*100:.2f}%)"
-        elif px <= sl_level:
-            reason = f"SL hit entry={entry:.10f} now={px:.10f} ({(px/entry-1)*100:.2f}%)"
-
-        if not reason:
-            continue
-
-        if mint in pending_sells:
-            continue
-
-        pending_sells[mint] = time.time()
-        log(f"EXIT -> SELL mint={mint} reason={reason}")
-        sig = await send_swap("sell", mint)
-        if sig:
-            log(f"SELL submitted mint={mint} sig={sig} (reconcile will confirm by balance)")
-        else:
-            log(f"SELL failed mint={mint} (will retry on next tick)")
+    mo = MarketOrderArgs(
+        token_id=asset,
+        amount=my_usdc,
+        side=order_side,
+        order_type=OrderType.FOK,  # fill-or-kill: do it now or not at all
+    )
+    signed = client.create_market_order(mo)
+    resp = client.post_order(signed, OrderType.FOK)
+    return resp
 
 
-# ===================== RECONCILE LOOP =====================
+# ===================== MAIN LOOP =====================
 
-async def reconcile_loop() -> None:
-    """
-    Makes the bot truthful:
-      - If we sent a BUY and balance shows up -> track position + start monitor
-      - If we sent a SELL and balance is gone -> untrack position + mark mint cooldown
-    """
-    while True:
-        await asyncio.sleep(RECONCILE_SEC)
+def main() -> None:
+    log("BOOT CONFIG:")
+    log(f"  TARGET_USER={TARGET_USER}")
+    log(f"  DATA_API_BASE={DATA_API_BASE}")
+    log(f"  POLL_SEC={POLL_SEC} FETCH_LIMIT={FETCH_LIMIT}")
+    log(f"  COPY_BUYS={COPY_BUYS} COPY_SELLS={COPY_SELLS}")
+    log(f"  SIZE_MULT={SIZE_MULT} MIN_USDC={MIN_USDC} MAX_USDC={MAX_USDC}")
+    log(f"  MAX_SIGNAL_AGE_SEC={MAX_SIGNAL_AGE_SEC}")
+    log(f"  MAX_TRADES_PER_MIN={MAX_TRADES_PER_MIN} COOLDOWN_SEC={COOLDOWN_SEC}")
+    log(f"  CLOB_HOST={CLOB_HOST} CHAIN_ID={CHAIN_ID} SIGNATURE_TYPE={SIGNATURE_TYPE}")
+    log(f"  FUNDER={FUNDER}")
+    log(f"  STATE_PATH={STATE_PATH}")
 
-        # confirm buys by balance
-        for mint in list(pending_buys.keys()):
-            bal = await get_token_balance(mint)
-            if bal > 0:
-                td = dexscreener_token_data(mint)
-                entry = float(td.get("priceUsd") or 0.0)
-                if entry <= 0:
-                    entry = 0.000000001
-                await track_position(mint, entry_usd=entry, opened_ts=time.time(), size_raw=bal)
-                asyncio.create_task(monitor_position(mint))
-                pending_buys.pop(mint, None)
-                mark_mint_traded(mint)
-                log(f"RECONCILE: BUY confirmed by balance mint={mint} bal={bal} entry={entry:.10f}")
+    state = load_state()
+    client = init_clob_client()
 
-        # confirm sells by balance
-        for mint in list(pending_sells.keys()):
-            bal = await get_token_balance(mint)
-            if bal <= 0:
-                await untrack_position(mint)
-                pending_sells.pop(mint, None)
-                mark_mint_traded(mint)
-                log(f"RECONCILE: SELL confirmed by balance mint={mint} bal=0 -> closed")
-
-
-# ===================== ENTRY (EXISTING + NEW) =====================
-
-async def try_buy(mint: str, px_usd: float) -> None:
-    snap = await get_bot_positions_snapshot()
-    if mint in snap or mint in pending_buys or mint in pending_sells:
-        return
-    if len(snap) >= MAX_OPEN_POSITIONS:
-        return
-    if not can_buy_now():
-        return
-    if mint_on_cooldown(mint):
-        if LOG_SKIPS:
-            log(f"SKIP mint cooldown mint={mint}")
-        return
-
-    # avoid doubling into bags
-    bal = await get_token_balance(mint)
-    if bal > 0:
-        return
-
-    pending_buys[mint] = time.time()
-    sig = await send_swap("buy", mint)
-    if sig:
-        mark_bought()
-        mark_mint_traded(mint)
-        log(f"BUY submitted mint={mint} px=${px_usd:.10f} sig={sig} (reconcile will confirm by balance)")
-    else:
-        pending_buys.pop(mint, None)
-
-
-async def scan_existing_tokens() -> None:
-    queries = [q.strip() for q in EXISTING_QUERIES.split(",") if q.strip()]
-    cycle = 0
+    trade_times: List[float] = []
 
     while True:
-        cycle += 1
-        scanned = 0
-        candidates = 0
-        buys = 0
-
-        skipped_invalid = 0
-        skipped_filters = 0
-        skipped_risk = 0
-        skipped_tracked = 0
-
-        seen_pairs: Dict[str, Dict[str, Any]] = {}
-
         try:
-            for q in queries:
-                pairs = dexscreener_search(q, EXISTING_LIMIT_PER_QUERY)
-                for p in pairs:
-                    scanned += 1
-                    mint = (p.get("baseToken") or {}).get("address") or ""
-                    if not is_valid_solana_mint(mint):
-                        skipped_invalid += 1
-                        continue
-                    if mint in seen_pairs:
-                        continue
-                    seen_pairs[mint] = p
+            events = fetch_target_trades(FETCH_LIMIT)
 
-            ranked: List[Tuple[float, Dict[str, Any]]] = []
-            for _mint, p in seen_pairs.items():
-                change1h = float((p.get("priceChange") or {}).get("h1") or 0.0)
-                vol1h = float((p.get("volume") or {}).get("h1") or 0.0)
-                liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
-                buys1h = int(((p.get("txns") or {}).get("h1") or {}).get("buys") or 0)
+            # newest first is typical; we process oldest->newest to preserve order
+            events_sorted = sorted(
+                events,
+                key=lambda x: int(x.get("timestamp") or 0)
+            )
 
-                # Strategy A gate: high liquidity (>= 150k), plus activity filters
-                if (
-                    liq >= EXISTING_MIN_LIQ_USD and
-                    vol1h >= EXISTING_MIN_VOL_1H_USD and
-                    buys1h >= EXISTING_MIN_BUYS_1H and
-                    change1h >= EXISTING_MIN_CHG_1H
-                ):
-                    ranked.append((change1h, p))
-                else:
-                    skipped_filters += 1
+            did_any = False
 
-            ranked.sort(key=lambda x: x[0], reverse=True)
+            for e in events_sorted:
+                k = _hash_event(e)
+                if seen_has(state, k):
+                    continue
 
-            for _, p in ranked:
-                if buys >= MAX_BUYS_PER_SCAN:
+                # Mark as seen FIRST (idempotency): avoids double fire if execution throws
+                seen_add(state, k)
+                save_state(state)
+
+                side = str(e.get("side") or "").upper()
+                asset = str(e.get("asset") or "")
+                title = str(e.get("title") or "")
+                price = e.get("price")
+
+                if not should_copy_side(side):
+                    continue
+
+                if not rate_limit_ok(trade_times):
+                    log("RISK: rate limit hit, skipping further trades this minute")
                     break
 
-                mint = (p.get("baseToken") or {}).get("address") or ""
-                change1h = float((p.get("priceChange") or {}).get("h1") or 0.0)
-                vol1h = float((p.get("volume") or {}).get("h1") or 0.0)
-                liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
-                buys1h = int(((p.get("txns") or {}).get("h1") or {}).get("buys") or 0)
-                px = float(p.get("priceUsd") or 0.0)
-
-                candidates += 1
-                log(f"EXISTING candidate {mint} | chg1h={change1h:.2f}% vol1h=${vol1h:.2f} liq=${liq:.2f} buys1h={buys1h} px=${px:.10f}")
-
-                snap = await get_bot_positions_snapshot()
-                if mint in snap or mint in pending_buys or mint in pending_sells:
-                    skipped_tracked += 1
+                # Attempt execution
+                resp = place_copy_trade(client, e)
+                if resp is None:
                     continue
 
-                if len(snap) >= MAX_OPEN_POSITIONS or not can_buy_now():
-                    skipped_risk += 1
-                    continue
+                trade_times.append(time.time())
+                did_any = True
 
-                if mint_on_cooldown(mint):
-                    skipped_risk += 1
-                    continue
+                log(
+                    f"COPIED {side} | token_id(asset)={asset} | target_usdc={e.get('usdcSize')} "
+                    f"-> my_usdc={compute_my_usdc(float(e.get('usdcSize') or e.get('size') or 0.0)):.6f} "
+                    f"| price={price} | title={title[:80]}"
+                )
+                log(f"  order_resp={resp}")
 
-                await try_buy(mint, px_usd=px)
-                buys += 1
+                time.sleep(COOLDOWN_SEC)
 
-        except Exception as e:
-            log(f"ExistingScan error: {e}")
+            if not did_any:
+                time.sleep(POLL_SEC)
+            else:
+                # if we did work, do a faster next poll
+                time.sleep(max(0.25, POLL_SEC / 2))
 
-        log(
-            "ExistingScan "
-            f"cycle={cycle} scanned={scanned} candidates={candidates} buys={buys} "
-            f"skipped(invalid={skipped_invalid}, filters={skipped_filters}, risk={skipped_risk}, tracked={skipped_tracked}) "
-            f"bot_positions={len((await get_bot_positions_snapshot()))} pending_buys={len(pending_buys)}"
-        )
-
-        await asyncio.sleep(EXISTING_SCAN_EVERY_SEC)
-
-
-async def monitor_new_launches() -> None:
-    backoff = 5
-    while True:
-        try:
-            async with websockets.connect(WS_URL, ping_interval=10, ping_timeout=30) as ws:
-                await ws.send(json.dumps({"method": "subscribeNewToken"}))
-                log("Connected to PumpPortal WS. Subscribed to new tokens.")
-                backoff = 5
-
-                while True:
-                    msg = await ws.recv()
-                    try:
-                        data = json.loads(msg)
-                    except Exception:
-                        continue
-
-                    mint = data.get("mint")
-                    if not mint or not is_valid_solana_mint(mint):
-                        continue
-
-                    socials_ok = bool(data.get("twitter") or data.get("telegram") or data.get("website"))
-                    if NEW_REQUIRE_SOCIALS and not socials_ok:
-                        continue
-
-                    if mint_on_cooldown(mint):
-                        continue
-
-                    await asyncio.sleep(NEW_WARMUP_SEC)
-
-                    td = dexscreener_token_data(mint)
-                    vol1h = float(td.get("volume_h1") or 0.0)
-                    liq = float(td.get("liquidity_usd") or 0.0)
-                    buys1h = int(td.get("buys_h1") or 0)
-                    px = float(td.get("priceUsd") or 0.0)
-
-                    # Strategy A gate: liq >= 150k
-                    if (
-                        liq < NEW_MIN_LIQ_USD or
-                        vol1h < NEW_MIN_VOL_1H_USD or
-                        buys1h < NEW_MIN_BUYS_1H or
-                        px <= 0
-                    ):
-                        continue
-
-                    snap = await get_bot_positions_snapshot()
-                    if mint in snap or mint in pending_buys or mint in pending_sells:
-                        continue
-                    if len(snap) >= MAX_OPEN_POSITIONS or not can_buy_now():
-                        continue
-
-                    bal = await get_token_balance(mint)
-                    if bal > 0:
-                        continue
-
-                    log(f"NEW candidate {mint} | vol1h=${vol1h:.2f} liq=${liq:.2f} buys1h={buys1h} px=${px:.10f} socials={socials_ok}")
-                    await try_buy(mint, px_usd=px)
-
-        except websockets.exceptions.ConnectionClosedError as e:
-            log(f"WS closed: {e}. Reconnecting in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        except Exception as e:
-            log(f"WS error: {e}. Reconnecting in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-
-
-# ===================== HEARTBEAT =====================
-
-async def heartbeat() -> None:
-    while True:
-        await asyncio.sleep(60)
-        snap = await get_bot_positions_snapshot()
-        log(
-            f"Heartbeat: bot_positions={len(snap)} monitored={len(monitored)} "
-            f"pending_buys={len(pending_buys)} pending_sells={len(pending_sells)} "
-            f"TP_PCT={TP_PCT} SL_PCT={SL_PCT} MONITOR_POLL_SEC={MONITOR_POLL_SEC} "
-            f"BUY_SOL={BUY_SOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIORITY_FEE_MICRO_LAMPORTS={PRIORITY_FEE_MICRO_LAMPORTS} "
-            f"MINT_COOLDOWN_SEC={MINT_COOLDOWN_SEC}"
-        )
-
-
-# ===================== MAIN =====================
-
-async def main() -> None:
-    sol_bal = await get_sol_balance()
-
-    log("BOOT CONFIG:")
-    log(f"  WALLET={WALLET_PUBKEY}")
-    log(f"  WS_URL={WS_URL}")
-    log(f"  RPC_URL={RPC_URL}")
-    log(f"  JUP_BASE_URL={JUP_BASE_URL}")
-    log(f"  BUY_SOL={BUY_SOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIORITY_FEE_MICRO_LAMPORTS={PRIORITY_FEE_MICRO_LAMPORTS} SKIP_PREFLIGHT={SKIP_PREFLIGHT}")
-    log(f"  STRATEGY_A: TP_PCT={TP_PCT} SL_PCT={SL_PCT} MONITOR_POLL_SEC={MONITOR_POLL_SEC} (NO TIME EXITS)")
-    log(f"  GLOBAL LIQ GATE: MIN_LIQ_USD_GLOBAL={MIN_LIQ_USD_GLOBAL}")
-    log(f"  NEW: warmup={NEW_WARMUP_SEC}s minVol1h={NEW_MIN_VOL_1H_USD} minLiq={NEW_MIN_LIQ_USD} minBuys1h={NEW_MIN_BUYS_1H} requireSocials={NEW_REQUIRE_SOCIALS}")
-    log(f"  EXISTING: queries={EXISTING_QUERIES} limitPerQuery={EXISTING_LIMIT_PER_QUERY} scanEvery={EXISTING_SCAN_EVERY_SEC}s")
-    log(f"           minChg1h={EXISTING_MIN_CHG_1H}% minVol1h={EXISTING_MIN_VOL_1H_USD} minLiq={EXISTING_MIN_LIQ_USD} minBuys1h={EXISTING_MIN_BUYS_1H}")
-    log(f"  RISK: MAX_BUYS_PER_SCAN={MAX_BUYS_PER_SCAN} BUY_COOLDOWN_SEC={BUY_COOLDOWN_SEC} MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}")
-    log(f"  MINT_COOLDOWN_SEC={MINT_COOLDOWN_SEC}")
-    log(f"  JUP_MIN_INTERVAL_SEC={JUP_MIN_INTERVAL_SEC}")
-    log(f"  RECONCILE_SEC={RECONCILE_SEC}")
-    log(f"  SOL_BALANCE={sol_bal:.6f} SOL")
-    log(f"  LOG_SKIPS={LOG_SKIPS}")
-
-    asyncio.create_task(reconcile_loop())
-    asyncio.create_task(scan_existing_tokens())
-    asyncio.create_task(heartbeat())
-    await monitor_new_launches()
+        except Exception as ex:
+            log(f"LOOP error: {ex}")
+            time.sleep(max(2.0, POLL_SEC))
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    finally:
-        try:
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(client.close())
-            loop.close()
-        except Exception:
-            pass
+    main()
