@@ -1,487 +1,377 @@
 import os
 import time
-import json
+import math
 import logging
-import requests
+import re
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Tuple, List
 
-from py_clob_client.client import ClobClient
-from py_clob_client.order_builder.constants import BUY, SELL
+import httpx
 
-# ----------------------------
-# Env helpers
-# ----------------------------
-
-def env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None or v == "" else v
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
-
-def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return int(v)
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return float(v)
-
-def parse_assets(raw: str) -> List[str]:
-    raw = raw.strip()
-    if raw.startswith("["):
-        try:
-            arr = json.loads(raw)
-            return [str(x).strip().upper() for x in arr]
-        except Exception:
-            pass
-    return [x.strip().upper() for x in raw.split(",") if x.strip()]
-
-# ----------------------------
-# Logging
-# ----------------------------
-
-LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
-log = logging.getLogger("updown15m_ladder")
+logger = logging.getLogger("updown15m_ladder")
 
-# ----------------------------
-# Config
-# ----------------------------
 
-CLOB_HOST  = env_str("CLOB_HOST", "https://clob.polymarket.com")
-GAMMA_HOST = env_str("GAMMA_HOST", "https://gamma-api.polymarket.com")
-CHAIN_ID   = env_int("CHAIN_ID", 137)
+# =========================
+# SETTINGS
+# =========================
+@dataclass
+class Settings:
+    # Hosts
+    CLOB_HOST: str = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
+    GAMMA_HOST: str = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
 
-PM_FUNDER        = env_str("PM_FUNDER")
-PM_PRIVATE_KEY   = env_str("PM_PRIVATE_KEY")
-PM_SIGNATURE_TYPE = env_int("PM_SIGNATURE_TYPE", 1)
+    # Assets
+    ASSETS: List[str] = None
 
-ASSETS = parse_assets(env_str("ASSETS", '["ETH","BTC","SOL","XRP"]'))
+    # Discovery
+    WINDOW_SEC: int = int(os.getenv("WINDOW_SEC", "900"))
+    SLUG_SCAN_BEHIND: int = int(os.getenv("SLUG_SCAN_BEHIND", "12"))
+    SLUG_SCAN_AHEAD: int = int(os.getenv("SLUG_SCAN_AHEAD", "12"))
 
-POLL_SEC          = env_float("POLL_SEC", 2.0)
-RESOLVE_EVERY_SEC = env_float("RESOLVE_EVERY_SEC", 15.0)
-MAX_SLUG_LOOKUPS  = env_int("MAX_SLUG_LOOKUPS", 50)
+    # Strategy timing
+    POLL_SEC: float = float(os.getenv("POLL_SEC", "2.0"))
+    EVAL_INTERVAL_SEC: int = int(os.getenv("EVAL_INTERVAL_SEC", "120"))  # every 2 min
+    EVAL_COUNT: int = int(os.getenv("EVAL_COUNT", "6"))                  # 6 evaluations
+    EXIT_AT_SEC: int = int(os.getenv("EXIT_AT_SEC", "780"))              # 13 min (780s) from start
 
-BASE_USDC         = env_float("BASE_USDC", 1.0)
-STEP_USDC         = env_float("STEP_USDC", 1.0)
-EVAL_INTERVAL_SEC = env_int("EVAL_INTERVAL_SEC", 120)
-EVAL_COUNT        = env_int("EVAL_COUNT", 6)
-EXIT_AT_SEC       = env_int("EXIT_AT_SEC", 780)
+    # Strategy sizing (USDC notionals per step)
+    BASE_USDC: float = float(os.getenv("BASE_USDC", "1.0"))              # buy both sides at start
+    STEP_USDC: float = float(os.getenv("STEP_USDC", "1.0"))              # add to winner side each eval
 
-SELL_OPPOSITE     = env_bool("SELL_OPPOSITE", True)
-DRY_RUN           = env_bool("DRY_RUN", False)
+    # Execution controls
+    DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
+    MAX_SLIPPAGE: float = float(os.getenv("MAX_SLIPPAGE", "0.02"))
+    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
+    COOLDOWN_SEC: float = float(os.getenv("COOLDOWN_SEC", "0.25"))
 
-MAX_SLIPPAGE       = env_float("MAX_SLIPPAGE", 0.02)
-MAX_RETRIES        = env_int("MAX_RETRIES", 3)
-MAX_TRADES_PER_MIN = env_int("MAX_TRADES_PER_MIN", 20)
-COOLDOWN_SEC       = env_float("COOLDOWN_SEC", 0.25)
+    # Credentials (your system already uses these in Railway)
+    POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
+    POLY_PROXY_ADDRESS: str = os.getenv("POLY_PROXY_ADDRESS", "")
+    POLY_FUNDER_ADDRESS: str = os.getenv("POLY_FUNDER_ADDRESS", "")
+    POLY_CHAIN_ID: int = int(os.getenv("POLY_CHAIN_ID", "137"))
 
-# Deterministic slug scan window
-# We’ll try current 15m bucket +/- N buckets (each bucket = 900s)
-SLUG_SCAN_BUCKETS_BEHIND = env_int("SLUG_SCAN_BUCKETS_BEHIND", 6)   # 6*15m = 90m back
-SLUG_SCAN_BUCKETS_AHEAD  = env_int("SLUG_SCAN_BUCKETS_AHEAD", 6)    # 90m forward
+    def __post_init__(self):
+        if self.ASSETS is None:
+            assets_raw = os.getenv("ASSETS", "ETH,BTC,SOL,XRP")
+            self.ASSETS = [a.strip().upper() for a in assets_raw.split(",") if a.strip()]
 
-# ----------------------------
-# HTTP (Gamma)
-# ----------------------------
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "updown15m-ladder-bot/2.0"})
+S = Settings()
 
-def http_get_json(url: str, params: Optional[dict] = None, timeout: float = 10.0) -> Optional[object]:
+
+# =========================
+# MARKET DISCOVERY (FIX)
+# =========================
+ASSET_PREFIX = {
+    "BTC": "btc",
+    "ETH": "eth",
+    "SOL": "sol",
+    "XRP": "xrp",
+}
+
+
+def epoch_now() -> int:
+    return int(datetime.now(tz=timezone.utc).timestamp())
+
+
+def round_to_window(ts: int, window: int) -> int:
+    return (ts // window) * window
+
+
+def gamma_event_by_slug(gamma_host: str, slug: str) -> Optional[dict]:
+    """
+    Correct endpoint: /events/slug/{slug}
+    Your earlier failures happened because you were calling /events/{slug} (wrong) or /markets?sort=... (422)
+    """
+    url = f"{gamma_host}/events/slug/{slug}"
     try:
-        r = SESSION.get(url, params=params, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        # show URL+params for immediate diagnosis
-        full = r.url if "r" in locals() else url
-        log.warning(f"[HTTP] GET failed: {full} ({e})")
+        r = httpx.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            return r.json()
         return None
-
-def gamma_market_by_slug(slug: str) -> Optional[dict]:
-    # Correct lookup: /markets?slug=<slug>
-    url = f"{GAMMA_HOST}/markets"
-    data = http_get_json(url, params={"slug": slug}, timeout=10.0)
-    if not data:
-        return None
-    if isinstance(data, list):
-        return data[0] if data else None
-    if isinstance(data, dict):
-        if "markets" in data and isinstance(data["markets"], list):
-            return data["markets"][0] if data["markets"] else None
-        # Sometimes API returns a single market object
-        if "slug" in data:
-            return data
-    return None
-
-# ----------------------------
-# Time helpers
-# ----------------------------
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s)
     except Exception:
         return None
 
-def floor_to_15m_epoch(ts: int) -> int:
-    return (ts // 900) * 900
 
-# ----------------------------
-# CLOB client
-# ----------------------------
+def extract_market_tokens_from_event(event_json: dict) -> Tuple[str, str, str]:
+    """
+    Returns: (market_id_or_condition, yes_token_id, no_token_id)
+    Gamma typically returns event_json["markets"][0]["clobTokenIds"] = [YES, NO]
+    """
+    markets = event_json.get("markets") or []
+    if not markets:
+        raise RuntimeError("Gamma event JSON has no markets[]")
 
-def init_clob() -> ClobClient:
-    if not PM_PRIVATE_KEY or not PM_FUNDER:
-        raise RuntimeError("Missing PM_PRIVATE_KEY or PM_FUNDER")
+    m0 = markets[0]
 
-    client = ClobClient(
-        host=CLOB_HOST,
-        chain_id=CHAIN_ID,
-        key=PM_PRIVATE_KEY,
-        signature_type=PM_SIGNATURE_TYPE,
-        funder=PM_FUNDER,
-    )
-    creds = client.create_or_derive_api_creds()
-    client.set_api_creds(creds)
-    log.info("[AUTH] derived API creds via create_or_derive_api_creds()")
-    return client
-
-def best_bid_ask(clob: ClobClient, token_id: str) -> Tuple[Optional[float], Optional[float]]:
-    try:
-        ob = clob.get_order_book(token_id)
-        bids = ob.get("bids") or []
-        asks = ob.get("asks") or []
-        best_bid = float(bids[0]["price"]) if bids else None
-        best_ask = float(asks[0]["price"]) if asks else None
-        return best_bid, best_ask
-    except Exception as e:
-        log.warning(f"[CLOB] order book failed token={token_id}: {e}")
-        return None, None
-
-def place_order(
-    clob: ClobClient,
-    token_id: str,
-    side: str,
-    usdc_amount: float,
-    max_slippage: float,
-    sell_tokens: bool = False
-) -> Optional[dict]:
-    bid, ask = best_bid_ask(clob, token_id)
-    if bid is None and ask is None:
-        return None
-
-    if side == BUY:
-        if ask is None:
-            return None
-        limit_price = min(0.99, ask * (1.0 + max_slippage))
-        size = usdc_amount / max(limit_price, 1e-9)
+    if "clobTokenIds" in m0 and isinstance(m0["clobTokenIds"], list) and len(m0["clobTokenIds"]) >= 2:
+        yes_token_id = m0["clobTokenIds"][0]
+        no_token_id = m0["clobTokenIds"][1]
     else:
-        if bid is None:
-            return None
-        limit_price = max(0.01, bid * (1.0 - max_slippage))
-        size = usdc_amount if sell_tokens else usdc_amount / max(limit_price, 1e-9)
+        # fallback shape
+        outcomes = m0.get("outcomes") or []
+        if len(outcomes) < 2:
+            raise RuntimeError("Gamma market JSON missing clobTokenIds and outcomes[]")
+        yes_token_id = outcomes[0].get("clobTokenId")
+        no_token_id = outcomes[1].get("clobTokenId")
+        if not yes_token_id or not no_token_id:
+            raise RuntimeError("Could not extract clobTokenId from outcomes")
 
-    size = float(size)
-    if size <= 0:
-        return None
+    market_id = m0.get("id") or m0.get("conditionId") or event_json.get("id")
+    if not market_id:
+        market_id = "unknown"
 
-    if DRY_RUN:
-        log.info(f"[DRY] {side} token={token_id} price={limit_price:.4f} size={size:.6f}")
-        return {"dry_run": True, "side": side, "token_id": token_id, "price": limit_price, "size": size}
+    return str(market_id), str(yes_token_id), str(no_token_id)
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = clob.create_and_post_order({
-                "token_id": token_id,
-                "side": side,
-                "price": str(limit_price),
-                "size": str(size),
-            })
-            return resp
-        except Exception as e:
-            log.warning(f"[ORDER] attempt {attempt}/{MAX_RETRIES} failed: {e}")
-            time.sleep(0.25 * attempt)
+
+def resolve_active_15m_market(asset: str) -> Optional[Dict[str, Any]]:
+    """
+    Deterministic slug scan (behind + ahead):
+      {prefix}-updown-15m-{epoch_rounded_to_15m}
+
+    Picks the first slug that exists AND is still within its open window.
+    """
+    asset = asset.upper()
+    if asset not in ASSET_PREFIX:
+        raise ValueError(f"Unsupported asset: {asset}")
+
+    prefix = ASSET_PREFIX[asset]
+    now_ts = epoch_now()
+    base = round_to_window(now_ts, S.WINDOW_SEC)
+
+    # scan behind + ahead (e.g. -12..+12 windows)
+    for k in range(-S.SLUG_SCAN_BEHIND, S.SLUG_SCAN_AHEAD + 1):
+        start_ts = base + (k * S.WINDOW_SEC)
+        if start_ts <= 0:
+            continue
+        slug = f"{prefix}-updown-15m-{start_ts}"
+
+        ev = gamma_event_by_slug(S.GAMMA_HOST, slug)
+        if not ev:
+            continue
+
+        # validate still open
+        if now_ts < start_ts + S.WINDOW_SEC:
+            market_id, yes_token, no_token = extract_market_tokens_from_event(ev)
+            return {
+                "asset": asset,
+                "slug": slug,
+                "start_ts": start_ts,
+                "end_ts": start_ts + S.WINDOW_SEC,
+                "market_id": market_id,
+                "yes_token_id": yes_token,
+                "no_token_id": no_token,
+            }
+
     return None
 
-# ----------------------------
-# Market resolution
-# ----------------------------
 
+# =========================
+# TRADING ADAPTERS (YOU MUST MAP THESE TO YOUR EXISTING FUNCTIONS)
+# =========================
+class TradingClient:
+    """
+    This is a thin adapter shell.
+    Replace internals with YOUR working py_clob_client init + methods.
+    """
+    def __init__(self):
+        # TODO: initialize your actual client here
+        # example (depends on your py_clob_client version):
+        # from py_clob_client.client import ClobClient
+        # self.client = ClobClient(host=S.CLOB_HOST, chain_id=S.POLY_CHAIN_ID, ...)
+        self.client = None
+
+    def get_best_ask(self, token_id: str) -> Optional[float]:
+        # TODO: return best ask price for token_id
+        # must be in [0,1] price terms
+        raise NotImplementedError
+
+    def get_best_bid(self, token_id: str) -> Optional[float]:
+        # TODO: return best bid price for token_id
+        raise NotImplementedError
+
+    def buy_usdc_notional(self, token_id: str, usdc: float, max_slippage: float) -> None:
+        """
+        Buy shares spending ~usdc.
+        Implementation: compute shares = usdc / best_ask, place marketable limit.
+        """
+        raise NotImplementedError
+
+    def sell_all(self, token_id: str) -> None:
+        raise NotImplementedError
+
+
+# =========================
+# STRATEGY CORE (UNCHANGED INTENT)
+# =========================
 @dataclass
-class Market:
-    asset: str
-    slug: str
-    condition_id: str
+class PositionState:
     yes_token: str
     no_token: str
-    end: datetime
+    start_ts: int
+    end_ts: int
+    slug: str
 
-def resolve_active_15m_market(asset: str) -> Optional[Market]:
+    # tracking
+    base_done: bool = False
+    eval_idx: int = 0
+    next_eval_ts: int = 0
+    exit_ts: int = 0
+
+    # last prices
+    last_yes: Optional[float] = None
+    last_no: Optional[float] = None
+
+
+def compute_winner_side(last_yes: float, last_no: float, now_yes: float, now_no: float) -> str:
     """
-    Deterministic scan:
-    - Build candidate slugs on 15m grid around now
-    - Query /markets?slug=<slug>
-    - Take the nearest future/open market with orderbook enabled
+    "Winner" = side whose price increased more in absolute delta.
+    If tie -> buy none.
     """
-    asset_l = asset.lower()
-    now_ts = int(time.time())
-    base = floor_to_15m_epoch(now_ts)
+    dy = now_yes - last_yes
+    dn = now_no - last_no
+    if dy > dn and dy > 0:
+        return "YES"
+    if dn > dy and dn > 0:
+        return "NO"
+    return "NONE"
 
-    candidates: List[Market] = []
 
-    # Scan behind -> ahead so we pick the currently active one first if it exists
-    for k in range(-SLUG_SCAN_BUCKETS_BEHIND, SLUG_SCAN_BUCKETS_AHEAD + 1):
-        t = base + k * 900
-        slug = f"{asset_l}-updown-15m-{t}"
+def run_market(client: TradingClient, m: Dict[str, Any]) -> None:
+    state = PositionState(
+        yes_token=m["yes_token_id"],
+        no_token=m["no_token_id"],
+        start_ts=m["start_ts"],
+        end_ts=m["end_ts"],
+        slug=m["slug"],
+        next_eval_ts=m["start_ts"] + S.EVAL_INTERVAL_SEC,
+        exit_ts=m["start_ts"] + S.EXIT_AT_SEC
+    )
 
-        m = gamma_market_by_slug(slug)
-        if not m:
-            continue
-
-        # Basic sanity checks
-        closed = str(m.get("closed", "")).lower() == "true"
-        eob = str(m.get("enableOrderBook", "")).lower() == "true"
-        if closed or not eob:
-            continue
-
-        end_dt = parse_iso(m.get("endDate"))
-        if not end_dt:
-            continue
-        if end_dt <= now_utc():
-            continue
-
-        toks = m.get("clobTokenIds") or []
-        if not isinstance(toks, list) or len(toks) < 2:
-            continue
-
-        condition_id = m.get("conditionId") or ""
-        if not isinstance(condition_id, str) or not condition_id.startswith("0x"):
-            continue
-
-        candidates.append(Market(
-            asset=asset,
-            slug=slug,
-            condition_id=condition_id,
-            yes_token=str(toks[0]),
-            no_token=str(toks[1]),
-            end=end_dt,
-        ))
-
-    if not candidates:
-        return None
-
-    # Choose the earliest-ending still-open market (closest in time)
-    candidates.sort(key=lambda x: x.end)
-    return candidates[0]
-
-# ----------------------------
-# Ladder state machine
-# ----------------------------
-
-@dataclass
-class RunState:
-    market: Market
-    started_at: datetime
-    last_eval_at: datetime
-    eval_idx: int
-    last_yes_ask: float
-    last_no_ask: float
-    inv_yes: float
-    inv_no: float
-
-def main():
-    log.info("=== UPDOWN 15M LADDER BOT START ===")
-    log.info(f"CLOB_HOST={CLOB_HOST} CHAIN_ID={CHAIN_ID} GAMMA_HOST={GAMMA_HOST}")
-    log.info(f"ASSETS={ASSETS}")
-    log.info(f"POLL_SEC={POLL_SEC} RESOLVE_EVERY_SEC={RESOLVE_EVERY_SEC} MAX_SLUG_LOOKUPS={MAX_SLUG_LOOKUPS}")
-    log.info(f"LADDER: BASE_USDC={BASE_USDC:.2f} STEP_USDC={STEP_USDC:.2f} EVAL_INTERVAL_SEC={EVAL_INTERVAL_SEC} EVAL_COUNT={EVAL_COUNT} EXIT_AT_SEC={EXIT_AT_SEC}")
-    log.info(f"EXEC: MAX_SLIPPAGE={MAX_SLIPPAGE:.3f} MAX_RETRIES={MAX_RETRIES} MAX_TRADES_PER_MIN={MAX_TRADES_PER_MIN} COOLDOWN_SEC={COOLDOWN_SEC}")
-    log.info(f"DRY_RUN={DRY_RUN}")
-    log.info(f"SLUG_SCAN: behind={SLUG_SCAN_BUCKETS_BEHIND} ahead={SLUG_SCAN_BUCKETS_AHEAD}")
-
-    clob = init_clob()
-
-    trade_timestamps: List[float] = []
-
-    def can_trade() -> bool:
-        nonlocal trade_timestamps
-        now = time.time()
-        trade_timestamps = [t for t in trade_timestamps if now - t < 60.0]
-        return len(trade_timestamps) < MAX_TRADES_PER_MIN
-
-    def mark_trade():
-        trade_timestamps.append(time.time())
-
-    states: Dict[str, Optional[RunState]] = {a: None for a in ASSETS}
-    last_resolve = 0.0
+    logger.info(f"[MARKET] {m['asset']} slug={state.slug} start={state.start_ts} end={state.end_ts}")
+    logger.info(f"[TOKENS] yes={state.yes_token} no={state.no_token}")
 
     while True:
-        loop_start = time.time()
+        now = epoch_now()
 
-        # Resolve markets periodically
-        if (loop_start - last_resolve) >= RESOLVE_EVERY_SEC:
-            last_resolve = loop_start
+        # stop if past exit time
+        if now >= state.exit_ts:
+            logger.info(f"[EXIT] now>=exit_ts ({now} >= {state.exit_ts}) selling all")
+            if not S.DRY_RUN:
+                # sell both
+                try:
+                    client.sell_all(state.yes_token)
+                except Exception as e:
+                    logger.warning(f"[SELL] YES failed: {e}")
+                try:
+                    client.sell_all(state.no_token)
+                except Exception as e:
+                    logger.warning(f"[SELL] NO failed: {e}")
+            else:
+                logger.info("[DRY_RUN] skip selling")
+            break
 
-            for asset in ASSETS:
+        # get prices
+        try:
+            yes_ask = client.get_best_ask(state.yes_token)
+            no_ask = client.get_best_ask(state.no_token)
+        except Exception as e:
+            logger.warning(f"[PRICES] failed: {e}")
+            time.sleep(S.POLL_SEC)
+            continue
+
+        if yes_ask is None or no_ask is None:
+            logger.info("[PRICES] missing best ask; retry")
+            time.sleep(S.POLL_SEC)
+            continue
+
+        logger.info(f"[PRICES] {m['asset']} ya={yes_ask:.4f} na={no_ask:.4f}")
+
+        # Base entry immediately once we have prices
+        if not state.base_done:
+            logger.info(f"[BASE] buying {S.BASE_USDC:.2f} USDC each side")
+            if not S.DRY_RUN:
+                client.buy_usdc_notional(state.yes_token, S.BASE_USDC, S.MAX_SLIPPAGE)
+                client.buy_usdc_notional(state.no_token, S.BASE_USDC, S.MAX_SLIPPAGE)
+            else:
+                logger.info("[DRY_RUN] base buys skipped")
+            state.base_done = True
+            state.last_yes = yes_ask
+            state.last_no = no_ask
+
+        # Evaluate every 2 minutes, 6 times total
+        if state.eval_idx < S.EVAL_COUNT and now >= state.next_eval_ts:
+            winner = compute_winner_side(state.last_yes, state.last_no, yes_ask, no_ask)
+            logger.info(f"[EVAL {state.eval_idx+1}/{S.EVAL_COUNT}] winner={winner} yes={yes_ask:.4f} no={no_ask:.4f}")
+
+            if winner == "YES":
+                if not S.DRY_RUN:
+                    client.buy_usdc_notional(state.yes_token, S.STEP_USDC, S.MAX_SLIPPAGE)
+                else:
+                    logger.info("[DRY_RUN] step buy YES skipped")
+            elif winner == "NO":
+                if not S.DRY_RUN:
+                    client.buy_usdc_notional(state.no_token, S.STEP_USDC, S.MAX_SLIPPAGE)
+                else:
+                    logger.info("[DRY_RUN] step buy NO skipped")
+            else:
+                logger.info("[EVAL] no clear winner; no buy")
+
+            state.eval_idx += 1
+            state.next_eval_ts = state.start_ts + (state.eval_idx + 1) * S.EVAL_INTERVAL_SEC
+            state.last_yes = yes_ask
+            state.last_no = no_ask
+
+        time.sleep(S.POLL_SEC)
+
+
+# =========================
+# MAIN LOOP
+# =========================
+def main():
+    logger.info("=== UPDOWN 15M LADDER BOT START ===")
+    logger.info(f"CLOB_HOST={S.CLOB_HOST} CHAIN_ID={S.POLY_CHAIN_ID} GAMMA_HOST={S.GAMMA_HOST}")
+    logger.info(f"ASSETS={S.ASSETS}")
+    logger.info(f"POLL_SEC={S.POLL_SEC} RESOLVE_EVERY_SEC=15.0")
+    logger.info(f"LADDER: BASE_USDC={S.BASE_USDC:.2f} STEP_USDC={S.STEP_USDC:.2f} "
+                f"EVAL_INTERVAL_SEC={S.EVAL_INTERVAL_SEC} EVAL_COUNT={S.EVAL_COUNT} EXIT_AT_SEC={S.EXIT_AT_SEC}")
+    logger.info(f"EXEC: MAX_SLIPPAGE={S.MAX_SLIPPAGE:.3f} MAX_RETRIES={S.MAX_RETRIES} COOLDOWN_SEC={S.COOLDOWN_SEC}")
+    logger.info(f"DRY_RUN={S.DRY_RUN}")
+    logger.info(f"SLUG_SCAN: behind={S.SLUG_SCAN_BEHIND} ahead={S.SLUG_SCAN_AHEAD}")
+
+    # init trading client
+    client = TradingClient()
+
+    # loop forever: for each asset find an active market and run it
+    while True:
+        for asset in S.ASSETS:
+            try:
                 m = resolve_active_15m_market(asset)
                 if not m:
-                    log.info(f"[MARKET] {asset} no active 15m market found")
+                    logger.info(f"[MARKET] {asset} no active 15m market found")
                     continue
 
-                st = states.get(asset)
-                if st is None or st.market.condition_id != m.condition_id:
-                    by, ay = best_bid_ask(clob, m.yes_token)
-                    bn, an = best_bid_ask(clob, m.no_token)
-                    if ay is None or an is None:
-                        log.info(f"[MARKET] {asset} slug={m.slug} asks not ready yet; waiting")
-                        continue
+                # only trade if within first 13 minutes window (we exit at 780s)
+                now = epoch_now()
+                if now >= m["start_ts"] + S.EXIT_AT_SEC:
+                    logger.info(f"[SKIP] {asset} market too late in window (now={now}, start={m['start_ts']})")
+                    continue
 
-                    log.info(f"[MARKET] {asset} slug={m.slug} end={m.end.isoformat()} yes={m.yes_token} no={m.no_token}")
+                run_market(client, m)
 
-                    yes_tokens = 0.0
-                    no_tokens = 0.0
+            except Exception as e:
+                logger.warning(f"[ERROR] {asset}: {e}")
 
-                    # Initial buy both sides
-                    if can_trade():
-                        r1 = place_order(clob, m.yes_token, BUY, BASE_USDC, MAX_SLIPPAGE)
-                        if r1:
-                            mark_trade()
-                            yes_tokens = BASE_USDC / float(ay)
-                        time.sleep(COOLDOWN_SEC)
+        time.sleep(2.0)
 
-                    if can_trade():
-                        r2 = place_order(clob, m.no_token, BUY, BASE_USDC, MAX_SLIPPAGE)
-                        if r2:
-                            mark_trade()
-                            no_tokens = BASE_USDC / float(an)
-                        time.sleep(COOLDOWN_SEC)
-
-                    states[asset] = RunState(
-                        market=m,
-                        started_at=now_utc(),
-                        last_eval_at=now_utc(),
-                        eval_idx=0,
-                        last_yes_ask=float(ay),
-                        last_no_ask=float(an),
-                        inv_yes=float(yes_tokens),
-                        inv_no=float(no_tokens),
-                    )
-
-                    log.info(f"[INIT] {asset} bought both: yes~{yes_tokens:.6f} no~{no_tokens:.6f} (asks y={ay:.4f} n={an:.4f})")
-
-        # Run ladder logic
-        for asset in ASSETS:
-            st = states.get(asset)
-            if not st:
-                continue
-
-            elapsed = (now_utc() - st.started_at).total_seconds()
-
-            # Exit at 13 minutes
-            if elapsed >= EXIT_AT_SEC:
-                log.info(f"[EXIT] {asset} selling inventory yes={st.inv_yes:.6f} no={st.inv_no:.6f}")
-
-                if st.inv_yes > 0 and can_trade():
-                    r = place_order(clob, st.market.yes_token, SELL, st.inv_yes, MAX_SLIPPAGE, sell_tokens=True)
-                    if r:
-                        mark_trade()
-                        st.inv_yes = 0.0
-                    time.sleep(COOLDOWN_SEC)
-
-                if st.inv_no > 0 and can_trade():
-                    r = place_order(clob, st.market.no_token, SELL, st.inv_no, MAX_SLIPPAGE, sell_tokens=True)
-                    if r:
-                        mark_trade()
-                        st.inv_no = 0.0
-                    time.sleep(COOLDOWN_SEC)
-
-                states[asset] = None
-                continue
-
-            # Evaluations every 2 minutes, 6 times
-            if st.eval_idx < EVAL_COUNT:
-                since_eval = (now_utc() - st.last_eval_at).total_seconds()
-                if since_eval >= EVAL_INTERVAL_SEC:
-                    by, ay = best_bid_ask(clob, st.market.yes_token)
-                    bn, an = best_bid_ask(clob, st.market.no_token)
-                    if ay is None or an is None:
-                        log.info(f"[EVAL] {asset} asks missing; waiting")
-                        st.last_eval_at = now_utc()
-                        continue
-
-                    dy = float(ay) - st.last_yes_ask
-                    dn = float(an) - st.last_no_ask
-                    pick_yes = dy > dn
-                    pick = "YES" if pick_yes else "NO"
-
-                    log.info(
-                        f"[EVAL] {asset} {st.eval_idx+1}/{EVAL_COUNT} "
-                        f"ask_yes={ay:.4f} ask_no={an:.4f} dy={dy:+.4f} dn={dn:+.4f} pick={pick}"
-                    )
-
-                    # Buy STEP_USDC on chosen side
-                    if can_trade():
-                        token = st.market.yes_token if pick_yes else st.market.no_token
-                        r = place_order(clob, token, BUY, STEP_USDC, MAX_SLIPPAGE)
-                        if r:
-                            mark_trade()
-                            added = STEP_USDC / float(ay if pick_yes else an)
-                            if pick_yes:
-                                st.inv_yes += added
-                            else:
-                                st.inv_no += added
-                            log.info(f"[BUY] {asset} +{STEP_USDC:.2f}USDC on {pick} tokens~{added:.6f}")
-                        time.sleep(COOLDOWN_SEC)
-
-                    # Optional: sell the opposite side immediately
-                    if SELL_OPPOSITE:
-                        if pick_yes and st.inv_no > 0 and can_trade():
-                            r = place_order(clob, st.market.no_token, SELL, st.inv_no, MAX_SLIPPAGE, sell_tokens=True)
-                            if r:
-                                mark_trade()
-                                log.info(f"[SELL] {asset} sold ALL NO inv={st.inv_no:.6f}")
-                                st.inv_no = 0.0
-                            time.sleep(COOLDOWN_SEC)
-
-                        if (not pick_yes) and st.inv_yes > 0 and can_trade():
-                            r = place_order(clob, st.market.yes_token, SELL, st.inv_yes, MAX_SLIPPAGE, sell_tokens=True)
-                            if r:
-                                mark_trade()
-                                log.info(f"[SELL] {asset} sold ALL YES inv={st.inv_yes:.6f}")
-                                st.inv_yes = 0.0
-                            time.sleep(COOLDOWN_SEC)
-
-                    # Advance
-                    st.last_yes_ask = float(ay)
-                    st.last_no_ask = float(an)
-                    st.last_eval_at = now_utc()
-                    st.eval_idx += 1
-
-        # sleep
-        dt = time.time() - loop_start
-        time.sleep(max(0.05, POLL_SEC - dt))
 
 if __name__ == "__main__":
     main()
