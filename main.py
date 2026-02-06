@@ -54,8 +54,9 @@ LOG_EVERY_SEC = float(os.getenv("LOG_EVERY_SEC", "15"))
 DEBUG = os.getenv("DEBUG", "1").strip() == "1"
 
 # Resolver knobs
-MAX_SLUG_LOOKUPS = int(os.getenv("MAX_SLUG_LOOKUPS", "12"))  # how many slugs per asset we expand via /markets?slug=
+MAX_SLUG_LOOKUPS = int(os.getenv("MAX_SLUG_LOOKUPS", "12"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
+DEBUG_EXPANSION_SAMPLES = int(os.getenv("DEBUG_EXPANSION_SAMPLES", "3"))  # how many expanded markets to print
 
 
 # =========================
@@ -120,14 +121,8 @@ def asset_query_name(asset: str) -> str:
     return mapping.get(asset.upper(), f"{asset.upper()} Up or Down")
 
 
-def slug_family_prefix(asset: str) -> str:
-    # Based on what you showed: btc-updown-15m-..., eth-updown-15m-...
-    return f"{asset.lower()}-updown-15m-"
-
-
 def is_candidate_slug(asset: str, slug: str) -> bool:
     s = (slug or "").lower()
-    # Must be the 15m family
     if "updown-15m" not in s:
         return False
 
@@ -140,14 +135,11 @@ def is_candidate_slug(asset: str, slug: str) -> bool:
         return s.startswith("sol-updown-15m-") or s.startswith("solana-updown-15m-")
     if a == "XRP":
         return s.startswith("xrp-updown-15m-")
-
-    # fallback
-    return s.startswith(slug_family_prefix(asset))
+    return True
 
 
 def extract_end_dt(market_obj: dict) -> Optional[datetime]:
-    # Gamma fields vary across endpoints/versions; handle common ones
-    for k in ("endDate", "endDateIso", "end_date", "end_date_iso"):
+    for k in ("endDate", "end_date", "endDateIso", "end_date_iso"):
         v = market_obj.get(k)
         if isinstance(v, str) and v.strip():
             try:
@@ -158,14 +150,12 @@ def extract_end_dt(market_obj: dict) -> Optional[datetime]:
 
 
 def extract_enable_orderbook(market_obj: dict) -> bool:
-    # Some responses use enableOrderBook, some enable_order_book
     v = market_obj.get("enableOrderBook")
     if isinstance(v, bool):
         return v
     v2 = market_obj.get("enable_order_book")
     if isinstance(v2, bool):
         return v2
-    # If missing, treat as False (we’ll only trade if explicitly enabled)
     return False
 
 
@@ -194,7 +184,7 @@ async def http_get_json(session: aiohttp.ClientSession, url: str, params: Option
 
 
 async def gamma_public_search(session: aiohttp.ClientSession, asset: str) -> dict:
-    # IMPORTANT: do NOT set optimized=true here, because you are getting incomplete market fields.
+    # Your logs show public-search returns incomplete market fields, but slugs are good.
     params = {
         "q": asset_query_name(asset),
         "events_status": "active",
@@ -207,18 +197,45 @@ async def gamma_public_search(session: aiohttp.ClientSession, asset: str) -> dic
 
 
 async def gamma_market_by_slug(session: aiohttp.ClientSession, slug: str) -> Optional[dict]:
-    # Gamma markets endpoint: /markets?slug=...
-    # Some deployments return a list; some return a dict with "markets"
-    data = await http_get_json(session, f"{GAMMA_HOST}/markets", params={"slug": slug})
-    if isinstance(data, list) and data:
-        return data[0]
-    if isinstance(data, dict):
-        mkts = data.get("markets")
-        if isinstance(mkts, list) and mkts:
-            return mkts[0]
-        # sometimes the market object is directly returned
-        if "slug" in data:
+    """
+    Use the dedicated endpoint first:
+      GET /markets/slug/{slug}
+    Fallback to:
+      GET /markets?slug=...
+    """
+    # 1) Dedicated endpoint
+    try:
+        data = await http_get_json(session, f"{GAMMA_HOST}/markets/slug/{slug}", params=None)
+        if isinstance(data, dict) and (data.get("slug") or "").strip().lower() == slug.lower():
             return data
+        # some variants wrap it
+        if isinstance(data, dict) and "market" in data and isinstance(data["market"], dict):
+            mk = data["market"]
+            if (mk.get("slug") or "").strip().lower() == slug.lower():
+                return mk
+    except Exception:
+        pass
+
+    # 2) Fallback query param
+    try:
+        data = await http_get_json(session, f"{GAMMA_HOST}/markets", params={"slug": slug})
+        if isinstance(data, list) and data:
+            mk = data[0]
+            if isinstance(mk, dict) and (mk.get("slug") or "").strip().lower() == slug.lower():
+                return mk
+            return None
+        if isinstance(data, dict):
+            mkts = data.get("markets")
+            if isinstance(mkts, list) and mkts:
+                mk = mkts[0]
+                if isinstance(mk, dict) and (mk.get("slug") or "").strip().lower() == slug.lower():
+                    return mk
+            # sometimes the market is directly returned
+            if (data.get("slug") or "").strip().lower() == slug.lower():
+                return data
+    except Exception:
+        pass
+
     return None
 
 
@@ -329,51 +346,54 @@ def place_fok(client: ClobClient, token_id: str, side: str, price: float, size: 
 # Resolver (fixed)
 # =========================
 async def gamma_resolve_current_15m(session: aiohttp.ClientSession, asset: str) -> Optional[ResolvedMarket]:
-    """
-    Two-step resolver:
-      1) public-search to get candidate slugs
-      2) expand a small number of updown-15m slugs via /markets?slug=... to get full fields
-    Then pick the soonest-ending valid market.
-    """
     data = await gamma_public_search(session, asset)
 
-    # candidates only from nested events[].markets (your logs show top_markets=0)
-    candidates = []
+    # public-search (your logs): top_markets=0, so take events[].markets slugs
+    slugs: List[str] = []
     for ev in (data.get("events") or []):
         for m in (ev.get("markets") or []):
             slug = (m.get("slug") or "").strip()
             if slug:
-                candidates.append(slug)
+                slugs.append(slug)
 
-    # filter to the 15m family
-    slugs = [s for s in candidates if is_candidate_slug(asset, s)]
+    slugs_15m = [s for s in slugs if is_candidate_slug(asset, s)]
 
     if DEBUG:
-        print(f"[RESOLVE] {asset}: events={len(data.get('events') or [])} market_slugs={len(candidates)} updown15m_slugs={len(slugs)}", flush=True)
-        if slugs[:5]:
-            print(f"  [SLUGS] {asset} sample={slugs[:5]}", flush=True)
+        print(f"[RESOLVE] {asset}: events={len(data.get('events') or [])} market_slugs={len(slugs)} updown15m_slugs={len(slugs_15m)}", flush=True)
+        if slugs_15m[:5]:
+            print(f"  [SLUGS] {asset} sample={slugs_15m[:5]}", flush=True)
 
-    if not slugs:
+    if not slugs_15m:
         return None
 
-    # Expand only the first N slugs (already sorted by endDate order in search, typically)
-    slugs = slugs[:MAX_SLUG_LOOKUPS]
+    slugs_15m = slugs_15m[:MAX_SLUG_LOOKUPS]
 
-    # Fetch full market details concurrently
-    tasks = [asyncio.create_task(gamma_market_by_slug(session, s)) for s in slugs]
-    full = await asyncio.gather(*tasks, return_exceptions=True)
+    tasks = [asyncio.create_task(gamma_market_by_slug(session, s)) for s in slugs_15m]
+    expanded = await asyncio.gather(*tasks, return_exceptions=True)
 
     now = now_utc()
     best: Optional[ResolvedMarket] = None
+    printed = 0
 
-    for idx, mk in enumerate(full):
+    for i, mk in enumerate(expanded):
         if isinstance(mk, Exception) or mk is None:
             continue
 
-        slug = (mk.get("slug") or slugs[idx]).strip()
-        question = (mk.get("question") or "").strip()
+        # Debug a few expanded payload summaries
+        if DEBUG and printed < DEBUG_EXPANSION_SAMPLES:
+            printed += 1
+            print(
+                f"  [EXPANDED] req_slug={slugs_15m[i]} got_slug={mk.get('slug')} "
+                f"closed={mk.get('closed')} enableOrderBook={mk.get('enableOrderBook')} "
+                f"endDate={mk.get('endDate')} clobTokenIds={mk.get('clobTokenIds')} conditionId={mk.get('conditionId')}",
+                flush=True,
+            )
 
-        # Must be open + orderbook enabled
+        # Must match the requested slug (avoid accidental mismatches)
+        got_slug = (mk.get("slug") or "").strip()
+        if got_slug.lower() != slugs_15m[i].lower():
+            continue
+
         if mk.get("closed", False):
             continue
         if not extract_enable_orderbook(mk):
@@ -394,12 +414,12 @@ async def gamma_resolve_current_15m(session: aiohttp.ClientSession, asset: str) 
 
         cand = ResolvedMarket(
             asset=asset.upper(),
-            slug=slug,
+            slug=got_slug,
             condition_id=condition_id,
             end_dt=end_dt,
             yes_token=yes_token,
             no_token=no_token,
-            question=question,
+            question=(mk.get("question") or "").strip(),
         )
 
         if best is None or cand.end_dt < best.end_dt:
@@ -440,13 +460,11 @@ async def run():
         while True:
             t0 = time.time()
 
-            # Heartbeat
             if t0 - last_heartbeat >= LOG_EVERY_SEC:
                 print(f"[HEARTBEAT] running. resolved={list(resolved.keys())}", flush=True)
                 last_heartbeat = t0
 
             for asset in assets:
-                # Resolve rotating market periodically
                 if (t0 - last_resolve.get(asset, 0.0)) >= RESOLVE_EVERY_SEC or asset not in resolved:
                     try:
                         m = await gamma_resolve_current_15m(session, asset)
@@ -467,19 +485,16 @@ async def run():
                 mkt = resolved[asset]
                 tte = seconds_to_end(mkt.end_dt)
 
-                # Stop opening new positions too close to end
                 if tte <= CLOSE_BEFORE_BOUNDARY_SEC:
                     if DEBUG:
                         print(f"[SKIP] {asset} too close to end tte={tte:.1f}s", flush=True)
                     continue
 
-                # Only trade within ARM window before end (set ARM huge to be always-on)
                 if tte > ARM_BEFORE_BOUNDARY_SEC:
                     if DEBUG:
                         print(f"[SKIP] {asset} not armed yet tte={tte:.1f}s (> ARM_BEFORE)", flush=True)
                     continue
 
-                # Throttles
                 if not rate_limit_ok(trades_ts):
                     continue
                 if (time.time() - last_trade) < COOLDOWN_SEC:
@@ -500,9 +515,7 @@ async def run():
                     if DEBUG:
                         print(f"[PRICES] {asset} ya={ya:.4f} na={na:.4f} yb={yb:.4f} nb={nb:.4f} buy_edge={buy_edge:.4f} sell_edge={sell_edge:.4f}", flush=True)
 
-                    # =======================
-                    # BUY BOTH (YES+NO < 1)
-                    # =======================
+                    # BUY BOTH
                     if buy_edge >= MIN_EDGE:
                         total_budget = clip(MAX_USDC * SIZE_MULT, MIN_USDC, MAX_USDC * SIZE_MULT)
                         leg_budget = total_budget / 2.0
@@ -529,10 +542,7 @@ async def run():
                         last_trade = time.time()
                         continue
 
-                    # =======================
-                    # SELL BOTH (YES+NO > 1)
-                    # Requires inventory in BOTH outcomes
-                    # =======================
+                    # SELL BOTH (requires inventory)
                     if sell_edge >= MIN_EDGE:
                         pos = await dataapi_positions(session, PM_FUNDER, mkt.condition_id)
                         up, down = parse_inventory_updown(pos)
@@ -571,7 +581,6 @@ async def run():
                     print(f"[ERR] {asset}: {e}", flush=True)
                     continue
 
-            # sleep
             elapsed = time.time() - t0
             await asyncio.sleep(max(0.0, POLL_SEC - elapsed))
 
