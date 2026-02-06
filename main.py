@@ -110,33 +110,39 @@ def asset_query_name(asset: str) -> str:
 def is_updown_15m_market(asset: str, slug: str, question: str) -> bool:
     """
     Robust match:
-    - must look like an up/down 15m market
-    - must correspond to the asset
-    We do NOT rely exclusively on strict prefix.
+    - Must look like the 15m Up/Down family
+    - Must correspond to the asset (by name or ticker)
     """
     s = (slug or "").lower()
     q = (question or "").lower()
 
-    # must be 15m updown style
-    if "updown-15m" not in s and "up or down" not in q:
+    looks_15m = ("updown-15m" in s) or (("up or down" in q) and ("15m" in q or "15 m" in q))
+    if not looks_15m:
         return False
 
-    a = asset.lower()
-    # asset present somewhere (slug or question)
-    if a in s or a in q:
-        return True
+    a = asset.upper()
+    if a == "ETH":
+        return ("ethereum" in q) or ("eth" in s) or ("ethereum" in s)
+    if a == "BTC":
+        return ("bitcoin" in q) or ("btc" in s) or ("bitcoin" in s)
+    if a == "SOL":
+        return ("solana" in q) or ("sol" in s) or ("solana" in s)
+    if a == "XRP":
+        return ("xrp" in q) or ("xrp" in s)
 
-    # special case: btc sometimes appears as "bitcoin"
-    if asset.upper() == "BTC" and ("bitcoin" in s or "bitcoin" in q):
-        return True
-
-    return False
+    return (a.lower() in q) or (a.lower() in s)
 
 
 # =========================
 # Polymarket API calls
 # =========================
 async def gamma_resolve_current(session: aiohttp.ClientSession, asset: str) -> Optional[ResolvedMarket]:
+    """
+    IMPORTANT: Gamma public-search can return matches in BOTH:
+      - data["markets"] (top-level)
+      - data["events"][..]["markets"] (nested)
+    We scan both.
+    """
     params = {
         "q": asset_query_name(asset),
         "events_status": "active",
@@ -151,53 +157,68 @@ async def gamma_resolve_current(session: aiohttp.ClientSession, asset: str) -> O
         r.raise_for_status()
         data = await r.json()
 
-    best: Optional[ResolvedMarket] = None
     now = now_utc()
+    best: Optional[ResolvedMarket] = None
 
-    events = data.get("events", []) or []
+    # Collect candidate markets from BOTH places
+    candidates = []
+    for m in (data.get("markets") or []):
+        candidates.append(m)
+    for ev in (data.get("events") or []):
+        for m in (ev.get("markets") or []):
+            candidates.append(m)
+
     if DEBUG:
-        print(f"[RESOLVE] {asset}: events={len(events)}", flush=True)
-
-    for ev in events:
-        for m in (ev.get("markets", []) or []):
-            if not m.get("enableOrderBook", False):
-                continue
-            if m.get("closed", False):
-                continue
-
-            slug = (m.get("slug") or "").strip()
-            question = (m.get("question") or "").strip()
-
-            if not is_updown_15m_market(asset, slug, question):
-                continue
-
-            end_str = (m.get("endDate") or "").strip()
-            if not end_str:
-                continue
-            end_dt = parse_iso(end_str)
-            if end_dt <= now:
-                continue
-
-            condition_id = (m.get("conditionId") or "").strip()
-            tokens = m.get("clobTokenIds")
-
-            if not condition_id or not condition_id.startswith("0x"):
-                continue
-            if not (isinstance(tokens, list) and len(tokens) == 2):
-                continue
-
-            cand = ResolvedMarket(
-                asset=asset.upper(),
-                slug=slug,
-                condition_id=condition_id,
-                end_dt=end_dt,
-                yes_token=str(tokens[0]).strip(),
-                no_token=str(tokens[1]).strip(),
-                question=question,
+        print(
+            f"[RESOLVE] {asset}: events={len(data.get('events') or [])} "
+            f"top_markets={len(data.get('markets') or [])} total_candidates={len(candidates)}",
+            flush=True,
+        )
+        for m in candidates[:5]:
+            print(
+                f"  [SAMPLE] slug={m.get('slug')} | q={m.get('question')} | end={m.get('endDate')} "
+                f"| OBook={m.get('enableOrderBook')} | closed={m.get('closed')}",
+                flush=True,
             )
 
-            if best is None or cand.end_dt < best.end_dt:
-                best = cand
+    for m in candidates:
+        if not m.get("enableOrderBook", False):
+            continue
+        if m.get("closed", False):
+            continue
+
+        slug = (m.get("slug") or "").strip()
+        question = (m.get("question") or "").strip()
+        if not is_updown_15m_market(asset, slug, question):
+            continue
+
+        end_str = (m.get("endDate") or "").strip()
+        if not end_str:
+            continue
+        end_dt = parse_iso(end_str)
+        if end_dt <= now:
+            continue
+
+        condition_id = (m.get("conditionId") or "").strip()
+        tokens = m.get("clobTokenIds")
+
+        if not condition_id or not condition_id.startswith("0x"):
+            continue
+        if not (isinstance(tokens, list) and len(tokens) == 2):
+            continue
+
+        cand = ResolvedMarket(
+            asset=asset.upper(),
+            slug=slug,
+            condition_id=condition_id,
+            end_dt=end_dt,
+            yes_token=str(tokens[0]).strip(),
+            no_token=str(tokens[1]).strip(),
+            question=question,
+        )
+
+        if best is None or cand.end_dt < best.end_dt:
+            best = cand
 
     return best
 
@@ -313,6 +334,7 @@ def place_fok(client: ClobClient, token_id: str, side: str, price: float, size: 
 # =========================
 async def run():
     assets = [a.strip().upper() for a in ASSETS.split(",") if a.strip()]
+
     print("=== UPDOWN ARB BOT START ===", flush=True)
     print(f"CLOB_HOST={CLOB_HOST} CHAIN_ID={CHAIN_ID} GAMMA_HOST={GAMMA_HOST} DATA_API_BASE={DATA_API_BASE}", flush=True)
     print(f"ASSETS={assets}", flush=True)
@@ -321,7 +343,7 @@ async def run():
     print(f"BOUNDARY: ARM_BEFORE={ARM_BEFORE_BOUNDARY_SEC} CLOSE_BEFORE={CLOSE_BEFORE_BOUNDARY_SEC} STOP_TRYING_BEFORE={STOP_TRYING_BEFORE_BOUNDARY_SEC}", flush=True)
 
     if not assets:
-        raise RuntimeError("ASSETS is empty")
+        raise RuntimeError("ASSETS is empty. Set ASSETS=ETH,BTC,SOL,XRP")
     if not PM_FUNDER or not PM_PRIVATE_KEY:
         raise RuntimeError("PM_FUNDER / PM_PRIVATE_KEY missing")
 
@@ -338,7 +360,7 @@ async def run():
             now = time.time()
 
             # Heartbeat
-            if now - last_heartbeat >= LOG_EVERY_SEC:
+            if now - last_heartbeat >= float(os.getenv("LOG_EVERY_SEC", "15")):
                 print(f"[HEARTBEAT] running. resolved={list(resolved.keys())}", flush=True)
                 last_heartbeat = now
 
@@ -370,8 +392,7 @@ async def run():
                         print(f"[SKIP] {asset} too close to end tte={tte:.1f}s", flush=True)
                     continue
 
-                # Optional "only trade near settlement" behavior:
-                # if you want always-on, set ARM_BEFORE_BOUNDARY_SEC to a huge number (default)
+                # Optional: only trade within ARM window before end
                 if tte > ARM_BEFORE_BOUNDARY_SEC:
                     if DEBUG:
                         print(f"[SKIP] {asset} not armed yet tte={tte:.1f}s (> ARM_BEFORE)", flush=True)
@@ -410,6 +431,9 @@ async def run():
                         n_sh = max_buy_shares(no_asks, n_cap, leg_budget)
                         sh = min(y_sh, n_sh)
 
+                        if sh <= 0:
+                            continue
+
                         if sh * (ya + na) < MIN_USDC:
                             continue
 
@@ -442,6 +466,9 @@ async def run():
                         y_ok = max_sell_shares(yes_bids, y_floor, desired)
                         n_ok = max_sell_shares(no_bids, n_floor, desired)
                         sh = min(y_ok, n_ok)
+
+                        if sh <= 0:
+                            continue
 
                         if sh * (yb + nb) < MIN_USDC:
                             continue
