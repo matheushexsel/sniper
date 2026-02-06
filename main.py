@@ -20,12 +20,12 @@ import logging
 import datetime as dt
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List
-
 import requests
+BUY = "BUY"
+SELL = "SELL"
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.constants import BUY, SELL
 from py_clob_client.exceptions import PolyApiException
 
 
