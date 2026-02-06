@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,7 +35,7 @@ SIZE_MULT = float(os.getenv("SIZE_MULT", "1.0"))
 MAX_TRADES_PER_MIN = int(os.getenv("MAX_TRADES_PER_MIN", "6"))
 COOLDOWN_SEC = float(os.getenv("COOLDOWN_SEC", "2.0"))
 
-ARM_BEFORE_BOUNDARY_SEC = float(os.getenv("ARM_BEFORE_BOUNDARY_SEC", "999999"))  # default: always armed
+ARM_BEFORE_BOUNDARY_SEC = float(os.getenv("ARM_BEFORE_BOUNDARY_SEC", "999999"))
 CLOSE_BEFORE_BOUNDARY_SEC = float(os.getenv("CLOSE_BEFORE_BOUNDARY_SEC", "90"))
 STOP_TRYING_BEFORE_BOUNDARY_SEC = float(os.getenv("STOP_TRYING_BEFORE_BOUNDARY_SEC", "30"))
 
@@ -56,7 +57,7 @@ DEBUG = os.getenv("DEBUG", "1").strip() == "1"
 # Resolver knobs
 MAX_SLUG_LOOKUPS = int(os.getenv("MAX_SLUG_LOOKUPS", "12"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
-DEBUG_EXPANSION_SAMPLES = int(os.getenv("DEBUG_EXPANSION_SAMPLES", "3"))  # how many expanded markets to print
+DEBUG_EXPANSION_SAMPLES = int(os.getenv("DEBUG_EXPANSION_SAMPLES", "3"))
 
 
 # =========================
@@ -167,11 +168,50 @@ def extract_condition_id(market_obj: dict) -> str:
     return ""
 
 
-def extract_clob_tokens(market_obj: dict) -> Optional[Tuple[str, str]]:
-    tokens = market_obj.get("clobTokenIds") or market_obj.get("clob_token_ids")
-    if isinstance(tokens, list) and len(tokens) == 2:
-        return str(tokens[0]).strip(), str(tokens[1]).strip()
+def _normalize_clob_token_ids(raw) -> Optional[List[str]]:
+    """
+    Gamma sometimes returns clobTokenIds as:
+      - list[str]
+      - list[int]
+      - string that contains a JSON list: '["123","456"]'
+    Normalize into List[str] of length 2.
+    """
+    if raw is None:
+        return None
+
+    # Case 1: already list
+    if isinstance(raw, list):
+        if len(raw) != 2:
+            return None
+        return [str(raw[0]).strip(), str(raw[1]).strip()]
+
+    # Case 2: string that is JSON
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        # Try JSON parse if it looks like a list
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list) and len(parsed) == 2:
+                    return [str(parsed[0]).strip(), str(parsed[1]).strip()]
+            except Exception:
+                return None
+        return None
+
     return None
+
+
+def extract_clob_tokens(market_obj: dict) -> Optional[Tuple[str, str]]:
+    raw = market_obj.get("clobTokenIds")
+    if raw is None:
+        raw = market_obj.get("clob_token_ids")
+
+    tokens = _normalize_clob_token_ids(raw)
+    if not tokens or len(tokens) != 2:
+        return None
+    return tokens[0], tokens[1]
 
 
 # =========================
@@ -184,31 +224,22 @@ async def http_get_json(session: aiohttp.ClientSession, url: str, params: Option
 
 
 async def gamma_public_search(session: aiohttp.ClientSession, asset: str) -> dict:
-    # Your logs show public-search returns incomplete market fields, but slugs are good.
     params = {
         "q": asset_query_name(asset),
         "events_status": "active",
         "limit_per_type": FETCH_LIMIT,
         "sort": "endDate",
         "ascending": "true",
-        # no optimized flag
     }
     return await http_get_json(session, f"{GAMMA_HOST}/public-search", params=params)
 
 
 async def gamma_market_by_slug(session: aiohttp.ClientSession, slug: str) -> Optional[dict]:
-    """
-    Use the dedicated endpoint first:
-      GET /markets/slug/{slug}
-    Fallback to:
-      GET /markets?slug=...
-    """
-    # 1) Dedicated endpoint
+    # Prefer dedicated endpoint
     try:
         data = await http_get_json(session, f"{GAMMA_HOST}/markets/slug/{slug}", params=None)
         if isinstance(data, dict) and (data.get("slug") or "").strip().lower() == slug.lower():
             return data
-        # some variants wrap it
         if isinstance(data, dict) and "market" in data and isinstance(data["market"], dict):
             mk = data["market"]
             if (mk.get("slug") or "").strip().lower() == slug.lower():
@@ -216,7 +247,7 @@ async def gamma_market_by_slug(session: aiohttp.ClientSession, slug: str) -> Opt
     except Exception:
         pass
 
-    # 2) Fallback query param
+    # Fallback
     try:
         data = await http_get_json(session, f"{GAMMA_HOST}/markets", params={"slug": slug})
         if isinstance(data, list) and data:
@@ -230,7 +261,6 @@ async def gamma_market_by_slug(session: aiohttp.ClientSession, slug: str) -> Opt
                 mk = mkts[0]
                 if isinstance(mk, dict) and (mk.get("slug") or "").strip().lower() == slug.lower():
                     return mk
-            # sometimes the market is directly returned
             if (data.get("slug") or "").strip().lower() == slug.lower():
                 return data
     except Exception:
@@ -343,12 +373,11 @@ def place_fok(client: ClobClient, token_id: str, side: str, price: float, size: 
 
 
 # =========================
-# Resolver (fixed)
+# Resolver
 # =========================
 async def gamma_resolve_current_15m(session: aiohttp.ClientSession, asset: str) -> Optional[ResolvedMarket]:
     data = await gamma_public_search(session, asset)
 
-    # public-search (your logs): top_markets=0, so take events[].markets slugs
     slugs: List[str] = []
     for ev in (data.get("events") or []):
         for m in (ev.get("markets") or []):
@@ -367,7 +396,6 @@ async def gamma_resolve_current_15m(session: aiohttp.ClientSession, asset: str) 
         return None
 
     slugs_15m = slugs_15m[:MAX_SLUG_LOOKUPS]
-
     tasks = [asyncio.create_task(gamma_market_by_slug(session, s)) for s in slugs_15m]
     expanded = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -379,20 +407,19 @@ async def gamma_resolve_current_15m(session: aiohttp.ClientSession, asset: str) 
         if isinstance(mk, Exception) or mk is None:
             continue
 
-        # Debug a few expanded payload summaries
+        got_slug = (mk.get("slug") or "").strip()
+        if got_slug.lower() != slugs_15m[i].lower():
+            continue
+
+        # Debug a few expanded summaries
         if DEBUG and printed < DEBUG_EXPANSION_SAMPLES:
             printed += 1
             print(
-                f"  [EXPANDED] req_slug={slugs_15m[i]} got_slug={mk.get('slug')} "
+                f"  [EXPANDED] req_slug={slugs_15m[i]} got_slug={got_slug} "
                 f"closed={mk.get('closed')} enableOrderBook={mk.get('enableOrderBook')} "
                 f"endDate={mk.get('endDate')} clobTokenIds={mk.get('clobTokenIds')} conditionId={mk.get('conditionId')}",
                 flush=True,
             )
-
-        # Must match the requested slug (avoid accidental mismatches)
-        got_slug = (mk.get("slug") or "").strip()
-        if got_slug.lower() != slugs_15m[i].lower():
-            continue
 
         if mk.get("closed", False):
             continue
@@ -409,7 +436,11 @@ async def gamma_resolve_current_15m(session: aiohttp.ClientSession, asset: str) 
 
         tokens = extract_clob_tokens(mk)
         if not tokens:
+            if DEBUG:
+                raw = mk.get("clobTokenIds")
+                print(f"  [SKIP] {asset} slug={got_slug} invalid clobTokenIds type={type(raw)} raw={raw}", flush=True)
             continue
+
         yes_token, no_token = tokens
 
         cand = ResolvedMarket(
@@ -542,7 +573,7 @@ async def run():
                         last_trade = time.time()
                         continue
 
-                    # SELL BOTH (requires inventory)
+                    # SELL BOTH
                     if sell_edge >= MIN_EDGE:
                         pos = await dataapi_positions(session, PM_FUNDER, mkt.condition_id)
                         up, down = parse_inventory_updown(pos)
