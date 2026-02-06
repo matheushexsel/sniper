@@ -1,620 +1,724 @@
+# main.py
 import os
 import time
 import json
-import asyncio
-from dataclasses import dataclass
+import math
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
-import aiohttp
-from dotenv import load_dotenv
+import requests
 
+# Polymarket CLOB client (pip: py-clob-client)
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.clob_types import OrderArgs, ApiCreds
+from py_clob_client.constants import POLYGON
 
-load_dotenv()
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("updown15m-ladder")
 
-# =========================
-# ENV (reusing your names)
-# =========================
-PM_FUNDER = os.getenv("PM_FUNDER", "").strip()
-PM_PRIVATE_KEY = os.getenv("PM_PRIVATE_KEY", "").strip()
+# -----------------------------
+# Env helpers
+# -----------------------------
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return default
+    return float(v)
 
-CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").strip()
-CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))
-PM_SIGNATURE_TYPE = int(os.getenv("PM_SIGNATURE_TYPE", "0"))
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return default
+    return int(float(v))
 
-POLL_SEC = float(os.getenv("POLL_SEC", "0.50"))
-FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "50"))
+def env_list(name: str, default: List[str]) -> List[str]:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return default
+    # supports JSON list or comma-separated
+    if v.startswith("["):
+        return [str(x).strip() for x in json.loads(v)]
+    return [x.strip() for x in v.split(",") if x.strip()]
 
-MIN_USDC = float(os.getenv("MIN_USDC", "5"))
-MAX_USDC = float(os.getenv("MAX_USDC", "50"))
-SIZE_MULT = float(os.getenv("SIZE_MULT", "1.0"))
-
-MAX_TRADES_PER_MIN = int(os.getenv("MAX_TRADES_PER_MIN", "6"))
-COOLDOWN_SEC = float(os.getenv("COOLDOWN_SEC", "2.0"))
-
-ARM_BEFORE_BOUNDARY_SEC = float(os.getenv("ARM_BEFORE_BOUNDARY_SEC", "999999"))
-CLOSE_BEFORE_BOUNDARY_SEC = float(os.getenv("CLOSE_BEFORE_BOUNDARY_SEC", "90"))
-STOP_TRYING_BEFORE_BOUNDARY_SEC = float(os.getenv("STOP_TRYING_BEFORE_BOUNDARY_SEC", "30"))
-
-# =========================
-# New env vars
-# =========================
-GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
-DATA_API_BASE = os.getenv("DATA_API_BASE", "https://data-api.polymarket.com").strip()
-
-ASSETS = os.getenv("ASSETS", "ETH,BTC,SOL,XRP").strip()
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.02"))
-MAX_SLIPPAGE = float(os.getenv("MAX_SLIPPAGE", "0.02"))
-RESOLVE_EVERY_SEC = float(os.getenv("RESOLVE_EVERY_SEC", "10"))
-
-# Debug knobs
-LOG_EVERY_SEC = float(os.getenv("LOG_EVERY_SEC", "15"))
-DEBUG = os.getenv("DEBUG", "1").strip() == "1"
-
-# Resolver knobs
-MAX_SLUG_LOOKUPS = int(os.getenv("MAX_SLUG_LOOKUPS", "12"))
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
-DEBUG_EXPANSION_SAMPLES = int(os.getenv("DEBUG_EXPANSION_SAMPLES", "3"))
-
-
-# =========================
-# Models
-# =========================
-@dataclass
-class Level:
-    price: float
-    size: float
-
-
-@dataclass
-class ResolvedMarket:
-    asset: str
-    slug: str
-    condition_id: str
-    end_dt: datetime
-    yes_token: str
-    no_token: str
-    question: str
-
-
-# =========================
-# Time helpers
-# =========================
-def now_utc() -> datetime:
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
+def parse_iso_z(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    # ISO like 2026-02-06T20:00:00Z
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
+        return None
 
-def parse_iso(dt_str: str) -> datetime:
-    return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+# -----------------------------
+# Strategy params (Railway env vars)
+# -----------------------------
+CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
+GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com").rstrip("/")
+CHAIN_ID = env_int("CHAIN_ID", 137)
 
+ASSETS = [a.upper() for a in env_list("ASSETS", ["ETH", "BTC", "SOL", "XRP"])]
 
-def seconds_to_end(end_dt: datetime) -> float:
-    return (end_dt - now_utc()).total_seconds()
+# Trading cadence
+POLL_SEC = env_float("POLL_SEC", 2.0)
+RESOLVE_EVERY_SEC = env_float("RESOLVE_EVERY_SEC", 15.0)
 
+# Window / ladder timing (seconds)
+WINDOW_SEC = env_int("WINDOW_SEC", 900)          # 15m
+EVAL_INTERVAL_SEC = env_int("EVAL_INTERVAL_SEC", 120)  # every 2m
+EVAL_COUNT = env_int("EVAL_COUNT", 6)            # 6 adds => 12 minutes
+EXIT_AT_SEC = env_int("EXIT_AT_SEC", 780)        # 13 minutes
+CLOSE_HARD_SEC = env_int("CLOSE_HARD_SEC", 60)   # if <=60s to end, exit now
 
-def clip(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+# Notional sizing
+BASE_USDC = env_float("BASE_USDC", 1.0)          # buy both sides at start
+STEP_USDC = env_float("STEP_USDC", 1.0)          # add to winner each eval
 
+# Execution constraints
+MAX_SLIPPAGE = env_float("MAX_SLIPPAGE", 0.02)   # 2%
+FILL_TIMEOUT_SEC = env_float("FILL_TIMEOUT_SEC", 2.0)
+MAX_RETRIES = env_int("MAX_RETRIES", 3)
 
-# =========================
-# Rate limit helper
-# =========================
-def rate_limit_ok(trades_ts: List[float]) -> bool:
-    cutoff = time.time() - 60.0
-    while trades_ts and trades_ts[0] < cutoff:
-        trades_ts.pop(0)
-    return len(trades_ts) < MAX_TRADES_PER_MIN
+# Rate limiting
+MAX_TRADES_PER_MIN = env_int("MAX_TRADES_PER_MIN", 20)
+COOLDOWN_SEC = env_float("COOLDOWN_SEC", 0.25)
 
+# Market selection
+MAX_SLUG_LOOKUPS = env_int("MAX_SLUG_LOOKUPS", 20)
+MAX_TTE_SELECT_SEC = env_int("MAX_TTE_SELECT_SEC", 1200)  # only consider markets ending within 20m
+MIN_TTE_SELECT_SEC = env_int("MIN_TTE_SELECT_SEC", 15)    # ignore already ending (too close)
 
-# =========================
-# Asset naming / matching
-# =========================
-def asset_query_name(asset: str) -> str:
-    mapping = {
-        "ETH": "Ethereum Up or Down",
-        "BTC": "Bitcoin Up or Down",
-        "SOL": "Solana Up or Down",
-        "XRP": "XRP Up or Down",
-    }
-    return mapping.get(asset.upper(), f"{asset.upper()} Up or Down")
+# Polymarket creds
+# NOTE: user said they already have working variables from other bot.
+# We accept common names + fallback.
+PM_PRIVATE_KEY = os.getenv("PM_PRIVATE_KEY") or os.getenv("PRIVATE_KEY")
+PM_API_KEY = os.getenv("PM_API_KEY")  # optional if you already have API creds
+PM_API_SECRET = os.getenv("PM_API_SECRET")  # optional
+PM_API_PASSPHRASE = os.getenv("PM_API_PASSPHRASE")  # optional
+PM_FUNDER = os.getenv("PM_FUNDER") or os.getenv("PM_FOUNDER")  # accept typo variant
 
+if not PM_PRIVATE_KEY:
+    raise SystemExit("Missing PM_PRIVATE_KEY (or PRIVATE_KEY) in Railway env vars")
 
-def is_candidate_slug(asset: str, slug: str) -> bool:
-    s = (slug or "").lower()
-    if "updown-15m" not in s:
+# -----------------------------
+# Asset -> slug prefix mapping (15m products)
+# -----------------------------
+SLUG_PREFIX = {
+    "ETH": "eth-updown-15m-",
+    "BTC": "btc-updown-15m-",
+    "SOL": "sol-updown-15m-",
+    "XRP": "xrp-updown-15m-",
+}
+
+# -----------------------------
+# Simple trade limiter
+# -----------------------------
+class TradeLimiter:
+    def __init__(self):
+        self.window_start = time.time()
+        self.count = 0
+
+    def allow(self) -> bool:
+        now = time.time()
+        if now - self.window_start >= 60:
+            self.window_start = now
+            self.count = 0
+        if self.count >= MAX_TRADES_PER_MIN:
+            return False
+        self.count += 1
+        return True
+
+trade_limiter = TradeLimiter()
+last_trade_ts = 0.0
+
+def cooldown_ok() -> bool:
+    global last_trade_ts
+    now = time.time()
+    if now - last_trade_ts < COOLDOWN_SEC:
         return False
-
-    a = asset.upper()
-    if a == "BTC":
-        return s.startswith("btc-updown-15m-") or s.startswith("bitcoin-updown-15m-")
-    if a == "ETH":
-        return s.startswith("eth-updown-15m-") or s.startswith("ethereum-updown-15m-")
-    if a == "SOL":
-        return s.startswith("sol-updown-15m-") or s.startswith("solana-updown-15m-")
-    if a == "XRP":
-        return s.startswith("xrp-updown-15m-")
+    last_trade_ts = now
     return True
 
+# -----------------------------
+# Gamma API wrappers
+# -----------------------------
+session = requests.Session()
+session.headers.update({"User-Agent": "updown15m-ladder-bot/1.0"})
 
-def extract_end_dt(market_obj: dict) -> Optional[datetime]:
-    for k in ("endDate", "end_date", "endDateIso", "end_date_iso"):
-        v = market_obj.get(k)
-        if isinstance(v, str) and v.strip():
-            try:
-                return parse_iso(v.strip())
-            except Exception:
-                pass
+def gamma_get(path: str, params: Optional[dict] = None) -> Optional[dict]:
+    url = f"{GAMMA_HOST}{path}"
+    try:
+        r = session.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            log.warning(f"[GAMMA] {r.status_code} {url} {r.text[:200]}")
+            return None
+        return r.json()
+    except Exception as e:
+        log.warning(f"[GAMMA] error {url}: {e}")
+        return None
+
+def gamma_search_events(asset: str, limit: int = 50) -> List[dict]:
+    # Gamma API shape varies; we try a couple patterns.
+    # 1) /events?limit=...&offset=...&search=...
+    data = gamma_get("/events", params={"limit": limit, "offset": 0, "search": asset})
+    if isinstance(data, dict) and "events" in data and isinstance(data["events"], list):
+        return data["events"]
+    if isinstance(data, list):
+        return data
+    # 2) /events?limit=...&q=...
+    data = gamma_get("/events", params={"limit": limit, "offset": 0, "q": asset})
+    if isinstance(data, dict) and "events" in data and isinstance(data["events"], list):
+        return data["events"]
+    if isinstance(data, list):
+        return data
+    return []
+
+def gamma_get_event_by_slug(slug: str) -> Optional[dict]:
+    # Common: /events/{slug}
+    data = gamma_get(f"/events/{slug}")
+    if isinstance(data, dict) and data.get("slug"):
+        return data
+    # Fallback: /events?slug=...
+    data = gamma_get("/events", params={"slug": slug, "limit": 1, "offset": 0})
+    if isinstance(data, dict) and "events" in data and data["events"]:
+        return data["events"][0]
+    if isinstance(data, list) and data:
+        return data[0]
     return None
 
+# -----------------------------
+# CLOB helpers
+# -----------------------------
+def init_clob_client() -> ClobClient:
+    # If you already have API creds, pass them; otherwise client can derive creds in some setups.
+    # We support both modes.
+    if PM_API_KEY and PM_API_SECRET and PM_API_PASSPHRASE:
+        creds = ApiCreds(PM_API_KEY, PM_API_SECRET, PM_API_PASSPHRASE)
+        client = ClobClient(
+            host=CLOB_HOST,
+            chain_id=CHAIN_ID,
+            private_key=PM_PRIVATE_KEY,
+            api_creds=creds,
+            funder=PM_FUNDER,
+        )
+    else:
+        client = ClobClient(
+            host=CLOB_HOST,
+            chain_id=CHAIN_ID,
+            private_key=PM_PRIVATE_KEY,
+            funder=PM_FUNDER,
+        )
+    return client
 
-def extract_enable_orderbook(market_obj: dict) -> bool:
-    v = market_obj.get("enableOrderBook")
-    if isinstance(v, bool):
-        return v
-    v2 = market_obj.get("enable_order_book")
-    if isinstance(v2, bool):
-        return v2
+clob = init_clob_client()
+
+def best_bid_ask(token_id: str) -> Optional[Tuple[float, float]]:
+    """
+    Returns (best_bid, best_ask) for the token_id.
+    """
+    try:
+        ob = clob.get_order_book(token_id)
+        bids = ob.get("bids", []) or []
+        asks = ob.get("asks", []) or []
+        if not bids or not asks:
+            return None
+        best_bid = float(bids[0]["price"])
+        best_ask = float(asks[0]["price"])
+        return best_bid, best_ask
+    except Exception as e:
+        log.warning(f"[OBOOK] token={token_id} error: {e}")
+        return None
+
+def estimate_vwap_buy(token_id: str, qty: float) -> Optional[float]:
+    """
+    Simulate taking asks until qty filled and return vwap price.
+    """
+    try:
+        ob = clob.get_order_book(token_id)
+        asks = ob.get("asks", []) or []
+        if not asks:
+            return None
+        remaining = qty
+        cost = 0.0
+        filled = 0.0
+        for lvl in asks:
+            p = float(lvl["price"])
+            s = float(lvl["size"])
+            take = min(remaining, s)
+            cost += take * p
+            filled += take
+            remaining -= take
+            if remaining <= 1e-12:
+                break
+        if filled <= 0 or remaining > 1e-9:
+            return None
+        return cost / filled
+    except Exception:
+        return None
+
+def estimate_vwap_sell(token_id: str, qty: float) -> Optional[float]:
+    """
+    Simulate hitting bids until qty filled and return vwap price.
+    """
+    try:
+        ob = clob.get_order_book(token_id)
+        bids = ob.get("bids", []) or []
+        if not bids:
+            return None
+        remaining = qty
+        proceeds = 0.0
+        filled = 0.0
+        for lvl in bids:
+            p = float(lvl["price"])
+            s = float(lvl["size"])
+            take = min(remaining, s)
+            proceeds += take * p
+            filled += take
+            remaining -= take
+            if remaining <= 1e-12:
+                break
+        if filled <= 0 or remaining > 1e-9:
+            return None
+        return proceeds / filled
+    except Exception:
+        return None
+
+def place_limit_order(token_id: str, side: str, qty: float, price: float) -> Optional[str]:
+    """
+    side: 'BUY' or 'SELL'
+    returns order_id if posted
+    """
+    try:
+        if not trade_limiter.allow() or not cooldown_ok():
+            return None
+        args = OrderArgs(
+            token_id=token_id,
+            price=round(float(price), 4),
+            size=round(float(qty), 8),
+            side=side,
+        )
+        signed = clob.create_order(args)
+        resp = clob.post_order(signed)
+        # Response shapes vary; attempt common fields:
+        oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+        return oid
+    except Exception as e:
+        log.warning(f"[ORDER] {side} token={token_id} qty={qty} price={price} error: {e}")
+        return None
+
+def get_order_status(order_id: str) -> Optional[dict]:
+    try:
+        return clob.get_order(order_id)
+    except Exception:
+        return None
+
+def cancel_order(order_id: str) -> bool:
+    try:
+        clob.cancel_order(order_id)
+        return True
+    except Exception:
+        return False
+
+def wait_fill_or_cancel(order_id: str, timeout_sec: float) -> bool:
+    """
+    Returns True if fully/partially filled (any fill), else cancels and returns False.
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout_sec:
+        st = get_order_status(order_id)
+        if not st:
+            time.sleep(0.2)
+            continue
+        filled = float(st.get("sizeMatched") or st.get("filledSize") or 0.0)
+        if filled > 0:
+            return True
+        if st.get("status") in ("CANCELED", "CANCELLED", "FILLED"):
+            return st.get("status") == "FILLED"
+        time.sleep(0.2)
+    cancel_order(order_id)
     return False
 
+# -----------------------------
+# Strategy state
+# -----------------------------
+@dataclass
+class MarketState:
+    asset: str
+    slug: str
+    t_start: datetime
+    t_end: datetime
+    up_token: str
+    down_token: str
 
-def extract_condition_id(market_obj: dict) -> str:
-    for k in ("conditionId", "condition_id"):
-        v = market_obj.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
+    base_done: bool = False
+    eval_index: int = 0  # 0..EVAL_COUNT
+    adds_done: int = 0
+    exit_done: bool = False
 
+    pos_up_qty: float = 0.0
+    pos_down_qty: float = 0.0
 
-def _normalize_clob_token_ids(raw) -> Optional[List[str]]:
+    last_ask_up: Optional[float] = None
+    last_ask_down: Optional[float] = None
+
+    def elapsed_sec(self) -> float:
+        return (utc_now() - self.t_start).total_seconds()
+
+    def tte_sec(self) -> float:
+        return (self.t_end - utc_now()).total_seconds()
+
+states: Dict[str, MarketState] = {}  # asset -> state
+last_resolve_ts = 0.0
+
+# -----------------------------
+# Market selection logic (airtight)
+# -----------------------------
+def resolve_current_15m_market(asset: str) -> Optional[Tuple[str, datetime, datetime, str, str]]:
     """
-    Gamma sometimes returns clobTokenIds as:
-      - list[str]
-      - list[int]
-      - string that contains a JSON list: '["123","456"]'
-    Normalize into List[str] of length 2.
+    Returns (slug, t_start, t_end, up_token_id, down_token_id) for the best 15m market:
+    - slug must contain prefix
+    - enableOrderBook True, not closed
+    - choose smallest positive TTE within [MIN_TTE_SELECT_SEC, MAX_TTE_SELECT_SEC]
     """
-    if raw is None:
+    prefix = SLUG_PREFIX.get(asset)
+    if not prefix:
         return None
 
-    # Case 1: already list
-    if isinstance(raw, list):
-        if len(raw) != 2:
-            return None
-        return [str(raw[0]).strip(), str(raw[1]).strip()]
+    events = gamma_search_events(asset, limit=50)
+    slugs = []
+    for ev in events:
+        s = (ev.get("slug") or "").strip()
+        if s.startswith(prefix):
+            slugs.append(s)
 
-    # Case 2: string that is JSON
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-        # Try JSON parse if it looks like a list
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list) and len(parsed) == 2:
-                    return [str(parsed[0]).strip(), str(parsed[1]).strip()]
-            except Exception:
-                return None
+    slugs = slugs[:MAX_SLUG_LOOKUPS]
+    if not slugs:
+        log.info(f"[RESOLVE] {asset}: no 15m slugs in search results")
         return None
 
-    return None
+    best = None  # (tte, expanded_event)
+    for slug in slugs:
+        ev = gamma_get_event_by_slug(slug)
+        if not ev:
+            continue
 
+        closed = bool(ev.get("closed", False))
+        enable_ob = bool(ev.get("enableOrderBook", False))
+        end_dt = parse_iso_z(ev.get("endDate") or "")
+        if closed or not enable_ob or not end_dt:
+            continue
 
-def extract_clob_tokens(market_obj: dict) -> Optional[Tuple[str, str]]:
-    raw = market_obj.get("clobTokenIds")
-    if raw is None:
-        raw = market_obj.get("clob_token_ids")
+        tte = (end_dt - utc_now()).total_seconds()
+        # pick only the "current / next" windows (not hours away)
+        if tte < MIN_TTE_SELECT_SEC:
+            continue
+        if tte > MAX_TTE_SELECT_SEC:
+            continue
 
-    tokens = _normalize_clob_token_ids(raw)
-    if not tokens or len(tokens) != 2:
+        clob_ids = ev.get("clobTokenIds") or []
+        if not isinstance(clob_ids, list) or len(clob_ids) < 2:
+            continue
+
+        if best is None or tte < best[0]:
+            best = (tte, ev)
+
+    if not best:
+        # Helpful debug: show the top few endDates we saw
+        log.info(f"[RESOLVE] {asset}: found slugs but none within TTE bounds (<= {MAX_TTE_SELECT_SEC}s)")
         return None
-    return tokens[0], tokens[1]
 
+    chosen = best[1]
+    slug = chosen["slug"]
+    t_end = parse_iso_z(chosen.get("endDate"))
+    t_start = t_end - timedelta_seconds(WINDOW_SEC)
+    # IMPORTANT: token ordering — for up/down markets, token[0]=YES(up) token[1]=NO(down) typically.
+    # We treat [0]=UP and [1]=DOWN, consistent with your prior logs usage.
+    up_token = str(chosen["clobTokenIds"][0])
+    down_token = str(chosen["clobTokenIds"][1])
 
-# =========================
-# HTTP calls
-# =========================
-async def http_get_json(session: aiohttp.ClientSession, url: str, params: Optional[dict] = None) -> dict:
-    async with session.get(url, params=params, timeout=HTTP_TIMEOUT) as r:
-        r.raise_for_status()
-        return await r.json()
+    return slug, t_start, t_end, up_token, down_token
 
+def timedelta_seconds(sec: int):
+    # tiny helper so we don't import timedelta separately
+    from datetime import timedelta
+    return timedelta(seconds=sec)
 
-async def gamma_public_search(session: aiohttp.ClientSession, asset: str) -> dict:
-    params = {
-        "q": asset_query_name(asset),
-        "events_status": "active",
-        "limit_per_type": FETCH_LIMIT,
-        "sort": "endDate",
-        "ascending": "true",
-    }
-    return await http_get_json(session, f"{GAMMA_HOST}/public-search", params=params)
+# -----------------------------
+# Winner selection rule (deterministic)
+# -----------------------------
+def choose_winner(ask_up_now: float, ask_down_now: float, last_up: float, last_down: float) -> str:
+    d_up = ask_up_now - last_up
+    d_down = ask_down_now - last_down
 
+    if d_up > d_down:
+        return "UP"
+    if d_down > d_up:
+        return "DOWN"
 
-async def gamma_market_by_slug(session: aiohttp.ClientSession, slug: str) -> Optional[dict]:
-    # Prefer dedicated endpoint
-    try:
-        data = await http_get_json(session, f"{GAMMA_HOST}/markets/slug/{slug}", params=None)
-        if isinstance(data, dict) and (data.get("slug") or "").strip().lower() == slug.lower():
-            return data
-        if isinstance(data, dict) and "market" in data and isinstance(data["market"], dict):
-            mk = data["market"]
-            if (mk.get("slug") or "").strip().lower() == slug.lower():
-                return mk
-    except Exception:
-        pass
+    # tie-breaker 1: higher current ask (more expensive)
+    if ask_up_now > ask_down_now:
+        return "UP"
+    if ask_down_now > ask_up_now:
+        return "DOWN"
 
-    # Fallback
-    try:
-        data = await http_get_json(session, f"{GAMMA_HOST}/markets", params={"slug": slug})
-        if isinstance(data, list) and data:
-            mk = data[0]
-            if isinstance(mk, dict) and (mk.get("slug") or "").strip().lower() == slug.lower():
-                return mk
-            return None
-        if isinstance(data, dict):
-            mkts = data.get("markets")
-            if isinstance(mkts, list) and mkts:
-                mk = mkts[0]
-                if isinstance(mk, dict) and (mk.get("slug") or "").strip().lower() == slug.lower():
-                    return mk
-            if (data.get("slug") or "").strip().lower() == slug.lower():
-                return data
-    except Exception:
-        pass
+    # tie-breaker 2: deterministic default
+    return "UP"
 
-    return None
+# -----------------------------
+# Trade helpers for this strategy
+# -----------------------------
+def buy_notional(token_id: str, usdc_notional: float) -> float:
+    """
+    Attempt to buy approx usdc_notional using best ask with slippage guard.
+    Returns filled qty (best-effort, may be 0).
+    """
+    ba = best_bid_ask(token_id)
+    if not ba:
+        return 0.0
+    _, ask = ba
+    qty = usdc_notional / ask
 
+    # Slippage check via VWAP sim
+    vwap = estimate_vwap_buy(token_id, qty)
+    if vwap is None:
+        log.info(f"[LIQ] buy token={token_id} qty={qty:.6f} no depth")
+        return 0.0
+    if vwap > ask * (1.0 + MAX_SLIPPAGE):
+        log.info(f"[LIQ] buy token={token_id} vwap={vwap:.4f} > max={ask*(1+MAX_SLIPPAGE):.4f}")
+        return 0.0
 
-async def clob_fetch_book(session: aiohttp.ClientSession, token_id: str) -> Tuple[List[Level], List[Level]]:
-    data = await http_get_json(session, f"{CLOB_HOST}/book", params={"token_id": token_id})
-    bids = sorted([Level(float(x["price"]), float(x["size"])) for x in data.get("bids", [])], key=lambda x: x.price, reverse=True)
-    asks = sorted([Level(float(x["price"]), float(x["size"])) for x in data.get("asks", [])], key=lambda x: x.price)
-    return bids, asks
-
-
-async def dataapi_positions(session: aiohttp.ClientSession, user: str, condition_id: str) -> List[dict]:
-    params = {"user": user, "market": condition_id, "sizeThreshold": 0}
-    data = await http_get_json(session, f"{DATA_API_BASE}/positions", params=params)
-    return data if isinstance(data, list) else []
-
-
-# =========================
-# Inventory parsing
-# =========================
-def parse_inventory_updown(positions: List[dict]) -> Tuple[float, float]:
-    up = 0.0
-    down = 0.0
-    for p in positions or []:
-        outcome = (p.get("outcome") or "").strip().lower()
-        size = float(p.get("size", 0) or 0)
-        if size <= 0:
+    # Place limit at ask
+    for i in range(MAX_RETRIES):
+        oid = place_limit_order(token_id, "BUY", qty, ask)
+        if not oid:
+            time.sleep(0.2)
             continue
-        if outcome == "up":
-            up += size
-        elif outcome == "down":
-            down += size
-    return up, down
+        ok = wait_fill_or_cancel(oid, FILL_TIMEOUT_SEC)
+        if ok:
+            # best-effort: we don't have exact filled qty reliably across response shapes,
+            # but order status usually provides it.
+            st = get_order_status(oid) or {}
+            filled = float(st.get("sizeMatched") or st.get("filledSize") or 0.0)
+            return max(0.0, filled)
+        time.sleep(0.2)
 
+    return 0.0
 
-# =========================
-# Strategy math
-# =========================
-def tob(bids: List[Level], asks: List[Level]) -> Tuple[Optional[float], Optional[float]]:
-    bid = bids[0].price if bids else None
-    ask = asks[0].price if asks else None
-    return bid, ask
+def sell_qty(token_id: str, qty: float) -> float:
+    """
+    Attempt to sell qty using best bid with slippage guard.
+    Returns filled qty (best-effort).
+    """
+    if qty <= 0:
+        return 0.0
 
+    ba = best_bid_ask(token_id)
+    if not ba:
+        return 0.0
+    bid, _ = ba
 
-def max_buy_shares(asks: List[Level], price_cap: float, budget: float) -> float:
-    shares = 0.0
-    spent = 0.0
-    for lvl in asks:
-        if lvl.price > price_cap:
-            break
-        if lvl.size <= 0:
+    vwap = estimate_vwap_sell(token_id, qty)
+    if vwap is None:
+        log.info(f"[LIQ] sell token={token_id} qty={qty:.6f} no depth")
+        return 0.0
+    if vwap < bid * (1.0 - MAX_SLIPPAGE):
+        log.info(f"[LIQ] sell token={token_id} vwap={vwap:.4f} < min={bid*(1-MAX_SLIPPAGE):.4f}")
+        return 0.0
+
+    for i in range(MAX_RETRIES):
+        oid = place_limit_order(token_id, "SELL", qty, bid)
+        if not oid:
+            time.sleep(0.2)
             continue
-        rem = budget - spent
-        if rem <= 0:
-            break
-        take = min(lvl.size, rem / lvl.price)
-        if take <= 0:
-            break
-        shares += take
-        spent += take * lvl.price
-    return shares
+        ok = wait_fill_or_cancel(oid, FILL_TIMEOUT_SEC)
+        st = get_order_status(oid) or {}
+        filled = float(st.get("sizeMatched") or st.get("filledSize") or 0.0)
+        if filled > 0:
+            return filled
+        time.sleep(0.2)
 
+    return 0.0
 
-def max_sell_shares(bids: List[Level], price_floor: float, cap_shares: float) -> float:
-    shares = 0.0
-    for lvl in bids:
-        if lvl.price < price_floor:
-            break
-        if lvl.size <= 0:
-            continue
-        take = min(lvl.size, cap_shares - shares)
-        if take <= 0:
-            break
-        shares += take
-        if shares >= cap_shares:
-            break
-    return shares
+# -----------------------------
+# Main loop
+# -----------------------------
+def print_boot():
+    log.info("=== UPDOWN 15M LADDER BOT START ===")
+    log.info(f"CLOB_HOST={CLOB_HOST} CHAIN_ID={CHAIN_ID} GAMMA_HOST={GAMMA_HOST}")
+    log.info(f"ASSETS={ASSETS}")
+    log.info(f"WINDOW_SEC={WINDOW_SEC} EVAL_INTERVAL_SEC={EVAL_INTERVAL_SEC} EVAL_COUNT={EVAL_COUNT} EXIT_AT_SEC={EXIT_AT_SEC}")
+    log.info(f"BASE_USDC={BASE_USDC} STEP_USDC={STEP_USDC} MAX_SLIPPAGE={MAX_SLIPPAGE}")
+    log.info(f"RESOLVE_EVERY_SEC={RESOLVE_EVERY_SEC} POLL_SEC={POLL_SEC}")
+    log.info(f"SELECT_TTE: MIN={MIN_TTE_SELECT_SEC}s MAX={MAX_TTE_SELECT_SEC}s MAX_SLUG_LOOKUPS={MAX_SLUG_LOOKUPS}")
 
+def ensure_market(asset: str):
+    global last_resolve_ts
+    now = time.time()
+    if now - last_resolve_ts < RESOLVE_EVERY_SEC:
+        return
+    last_resolve_ts = now
 
-# =========================
-# Trading client
-# =========================
-def make_client() -> ClobClient:
-    if not PM_FUNDER or not PM_PRIVATE_KEY:
-        raise RuntimeError("Missing PM_FUNDER or PM_PRIVATE_KEY.")
-    c = ClobClient(
-        CLOB_HOST,
-        key=PM_PRIVATE_KEY,
-        chain_id=CHAIN_ID,
-        signature_type=PM_SIGNATURE_TYPE,
-        funder=PM_FUNDER,
+    resolved = resolve_current_15m_market(asset)
+    if not resolved:
+        log.info(f"[MARKET] {asset}: no eligible 15m market in TTE bounds")
+        return
+
+    slug, t_start, t_end, up_token, down_token = resolved
+
+    st = states.get(asset)
+    if st and st.slug == slug:
+        return
+
+    states[asset] = MarketState(
+        asset=asset,
+        slug=slug,
+        t_start=t_start,
+        t_end=t_end,
+        up_token=up_token,
+        down_token=down_token,
     )
-    c.set_api_creds(c.create_or_derive_api_creds())
-    return c
+    tte = (t_end - utc_now()).total_seconds()
+    log.info(f"[MARKET] {asset}: selected slug={slug} tte={tte:.1f}s start={t_start.isoformat()} end={t_end.isoformat()}")
 
+def tick_asset(asset: str):
+    st = states.get(asset)
+    if not st:
+        return
 
-def place_fok(client: ClobClient, token_id: str, side: str, price: float, size: float) -> dict:
-    args = OrderArgs(
-        token_id=token_id,
-        price=round(price, 4),
-        size=round(size, 4),
-        side=side,
-    )
-    signed = client.create_order(args)
-    return client.post_order(signed, OrderType.FOK)
+    tte = st.tte_sec()
+    T = st.elapsed_sec()
 
+    # Hard exit if close to end
+    if not st.exit_done and tte <= CLOSE_HARD_SEC:
+        log.info(f"[EXIT-HARD] {asset} slug={st.slug} tte={tte:.1f}s -> exiting")
+        do_exit(st)
+        return
 
-# =========================
-# Resolver
-# =========================
-async def gamma_resolve_current_15m(session: aiohttp.ClientSession, asset: str) -> Optional[ResolvedMarket]:
-    data = await gamma_public_search(session, asset)
+    # Base entry (first minute only)
+    if not st.base_done and 0 <= T < 60 and tte > 120:
+        # Need fresh prices
+        up_ba = best_bid_ask(st.up_token)
+        dn_ba = best_bid_ask(st.down_token)
+        if not up_ba or not dn_ba:
+            return
+        _, ask_up = up_ba
+        _, ask_dn = dn_ba
 
-    slugs: List[str] = []
-    for ev in (data.get("events") or []):
-        for m in (ev.get("markets") or []):
-            slug = (m.get("slug") or "").strip()
-            if slug:
-                slugs.append(slug)
+        qty_up = buy_notional(st.up_token, BASE_USDC)
+        qty_dn = buy_notional(st.down_token, BASE_USDC)
+        st.pos_up_qty += qty_up
+        st.pos_down_qty += qty_dn
+        st.last_ask_up = ask_up
+        st.last_ask_down = ask_dn
+        st.base_done = True
 
-    slugs_15m = [s for s in slugs if is_candidate_slug(asset, s)]
+        log.info(
+            f"[BASE] {asset} slug={st.slug} "
+            f"buy_up=${BASE_USDC} (qty={qty_up:.6f} ask={ask_up:.4f}) "
+            f"buy_down=${BASE_USDC} (qty={qty_dn:.6f} ask={ask_dn:.4f})"
+        )
+        return
 
-    if DEBUG:
-        print(f"[RESOLVE] {asset}: events={len(data.get('events') or [])} market_slugs={len(slugs)} updown15m_slugs={len(slugs_15m)}", flush=True)
-        if slugs_15m[:5]:
-            print(f"  [SLUGS] {asset} sample={slugs_15m[:5]}", flush=True)
+    # If base not done yet and we are past it, just wait; next window will handle.
+    if not st.base_done:
+        return
 
-    if not slugs_15m:
-        return None
+    # Scheduled evaluations (6 times)
+    # eval target time = (eval_index+1)*EVAL_INTERVAL_SEC
+    if (not st.exit_done) and st.eval_index < EVAL_COUNT:
+        target = (st.eval_index + 1) * EVAL_INTERVAL_SEC
+        if T >= target and T < EXIT_AT_SEC:
+            # fetch prices now
+            up_ba = best_bid_ask(st.up_token)
+            dn_ba = best_bid_ask(st.down_token)
+            if not up_ba or not dn_ba:
+                return
+            up_bid, up_ask = up_ba
+            dn_bid, dn_ask = dn_ba
 
-    slugs_15m = slugs_15m[:MAX_SLUG_LOOKUPS]
-    tasks = [asyncio.create_task(gamma_market_by_slug(session, s)) for s in slugs_15m]
-    expanded = await asyncio.gather(*tasks, return_exceptions=True)
+            # ensure last eval prices exist
+            if st.last_ask_up is None or st.last_ask_down is None:
+                st.last_ask_up, st.last_ask_down = up_ask, dn_ask
 
-    now = now_utc()
-    best: Optional[ResolvedMarket] = None
-    printed = 0
+            winner = choose_winner(up_ask, dn_ask, st.last_ask_up, st.last_ask_down)
+            win_token = st.up_token if winner == "UP" else st.down_token
+            win_ask = up_ask if winner == "UP" else dn_ask
 
-    for i, mk in enumerate(expanded):
-        if isinstance(mk, Exception) or mk is None:
-            continue
+            qty = buy_notional(win_token, STEP_USDC)
+            if winner == "UP":
+                st.pos_up_qty += qty
+            else:
+                st.pos_down_qty += qty
 
-        got_slug = (mk.get("slug") or "").strip()
-        if got_slug.lower() != slugs_15m[i].lower():
-            continue
+            # update last eval prices and index regardless of fill (timing deterministic)
+            d_up = up_ask - st.last_ask_up
+            d_dn = dn_ask - st.last_ask_down
+            st.last_ask_up, st.last_ask_down = up_ask, dn_ask
+            st.eval_index += 1
+            st.adds_done += 1
 
-        # Debug a few expanded summaries
-        if DEBUG and printed < DEBUG_EXPANSION_SAMPLES:
-            printed += 1
-            print(
-                f"  [EXPANDED] req_slug={slugs_15m[i]} got_slug={got_slug} "
-                f"closed={mk.get('closed')} enableOrderBook={mk.get('enableOrderBook')} "
-                f"endDate={mk.get('endDate')} clobTokenIds={mk.get('clobTokenIds')} conditionId={mk.get('conditionId')}",
-                flush=True,
+            log.info(
+                f"[EVAL] {asset} k={st.eval_index}/{EVAL_COUNT} T={T:.1f}s tte={tte:.1f}s "
+                f"ask_up={up_ask:.4f} ask_dn={dn_ask:.4f} "
+                f"d_up={d_up:+.4f} d_dn={d_dn:+.4f} winner={winner} "
+                f"buy=${STEP_USDC} qty={qty:.6f} win_ask={win_ask:.4f}"
+            )
+            return
+
+    # Exit at minute 13
+    if not st.exit_done and T >= EXIT_AT_SEC:
+        log.info(f"[EXIT] {asset} slug={st.slug} T={T:.1f}s tte={tte:.1f}s -> exiting all")
+        do_exit(st)
+        return
+
+    # Optional periodic price print (lightweight)
+    # Only for visibility; remove if noisy.
+    if int(time.time()) % 10 == 0:
+        up_ba = best_bid_ask(st.up_token)
+        dn_ba = best_bid_ask(st.down_token)
+        if up_ba and dn_ba:
+            up_bid, up_ask = up_ba
+            dn_bid, dn_ask = dn_ba
+            log.info(
+                f"[PRICES] {asset} slug={st.slug} T={T:.0f}s tte={tte:.0f}s "
+                f"UP bid/ask={up_bid:.4f}/{up_ask:.4f} "
+                f"DN bid/ask={dn_bid:.4f}/{dn_ask:.4f} "
+                f"pos_up={st.pos_up_qty:.6f} pos_dn={st.pos_down_qty:.6f}"
             )
 
-        if mk.get("closed", False):
-            continue
-        if not extract_enable_orderbook(mk):
-            continue
+def do_exit(st: MarketState):
+    # sell both sides best-effort
+    sold_up = sell_qty(st.up_token, st.pos_up_qty)
+    st.pos_up_qty = max(0.0, st.pos_up_qty - sold_up)
 
-        end_dt = extract_end_dt(mk)
-        if end_dt is None or end_dt <= now:
-            continue
+    sold_dn = sell_qty(st.down_token, st.pos_down_qty)
+    st.pos_down_qty = max(0.0, st.pos_down_qty - sold_dn)
 
-        condition_id = extract_condition_id(mk)
-        if not condition_id or not condition_id.startswith("0x"):
-            continue
+    log.info(
+        f"[EXIT-DONE] {st.asset} slug={st.slug} sold_up={sold_up:.6f} rem_up={st.pos_up_qty:.6f} "
+        f"sold_dn={sold_dn:.6f} rem_dn={st.pos_down_qty:.6f}"
+    )
+    st.exit_done = True
 
-        tokens = extract_clob_tokens(mk)
-        if not tokens:
-            if DEBUG:
-                raw = mk.get("clobTokenIds")
-                print(f"  [SKIP] {asset} slug={got_slug} invalid clobTokenIds type={type(raw)} raw={raw}", flush=True)
-            continue
-
-        yes_token, no_token = tokens
-
-        cand = ResolvedMarket(
-            asset=asset.upper(),
-            slug=got_slug,
-            condition_id=condition_id,
-            end_dt=end_dt,
-            yes_token=yes_token,
-            no_token=no_token,
-            question=(mk.get("question") or "").strip(),
-        )
-
-        if best is None or cand.end_dt < best.end_dt:
-            best = cand
-
-    return best
-
-
-# =========================
-# Main loop
-# =========================
-async def run():
-    assets = [a.strip().upper() for a in ASSETS.split(",") if a.strip()]
-
-    print("=== UPDOWN 15M ARB BOT START ===", flush=True)
-    print(f"CLOB_HOST={CLOB_HOST} CHAIN_ID={CHAIN_ID} GAMMA_HOST={GAMMA_HOST} DATA_API_BASE={DATA_API_BASE}", flush=True)
-    print(f"ASSETS={assets}", flush=True)
-    print(f"MIN_EDGE={MIN_EDGE} MAX_SLIPPAGE={MAX_SLIPPAGE} MIN_USDC={MIN_USDC} MAX_USDC={MAX_USDC} SIZE_MULT={SIZE_MULT}", flush=True)
-    print(f"POLL_SEC={POLL_SEC} RESOLVE_EVERY_SEC={RESOLVE_EVERY_SEC} MAX_SLUG_LOOKUPS={MAX_SLUG_LOOKUPS}", flush=True)
-    print(f"RATE: MAX_TRADES_PER_MIN={MAX_TRADES_PER_MIN} COOLDOWN_SEC={COOLDOWN_SEC}", flush=True)
-    print(f"BOUNDARY: ARM_BEFORE={ARM_BEFORE_BOUNDARY_SEC} CLOSE_BEFORE={CLOSE_BEFORE_BOUNDARY_SEC} STOP_TRYING_BEFORE={STOP_TRYING_BEFORE_BOUNDARY_SEC}", flush=True)
-
-    if not assets:
-        raise RuntimeError("ASSETS is empty. Set ASSETS=ETH,BTC,SOL,XRP")
-    if not PM_FUNDER or not PM_PRIVATE_KEY:
-        raise RuntimeError("PM_FUNDER / PM_PRIVATE_KEY missing")
-
-    client = make_client()
-
-    resolved: Dict[str, ResolvedMarket] = {}
-    last_resolve: Dict[str, float] = {a: 0.0 for a in assets}
-
-    trades_ts: List[float] = []
-    last_trade = 0.0
-    last_heartbeat = 0.0
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            t0 = time.time()
-
-            if t0 - last_heartbeat >= LOG_EVERY_SEC:
-                print(f"[HEARTBEAT] running. resolved={list(resolved.keys())}", flush=True)
-                last_heartbeat = t0
-
-            for asset in assets:
-                if (t0 - last_resolve.get(asset, 0.0)) >= RESOLVE_EVERY_SEC or asset not in resolved:
-                    try:
-                        m = await gamma_resolve_current_15m(session, asset)
-                        last_resolve[asset] = time.time()
-                        if m:
-                            resolved[asset] = m
-                            tte = seconds_to_end(m.end_dt)
-                            print(f"[MARKET] {asset} slug={m.slug} tte={tte:.1f}s yes={m.yes_token} no={m.no_token}", flush=True)
-                        else:
-                            print(f"[MARKET] {asset} no active 15m market found after slug expansion", flush=True)
-                    except Exception as e:
-                        print(f"[RESOLVE-ERR] {asset}: {e}", flush=True)
-                        continue
-
-                if asset not in resolved:
-                    continue
-
-                mkt = resolved[asset]
-                tte = seconds_to_end(mkt.end_dt)
-
-                if tte <= CLOSE_BEFORE_BOUNDARY_SEC:
-                    if DEBUG:
-                        print(f"[SKIP] {asset} too close to end tte={tte:.1f}s", flush=True)
-                    continue
-
-                if tte > ARM_BEFORE_BOUNDARY_SEC:
-                    if DEBUG:
-                        print(f"[SKIP] {asset} not armed yet tte={tte:.1f}s (> ARM_BEFORE)", flush=True)
-                    continue
-
-                if not rate_limit_ok(trades_ts):
-                    continue
-                if (time.time() - last_trade) < COOLDOWN_SEC:
-                    continue
-
-                try:
-                    yes_bids, yes_asks = await clob_fetch_book(session, mkt.yes_token)
-                    no_bids, no_asks = await clob_fetch_book(session, mkt.no_token)
-
-                    yb, ya = tob(yes_bids, yes_asks)
-                    nb, na = tob(no_bids, no_asks)
-                    if yb is None or ya is None or nb is None or na is None:
-                        continue
-
-                    buy_edge = 1.0 - (ya + na)
-                    sell_edge = (yb + nb) - 1.0
-
-                    if DEBUG:
-                        print(f"[PRICES] {asset} ya={ya:.4f} na={na:.4f} yb={yb:.4f} nb={nb:.4f} buy_edge={buy_edge:.4f} sell_edge={sell_edge:.4f}", flush=True)
-
-                    # BUY BOTH
-                    if buy_edge >= MIN_EDGE:
-                        total_budget = clip(MAX_USDC * SIZE_MULT, MIN_USDC, MAX_USDC * SIZE_MULT)
-                        leg_budget = total_budget / 2.0
-
-                        y_cap = clip(ya + MAX_SLIPPAGE, 0.0001, 0.9999)
-                        n_cap = clip(na + MAX_SLIPPAGE, 0.0001, 0.9999)
-
-                        y_sh = max_buy_shares(yes_asks, y_cap, leg_budget)
-                        n_sh = max_buy_shares(no_asks, n_cap, leg_budget)
-                        sh = min(y_sh, n_sh)
-
-                        if sh <= 0:
-                            continue
-                        if sh * (ya + na) < MIN_USDC:
-                            continue
-
-                        print(f"[TRADE BUY-BOTH] {asset} edge={buy_edge:.4f} shares={sh:.4f} y_cap={y_cap:.4f} n_cap={n_cap:.4f}", flush=True)
-                        r1 = place_fok(client, mkt.yes_token, BUY, y_cap, sh)
-                        r2 = place_fok(client, mkt.no_token, BUY, n_cap, sh)
-                        print(f"  YES: {r1}", flush=True)
-                        print(f"  NO : {r2}", flush=True)
-
-                        trades_ts.append(time.time())
-                        last_trade = time.time()
-                        continue
-
-                    # SELL BOTH
-                    if sell_edge >= MIN_EDGE:
-                        pos = await dataapi_positions(session, PM_FUNDER, mkt.condition_id)
-                        up, down = parse_inventory_updown(pos)
-                        inv = min(up, down)
-                        if inv <= 0:
-                            if DEBUG:
-                                print(f"[SKIP] {asset} sell_edge but no inventory (up={up:.4f} down={down:.4f})", flush=True)
-                            continue
-
-                        y_floor = clip(yb - MAX_SLIPPAGE, 0.0001, 0.9999)
-                        n_floor = clip(nb - MAX_SLIPPAGE, 0.0001, 0.9999)
-
-                        cap_sh = (MAX_USDC * SIZE_MULT) / max((yb + nb), 1e-9)
-                        desired = min(inv, cap_sh)
-
-                        y_ok = max_sell_shares(yes_bids, y_floor, desired)
-                        n_ok = max_sell_shares(no_bids, n_floor, desired)
-                        sh = min(y_ok, n_ok)
-
-                        if sh <= 0:
-                            continue
-                        if sh * (yb + nb) < MIN_USDC:
-                            continue
-
-                        print(f"[TRADE SELL-BOTH] {asset} edge={sell_edge:.4f} shares={sh:.4f} y_floor={y_floor:.4f} n_floor={n_floor:.4f} inv={inv:.4f}", flush=True)
-                        r1 = place_fok(client, mkt.yes_token, SELL, y_floor, sh)
-                        r2 = place_fok(client, mkt.no_token, SELL, n_floor, sh)
-                        print(f"  YES: {r1}", flush=True)
-                        print(f"  NO : {r2}", flush=True)
-
-                        trades_ts.append(time.time())
-                        last_trade = time.time()
-                        continue
-
-                except Exception as e:
-                    print(f"[ERR] {asset}: {e}", flush=True)
-                    continue
-
-            elapsed = time.time() - t0
-            await asyncio.sleep(max(0.0, POLL_SEC - elapsed))
-
+def main():
+    print_boot()
+    while True:
+        for asset in ASSETS:
+            ensure_market(asset)
+            tick_asset(asset)
+        time.sleep(POLL_SEC)
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    main()
