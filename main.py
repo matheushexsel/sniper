@@ -106,9 +106,6 @@ class Settings:
     max_tte_select_sec: int
 
     assets: List[str]
-    slug_scan_buckets_ahead: int
-    slug_scan_buckets_behind: int
-    max_slug_lookups: int
 
     poll_sec: float
     log_every_sec: float
@@ -153,9 +150,6 @@ class Settings:
             max_tte_select_sec=_env_int("MAX_TTE_SELECT_SEC", default=900),
 
             assets=_env_json_list("ASSETS", default=["BTC"]),
-            slug_scan_buckets_ahead=_env_int("SLUG_SCAN_BUCKETS_AHEAD", default=12),
-            slug_scan_buckets_behind=_env_int("SLUG_SCAN_BUCKETS_BEHIND", default=12),
-            max_slug_lookups=_env_int("MAX_SLUG_LOOKUPS", default=50),
 
             poll_sec=_env_float("POLL_SEC", default=2.0),
             log_every_sec=_env_float("LOG_EVERY_SEC", default=15.0),
@@ -181,64 +175,26 @@ class Settings:
 
 
 # ----------------------------
-# Market helpers
+# Time helpers
 # ----------------------------
 
 def _bucket_start(ts: int, window_sec: int) -> int:
     return (ts // window_sec) * window_sec
 
 
-def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: int, behind: int) -> List[str]:
-    asset_l = asset.lower()
-    minutes = int(window_sec / 60)
-    base = _bucket_start(now_ts, window_sec)
-
-    out: List[str] = []
-    for off in range(-behind, ahead + 1):
-        start_ts = base + off * window_sec
-        out.append(f"{asset_l}-updown-{minutes}m-{start_ts}")
-        out.append(f"{asset_l}-updown-{minutes}m-{start_ts + window_sec}")
-
-    seen = set()
-    dedup: List[str] = []
-    for s in out:
-        if s not in seen:
-            seen.add(s)
-            dedup.append(s)
-    return dedup
-
-
-async def gamma_find_market_records_by_slug(gamma_host: str, slug: str) -> List[Dict[str, Any]]:
-    """
-    Gamma /markets returns a list of market records. We filter client-side by slug because
-    the API shape can vary.
-    """
-    url = f"{gamma_host.rstrip('/')}/markets"
-    params = {"closed": "false", "limit": 500}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        data = r.json()
-
-    if not isinstance(data, list):
-        return []
-    return [m for m in data if str(m.get("slug") or "").strip() == slug]
-
+# ----------------------------
+# Gamma market resolution (authoritative token IDs)
+# ----------------------------
 
 def _extract_yes_no_from_gamma_record(m: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """
-    Gamma market records often include:
-      - clobTokenIds: [yes_token_id, no_token_id] (sometimes reversed)
-      - outcomes / outcomeNames: ["Yes","No"] etc
-    """
     tids = m.get("clobTokenIds")
     if not isinstance(tids, list) or len(tids) < 2:
         return None
+
     labels = m.get("outcomes") or m.get("outcomeNames") or ["Yes", "No"]
     if not isinstance(labels, list) or len(labels) < 2:
         labels = ["Yes", "No"]
 
-    # normalize by label when possible
     yes_idx, no_idx = 0, 1
     l0 = str(labels[0]).strip().lower()
     l1 = str(labels[1]).strip().lower()
@@ -256,10 +212,6 @@ def _extract_yes_no_from_gamma_record(m: Dict[str, Any]) -> Optional[Dict[str, s
 
 
 async def find_active_market_via_gamma(s: Settings, asset: str) -> Optional[Dict[str, str]]:
-    """
-    Best path: determine the active slug for asset/window and immediately return
-    token IDs from Gamma record (NOT from website scrape).
-    """
     minutes = int(s.window_sec / 60)
     pat = re.compile(rf"^{asset.lower()}-updown-{minutes}m-(\d+)$")
     url = f"{s.gamma_host.rstrip('/')}/markets"
@@ -274,6 +226,7 @@ async def find_active_market_via_gamma(s: Settings, asset: str) -> Optional[Dict
         return None
 
     now_ts = int(time.time())
+
     candidates: List[Tuple[int, Dict[str, Any]]] = []
     for m in data:
         slug = str(m.get("slug") or "").strip()
@@ -281,12 +234,12 @@ async def find_active_market_via_gamma(s: Settings, asset: str) -> Optional[Dict
         if not mo:
             continue
         ts = int(mo.group(1))
-        # Prefer currently-open window
+        # prefer current open window
         if now_ts < ts + s.window_sec:
             candidates.append((ts, m))
 
-    # If none look "open", take newest matching
     if not candidates:
+        # fallback: newest matching
         for m in data:
             slug = str(m.get("slug") or "").strip()
             mo = pat.match(slug)
@@ -298,7 +251,6 @@ async def find_active_market_via_gamma(s: Settings, asset: str) -> Optional[Dict
 
     candidates.sort(key=lambda x: x[0], reverse=True)
 
-    # Return first candidate that has clobTokenIds
     for _, rec in candidates:
         info = _extract_yes_no_from_gamma_record(rec)
         if info and info.get("yes_token_id") and info.get("no_token_id"):
@@ -308,7 +260,7 @@ async def find_active_market_via_gamma(s: Settings, asset: str) -> Optional[Dict
 
 
 # ----------------------------
-# Order book helpers
+# Orderbook helpers
 # ----------------------------
 
 def _best_ask(book: Dict[str, Any]) -> Optional[Tuple[float, float]]:
@@ -467,10 +419,10 @@ class ArbBot:
         self.trader = PolymarketTrader(s)
 
         self._active: Dict[str, Dict[str, str]] = {}
-        self._invalid_until: Dict[str, float] = {}  # asset -> timestamp (cooldown on bad token ids)
-        self._last_log = 0.0
+        self._invalid_until: Dict[str, float] = {}
         self._last_trade = 0.0
         self._trade_ts: List[float] = []
+        self._last_heartbeat = 0.0
 
     def _trades_per_min_ok(self) -> bool:
         now = time.time()
@@ -496,13 +448,20 @@ class ArbBot:
         return self.s.min_tte_select_sec <= tte <= self.s.max_tte_select_sec
 
     async def _refresh_market(self, asset: str) -> Optional[Dict[str, str]]:
-        # backoff if we recently had invalid token ids (404 orderbook)
         until = self._invalid_until.get(asset, 0.0)
         if time.time() < until:
+            if self.s.debug:
+                logger.info(f"[{asset}] market refresh blocked until {until:.0f}")
             return None
 
-        info = await find_active_market_via_gamma(self.s, asset)
+        try:
+            info = await find_active_market_via_gamma(self.s, asset)
+        except Exception as e:
+            logger.warning(f"[{asset}] gamma resolution failed: {e}")
+            return None
+
         if not info:
+            logger.warning(f"[{asset}] gamma returned no active market (slug not found).")
             return None
 
         cached = self._active.get(asset)
@@ -564,9 +523,23 @@ class ArbBot:
 
     async def try_trade(self, asset: str) -> None:
         now_ts = int(time.time())
-        if not self._armed(now_ts) or not self._tradeable(now_ts):
+        tte = self._tte(now_ts)
+        armed = self._armed(now_ts)
+        tradeable = self._tradeable(now_ts)
+
+        if self.s.debug:
+            if not armed or not tradeable:
+                logger.info(f"[{asset}] skip gates | armed={armed} tradeable={tradeable} tte={tte}")
+
+        if not armed or not tradeable:
             return
-        if not self._trades_per_min_ok() or not self._cooldown_ok():
+        if not self._trades_per_min_ok():
+            if self.s.debug:
+                logger.info(f"[{asset}] skip rate-limit | trades_last_min={len(self._trade_ts)}")
+            return
+        if not self._cooldown_ok():
+            if self.s.debug:
+                logger.info(f"[{asset}] skip cooldown")
             return
 
         market = await self._refresh_market(asset)
@@ -580,10 +553,8 @@ class ArbBot:
             yes_book, no_book = await self._books(yes_token, no_token)
         except Exception as e:
             msg = str(e)
-            # Critical: if token IDs are wrong, CLOB throws 404 no orderbook exists.
-            # Mark invalid briefly, forcing gamma refresh next time.
             if "No orderbook exists" in msg or "status_code=404" in msg:
-                logger.warning(f"[{asset}] Token IDs not orderbook-enabled. Forcing re-resolve in 10s. err={e}")
+                logger.warning(f"[{asset}] token IDs not orderbook-enabled; re-resolve in 10s | err={e}")
                 self._active.pop(asset, None)
                 self._invalid_until[asset] = time.time() + 10.0
                 return
@@ -593,6 +564,8 @@ class ArbBot:
         yes_best = _best_ask(yes_book)
         no_best = _best_ask(no_book)
         if not yes_best or not no_best:
+            if self.s.debug:
+                logger.info(f"[{asset}] no top-of-book liquidity (asks empty).")
             return
 
         yes_best_p, _ = yes_best
@@ -607,6 +580,8 @@ class ArbBot:
         yes_worst = _walk_asks_for_size(yes_book, shares)
         no_worst = _walk_asks_for_size(no_book, shares)
         if yes_worst is None or no_worst is None:
+            if self.s.debug:
+                logger.info(f"[{asset}] insufficient ask depth for shares={shares:.0f}")
             return
 
         if not _slippage_ok(yes_best_p, yes_worst, self.s.max_slippage):
@@ -619,12 +594,10 @@ class ArbBot:
         if edge < self.s.min_edge:
             return
 
-        if time.time() - self._last_log >= self.s.log_every_sec:
-            self._last_log = time.time()
-            logger.info(
-                f"[{asset}] edge={edge:.4f} total={total_cost:.4f} shares={shares:.0f} "
-                f"YES@{yes_worst:.4f} NO@{no_worst:.4f} tte={self._tte(now_ts)}s slug={market.get('slug')}"
-            )
+        logger.info(
+            f"[{asset}] edge={edge:.4f} total={total_cost:.4f} shares={shares:.0f} "
+            f"YES@{yes_worst:.4f} NO@{no_worst:.4f} tte={tte}s slug={market.get('slug')}"
+        )
 
         await self._execute_paired(asset, yes_token, no_token, shares, yes_worst, no_worst)
 
@@ -692,14 +665,29 @@ class ArbBot:
         logger.info("Bot started.")
         logger.info(f"Assets={self.s.assets} window={self.s.window_sec}s dry_run={self.s.dry_run}")
         logger.info(f"min_edge={self.s.min_edge} max_slippage={self.s.max_slippage}")
+        logger.info(
+            f"gates: arm<= {self.s.arm_before_boundary_sec}s, tradeable in [{self.s.min_tte_select_sec},{self.s.max_tte_select_sec}] "
+            f"stop_trying<= {self.s.stop_trying_before_boundary_sec}s"
+        )
 
         while True:
+            now = time.time()
+            if now - self._last_heartbeat >= self.s.log_every_sec:
+                self._last_heartbeat = now
+                now_ts = int(now)
+                tte = self._tte(now_ts)
+                logger.info(
+                    f"HEARTBEAT | tte={tte}s | armed={self._armed(now_ts)} tradeable={self._tradeable(now_ts)} "
+                    f"| trades_last_min={len(self._trade_ts)} | cooldown_ok={self._cooldown_ok()}"
+                )
+
             t0 = time.time()
             try:
                 for a in self.s.assets:
                     await self.try_trade(a.upper())
             except Exception as e:
                 logger.warning(f"loop error: {e}")
+
             dt = time.time() - t0
             await asyncio.sleep(max(0.0, self.s.poll_sec - dt))
 
