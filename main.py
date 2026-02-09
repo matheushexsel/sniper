@@ -10,6 +10,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -86,10 +87,11 @@ def _env_json_list(*keys: str, default: List[str]) -> List[str]:
 
 @dataclass
 class Settings:
+    # APIs
     clob_host: str
-    gamma_host: str
-    data_api_base: str
+    data_api_base: str  # kept for compatibility; not required in this resolver
 
+    # auth
     chain_id: int
     signature_type: int
     private_key: str
@@ -99,6 +101,7 @@ class Settings:
     api_secret: str
     api_passphrase: str
 
+    # strategy timing
     window_sec: int
     arm_before_boundary_sec: int
     stop_trying_before_boundary_sec: int
@@ -107,19 +110,23 @@ class Settings:
 
     assets: List[str]
 
+    # loop
     poll_sec: float
     log_every_sec: float
     debug: bool
 
+    # sizing
     min_usdc: float
     max_usdc: float
     base_usdc: float
     step_usdc: float
     size_mult: float
 
+    # risk
     min_edge: float
     max_slippage: float
 
+    # execution
     dry_run: bool
     max_trades_per_min: int
     cooldown_sec: float
@@ -127,15 +134,19 @@ class Settings:
     max_retries: int
     sell_opposite: bool
 
+    # slug scanning
     max_slug_lookups: int
     slug_scan_buckets_ahead: int
     slug_scan_buckets_behind: int
+
+    # resolver
+    resolve_validate_orderbook: bool
+    resolve_cache_sec: float
 
     @staticmethod
     def load() -> "Settings":
         return Settings(
             clob_host=_env("CLOB_HOST", default="https://clob.polymarket.com"),
-            gamma_host=_env("GAMMA_HOST", default="https://gamma-api.polymarket.com"),
             data_api_base=_env("DATA_API_BASE", default="https://data-api.polymarket.com"),
 
             chain_id=_env_int("CHAIN_ID", default=137),
@@ -178,6 +189,9 @@ class Settings:
             max_slug_lookups=_env_int("MAX_SLUG_LOOKUPS", default=50),
             slug_scan_buckets_ahead=_env_int("SLUG_SCAN_BUCKETS_AHEAD", default=12),
             slug_scan_buckets_behind=_env_int("SLUG_SCAN_BUCKETS_BEHIND", default=12),
+
+            resolve_validate_orderbook=_env_bool("RESOLVE_VALIDATE_ORDERBOOK", default=True),
+            resolve_cache_sec=_env_float("RESOLVE_CACHE_SEC", default=10.0),
         )
 
 
@@ -210,239 +224,88 @@ def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: in
 
 
 # ----------------------------
-# Data API discovery (best-effort)
+# Polymarket event page resolver (the working approach)
 # ----------------------------
 
-async def data_api_search_slugs(s: Settings, asset: str) -> List[str]:
-    asset_u = asset.upper()
-    minutes = int(s.window_sec / 60)
+_NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
 
-    queries = [
-        f"{asset_u} up/down {minutes}m",
-        f"{asset_u} updown {minutes}m",
-        f"{asset_u} up down {minutes}m",
-        f"{asset_u} updown",
-        f"{asset_u} Up or Down - {minutes} minute",
-    ]
-
-    slugs: List[str] = []
-    async with httpx.AsyncClient(timeout=20) as client:
-        for q in queries:
-            for path, params in [
-                ("/markets", {"search": q, "limit": 200}),
-                ("/markets", {"query": q, "limit": 200}),
-                ("/search", {"q": q, "limit": 200}),
-            ]:
-                url = s.data_api_base.rstrip("/") + path
-                try:
-                    r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
-                    if r.status_code >= 400:
-                        continue
-                    data = r.json()
-                except Exception:
-                    continue
-
-                items: List[Dict[str, Any]] = []
-                if isinstance(data, list):
-                    items = [x for x in data if isinstance(x, dict)]
-                elif isinstance(data, dict):
-                    for key in ("markets", "data", "results", "items"):
-                        v = data.get(key)
-                        if isinstance(v, list):
-                            items = [x for x in v if isinstance(x, dict)]
-                            break
-
-                for it in items:
-                    slug = str(it.get("slug") or it.get("market_slug") or "").strip()
-                    if slug:
-                        slugs.append(slug)
-
-    pat = re.compile(rf"^{asset.lower()}-updown-{minutes}m-(\d+)$")
-    filtered = [x for x in slugs if pat.match(x)]
-    out: List[str] = []
-    seen = set()
-    for x in filtered:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-def pick_best_slug_for_now(slugs: List[str], asset: str, window_sec: int) -> Optional[str]:
-    if not slugs:
-        return None
-    minutes = int(window_sec / 60)
-    pat = re.compile(rf"^{asset.lower()}-updown-{minutes}m-(\d+)$")
-    now_ts = int(time.time())
-
-    scored: List[Tuple[int, str]] = []
-    for s in slugs:
-        m = pat.match(s)
-        if not m:
-            continue
-        ts = int(m.group(1))
-        is_open = 1 if now_ts < ts + window_sec else 0
-        dist = abs(now_ts - ts)
-        score = is_open * 10_000_000 - dist
-        scored.append((score, s))
-
-    if not scored:
-        return None
-    scored.sort(reverse=True)
-    return scored[0][1]
-
-
-# ----------------------------
-# Gamma-by-slug token resolver (robust)
-# ----------------------------
-
-def _parse_clob_token_ids(raw: Any) -> Optional[List[str]]:
+async def fetch_market_from_event_page(slug: str) -> Dict[str, Any]:
     """
-    Gamma can return clobTokenIds as:
-    - list[str]
-    - JSON-encoded string (e.g. '["id1","id2"]')
-    - comma-separated string
-    - list of numbers
+    Fetch https://polymarket.com/event/<slug> and extract market object containing clobTokenIds.
+    This matches the approach from the repo you uploaded.
     """
-    if raw is None:
-        return None
+    slug = slug.split("?")[0].strip()
+    url = f"https://polymarket.com/event/{slug}"
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    if isinstance(raw, list):
-        out = [str(x) for x in raw if str(x).strip() != ""]
-        return out if len(out) >= 2 else None
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        html = r.text
 
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-        # JSON list string
-        if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
-            try:
-                j = json.loads(s)
-                if isinstance(j, list):
-                    out = [str(x) for x in j if str(x).strip() != ""]
-                    return out if len(out) >= 2 else None
-            except Exception:
-                pass
-        # comma-separated
-        if "," in s:
-            parts = [p.strip().strip('"').strip("'") for p in s.split(",")]
-            out = [p for p in parts if p]
-            return out if len(out) >= 2 else None
+    m = _NEXT_DATA_RE.search(html)
+    if not m:
+        raise RuntimeError("__NEXT_DATA__ payload not found on event page")
 
-        # single string token id isn't useful for YES/NO
-        return None
-
-    # numeric? try to coerce to string; but single value still not enough
-    try:
-        return [str(raw)]
-    except Exception:
-        return None
-
-
-def _extract_tokens_from_market_obj(m: Dict[str, Any], slug: str, debug: bool) -> Dict[str, str]:
-    # Handle 200 OK error payloads
-    if any(k in m for k in ("error", "errors", "message", "detail")) and "clobTokenIds" not in m and "clob_token_ids" not in m:
-        raise RuntimeError(f"Gamma error payload for slug={slug}: keys={list(m.keys())[:8]}")
-
-    # Accept key variants
-    raw_ids = (
-        m.get("clobTokenIds")
-        or m.get("clob_token_ids")
-        or m.get("clobTokenIDs")
-        or m.get("clobtokenids")
+    payload = json.loads(m.group(1))
+    queries = (
+        payload.get("props", {})
+        .get("pageProps", {})
+        .get("dehydratedState", {})
+        .get("queries", [])
     )
-    tids = _parse_clob_token_ids(raw_ids)
 
-    # Some Gamma payloads embed tokens differently; try a couple of fallbacks
-    if not tids:
-        # Sometimes present as two outcome objects with token IDs
-        # Common patterns: m['tokens'], m['outcomes'], etc.
-        for key in ("tokens", "outcomes", "outcomeTokens"):
-            v = m.get(key)
-            if isinstance(v, list) and len(v) >= 2:
-                # try fields that might hold the token id
-                cand: List[str] = []
-                for item in v:
-                    if not isinstance(item, dict):
-                        continue
-                    for tk in ("clobTokenId", "clob_token_id", "tokenId", "token_id", "id"):
-                        if item.get(tk):
-                            cand.append(str(item[tk]))
-                            break
-                if len(cand) >= 2:
-                    tids = cand[:2]
+    market_obj: Optional[Dict[str, Any]] = None
+
+    # Scan dehydrated queries for a dict with "markets"
+    for q in queries:
+        data = q.get("state", {}).get("data")
+        if isinstance(data, dict) and "markets" in data and isinstance(data["markets"], list):
+            for mk in data["markets"]:
+                if isinstance(mk, dict) and mk.get("slug") == slug:
+                    market_obj = mk
                     break
+        if market_obj:
+            break
 
-    if not tids or len(tids) < 2:
-        if debug:
-            # Print a minimal payload signature to troubleshoot without dumping secrets
-            snippet = {k: m.get(k) for k in list(m.keys())[:20]}
-            logger.warning(f"[gamma-debug] slug={slug} keys={list(m.keys())[:20]} sample={str(snippet)[:300]}")
-        raise RuntimeError(f"Gamma missing clobTokenIds for slug={slug}")
+    if not market_obj:
+        raise RuntimeError("Market slug not found in dehydrated state")
 
-    labels = m.get("outcomes") or m.get("outcomeNames") or ["Yes", "No"]
-    if not isinstance(labels, list) or len(labels) < 2:
-        labels = ["Yes", "No"]
+    return market_obj
 
-    # Determine YES/NO index
+
+def extract_yes_no_tokens_from_market(market_obj: Dict[str, Any], slug: str) -> Dict[str, str]:
+    clob_tokens = market_obj.get("clobTokenIds") or market_obj.get("clob_token_ids") or []
+    outcomes = market_obj.get("outcomes") or market_obj.get("outcomeNames") or []
+
+    # clobTokenIds sometimes arrives as JSON-string list
+    if isinstance(clob_tokens, str):
+        try:
+            clob_tokens = json.loads(clob_tokens)
+        except Exception:
+            clob_tokens = []
+
+    if not isinstance(clob_tokens, list) or len(clob_tokens) < 2:
+        raise RuntimeError(f"event-page missing usable clobTokenIds for slug={slug}")
+
+    if not isinstance(outcomes, list) or len(outcomes) < 2:
+        outcomes = ["Yes", "No"]
+
+    # Prefer YES/NO mapping if outcomes literally include yes/no; otherwise keep index order stable
     yes_idx, no_idx = 0, 1
-    l0 = str(labels[0]).strip().lower()
-    l1 = str(labels[1]).strip().lower()
+    l0 = str(outcomes[0]).strip().lower()
+    l1 = str(outcomes[1]).strip().lower()
     if l0 == "no" and l1 == "yes":
         yes_idx, no_idx = 1, 0
 
-    # If tids order doesn't match labels order, we still treat [0]=YES [1]=NO by default
-    # because most Up/Down markets use [Yes, No] outcomes. If your market uses [Up, Down],
-    # the "labels" won't literally say yes/no; we will still map index 0/1 consistently.
     return {
         "slug": slug,
-        "market_id": str(m.get("id") or ""),
-        "yes_token_id": str(tids[yes_idx]),
-        "no_token_id": str(tids[no_idx]),
-        "yes_label": str(labels[yes_idx]),
-        "no_label": str(labels[no_idx]),
+        "market_id": str(market_obj.get("id") or market_obj.get("marketId") or ""),
+        "yes_token_id": str(clob_tokens[yes_idx]),
+        "no_token_id": str(clob_tokens[no_idx]),
+        "yes_label": str(outcomes[yes_idx]),
+        "no_label": str(outcomes[no_idx]),
     }
-
-
-async def tokens_from_gamma_slug(gamma_host: str, slug: str, debug: bool = False) -> Dict[str, str]:
-    """
-    Primary: GET /markets/slug/{slug}
-    Fallback: GET /markets?slug=...
-    """
-    base = gamma_host.rstrip("/")
-    url_slug = f"{base}/markets/slug/{slug}"
-    url_list = f"{base}/markets"
-
-    async with httpx.AsyncClient(timeout=20) as client:
-        # Primary
-        r = await client.get(url_slug, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code == 200:
-            m = r.json()
-            if not isinstance(m, dict):
-                raise RuntimeError(f"Unexpected Gamma /markets/slug response type for slug={slug}: {type(m)}")
-            return _extract_tokens_from_market_obj(m, slug, debug)
-
-        if debug:
-            logger.warning(f"[gamma-debug] /markets/slug/{slug} -> {r.status_code} body={r.text[:200]}")
-
-        # Fallback list endpoint
-        for params in ({"slug": slug, "limit": 1, "offset": 0}, {"slug": [slug], "limit": 1, "offset": 0}):
-            rr = await client.get(url_list, params=params, headers={"User-Agent": "Mozilla/5.0"})
-            if rr.status_code != 200:
-                if debug:
-                    logger.warning(f"[gamma-debug] /markets params={params} -> {rr.status_code} body={rr.text[:200]}")
-                continue
-            data = rr.json()
-            if isinstance(data, list) and data:
-                return _extract_tokens_from_market_obj(data[0], slug, debug)
-            if isinstance(data, dict):
-                for k in ("markets", "data", "results", "items"):
-                    v = data.get(k)
-                    if isinstance(v, list) and v:
-                        return _extract_tokens_from_market_obj(v[0], slug, debug)
-
-        raise RuntimeError(f"Gamma returned no market for slug={slug}")
 
 
 # ----------------------------
@@ -608,8 +471,6 @@ class ArbBot:
         self._trade_ts: List[float] = []
         self._last_heartbeat = 0.0
 
-        self._last_resolve_log = 0.0  # rate-limit spam
-
     def _trades_per_min_ok(self) -> bool:
         now = time.time()
         cutoff = now - 60.0
@@ -633,52 +494,57 @@ class ArbBot:
             return False
         return self.s.min_tte_select_sec <= tte <= self.s.max_tte_select_sec
 
+    async def _validate_orderbooks(self, yes_token: str, no_token: str) -> bool:
+        """
+        Hard validation: if either token has no orderbook, skip this slug.
+        This kills the exact failure you keep hitting.
+        """
+        try:
+            await asyncio.to_thread(self.trader.get_order_book, yes_token)
+            await asyncio.to_thread(self.trader.get_order_book, no_token)
+            return True
+        except Exception as e:
+            msg = str(e)
+            if "No orderbook exists" in msg or "status_code=404" in msg:
+                return False
+            # Other errors: treat as transient failure
+            raise
+
     async def _resolve_market(self, asset: str) -> Optional[Dict[str, str]]:
         until = self._invalid_until.get(asset, 0.0)
         if time.time() < until:
             return None
 
-        # 1) Data API -> best slug
-        slug: Optional[str] = None
-        try:
-            slugs = await data_api_search_slugs(self.s, asset)
-            slug = pick_best_slug_for_now(slugs, asset, self.s.window_sec)
-        except Exception:
-            pass
-
-        # 2) If we got a slug, resolve via Gamma
-        if slug:
-            try:
-                info = await tokens_from_gamma_slug(self.s.gamma_host, slug, debug=self.s.debug)
-                self._active[asset] = info
-                logger.info(f"[{asset}] Active: {info['slug']} | YES={info['yes_token_id']} NO={info['no_token_id']}")
-                return info
-            except Exception as e:
-                if self.s.debug:
-                    logger.warning(f"[{asset}] gamma-by-slug failed slug={slug}: {e}")
-
-        # 3) Deterministic fallback around current bucket
         now_ts = int(time.time())
         cands = _compute_candidate_slugs(
             asset, now_ts, self.s.window_sec, self.s.slug_scan_buckets_ahead, self.s.slug_scan_buckets_behind
         )[: self.s.max_slug_lookups]
 
         last_err: Optional[str] = None
-        for c in cands:
+        for slug in cands:
             try:
-                info = await tokens_from_gamma_slug(self.s.gamma_host, c, debug=self.s.debug)
+                mk = await fetch_market_from_event_page(slug)
+                info = extract_yes_no_tokens_from_market(mk, slug)
+
+                if self.s.resolve_validate_orderbook:
+                    ok = await self._validate_orderbooks(info["yes_token_id"], info["no_token_id"])
+                    if not ok:
+                        if self.s.debug:
+                            logger.warning(f"[{asset}] slug={slug} has clobTokenIds but NO CLOB orderbooks (skipping).")
+                        continue
+
                 self._active[asset] = info
-                logger.info(f"[{asset}] Active (fallback): {info['slug']} | YES={info['yes_token_id']} NO={info['no_token_id']}")
+                logger.info(f"[{asset}] Active: {info['slug']} | YES={info['yes_token_id']} NO={info['no_token_id']}")
+                self._invalid_until[asset] = time.time() + self.s.resolve_cache_sec
                 return info
+
             except Exception as e:
                 last_err = str(e)
                 continue
 
-        # rate-limit noisy log
-        now = time.time()
-        if now - self._last_resolve_log > 5.0:
-            self._last_resolve_log = now
-            logger.warning(f"[{asset}] could not resolve any active market (last_err={last_err}).")
+        logger.warning(f"[{asset}] could not resolve any active market via event-page resolver (last_err={last_err}).")
+        # don’t hammer the site
+        self._invalid_until[asset] = time.time() + max(3.0, self.s.poll_sec)
         return None
 
     def _pick_notional(self) -> float:
@@ -749,13 +615,7 @@ class ArbBot:
         try:
             yes_book, no_book = await self._books(yes_token, no_token)
         except Exception as e:
-            msg = str(e)
-            if "No orderbook exists" in msg or "status_code=404" in msg:
-                logger.warning(f"[{asset}] token IDs not orderbook-enabled; re-resolve in 10s | err={e}")
-                self._active.pop(asset, None)
-                self._invalid_until[asset] = time.time() + 10.0
-                return
-            logger.warning(f"[{asset}] book fetch failed: {e}")
+            logger.warning(f"[{asset}] book fetch failed even after validation: {e}")
             return
 
         yes_best = _best_ask(yes_book)
@@ -904,6 +764,7 @@ async def main() -> None:
     _setup_logging()
     s = Settings.load()
     _sanity(s)
+
     bot = ArbBot(s)
     await bot.run_forever()
 
