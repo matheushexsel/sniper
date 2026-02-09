@@ -223,7 +223,7 @@ def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: in
 
 
 # ----------------------------
-# Polymarket event page resolver (working approach)
+# Polymarket event page resolver
 # ----------------------------
 
 _NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
@@ -306,13 +306,6 @@ def extract_yes_no_tokens_from_market(market_obj: Dict[str, Any], slug: str) -> 
 # ----------------------------
 
 def _book_to_dict(book: Any) -> Dict[str, Any]:
-    """
-    py_clob_client may return:
-      - dict with {asks:[{price,size}], bids:[...]}
-      - OrderBookSummary object with .asks/.bids
-      - pydantic model with .dict() / .model_dump()
-    Normalize to: {"asks":[{"price":..,"size":..}], "bids":[...]}
-    """
     if book is None:
         return {"asks": [], "bids": []}
 
@@ -511,6 +504,7 @@ class ArbBot:
         self._last_trade = 0.0
         self._trade_ts: List[float] = []
         self._last_heartbeat = 0.0
+        self._last_debug_log: Dict[str, float] = {}  # per-asset debug throttling
 
     def _trades_per_min_ok(self) -> bool:
         now = time.time()
@@ -535,6 +529,14 @@ class ArbBot:
             return False
         return self.s.min_tte_select_sec <= tte <= self.s.max_tte_select_sec
 
+    def _debug_throttle_ok(self, asset: str, every_sec: float = 5.0) -> bool:
+        now = time.time()
+        last = self._last_debug_log.get(asset, 0.0)
+        if now - last >= every_sec:
+            self._last_debug_log[asset] = now
+            return True
+        return False
+
     async def _validate_orderbooks(self, yes_token: str, no_token: str) -> bool:
         try:
             y = await asyncio.to_thread(self.trader.get_order_book, yes_token)
@@ -551,7 +553,7 @@ class ArbBot:
     async def _resolve_market(self, asset: str) -> Optional[Dict[str, str]]:
         until = self._invalid_until.get(asset, 0.0)
         if time.time() < until:
-            return None
+            return self._active.get(asset)
 
         now_ts = int(time.time())
         cands = _compute_candidate_slugs(
@@ -571,8 +573,10 @@ class ArbBot:
                             logger.warning(f"[{asset}] slug={slug} has clobTokenIds but NO CLOB orderbooks (skipping).")
                         continue
 
+                prev = self._active.get(asset)
                 self._active[asset] = info
-                logger.info(f"[{asset}] Active: {info['slug']} | YES={info['yes_token_id']} NO={info['no_token_id']}")
+                if not prev or prev.get("slug") != info.get("slug"):
+                    logger.info(f"[{asset}] Active: {info['slug']} | YES={info['yes_token_id']} NO={info['no_token_id']}")
                 self._invalid_until[asset] = time.time() + self.s.resolve_cache_sec
                 return info
 
@@ -585,12 +589,17 @@ class ArbBot:
         return None
 
     def _pick_notional(self) -> float:
+        # Choose target notional in [min_usdc, max_usdc] stepping by step_usdc,
+        # then apply SIZE_MULT (scale), and clamp to [min_usdc, max_usdc].
         if self.s.step_usdc <= 0:
-            return float(max(self.s.min_usdc, min(self.s.base_usdc, self.s.max_usdc)))
-        steps = int(max(0, math.floor((self.s.max_usdc - self.s.min_usdc) / self.s.step_usdc)))
-        k = random.randint(0, max(0, steps))
-        val = self.s.min_usdc + k * self.s.step_usdc
-        return float(max(self.s.min_usdc, min(val, self.s.max_usdc)))
+            raw = float(max(self.s.min_usdc, min(self.s.base_usdc, self.s.max_usdc)))
+        else:
+            steps = int(max(0, math.floor((self.s.max_usdc - self.s.min_usdc) / self.s.step_usdc)))
+            k = random.randint(0, max(0, steps))
+            raw = self.s.min_usdc + k * self.s.step_usdc
+
+        scaled = raw * max(0.0, self.s.size_mult)
+        return float(max(self.s.min_usdc, min(scaled, self.s.max_usdc)))
 
     async def _books(self, yes_token: str, no_token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         t1 = asyncio.to_thread(self.trader.get_order_book, yes_token)
@@ -638,9 +647,19 @@ class ArbBot:
         now_ts = int(time.time())
         tte = self._tte(now_ts)
 
-        if not self._armed(now_ts) or not self._tradeable(now_ts):
+        if not self._armed(now_ts):
             return
-        if not self._trades_per_min_ok() or not self._cooldown_ok():
+        if not self._tradeable(now_ts):
+            if self.s.debug and self._debug_throttle_ok(asset, 10.0):
+                logger.info(f"[{asset}] skip: not tradeable (tte={tte}s, min_tte={self.s.min_tte_select_sec}, stop_trying<={self.s.stop_trying_before_boundary_sec})")
+            return
+        if not self._trades_per_min_ok():
+            if self.s.debug and self._debug_throttle_ok(asset, 10.0):
+                logger.info(f"[{asset}] skip: trades/min cap hit ({len(self._trade_ts)}/{self.s.max_trades_per_min})")
+            return
+        if not self._cooldown_ok():
+            if self.s.debug and self._debug_throttle_ok(asset, 10.0):
+                logger.info(f"[{asset}] skip: cooldown ({time.time()-self._last_trade:.2f}s/{self.s.cooldown_sec}s)")
             return
 
         market = await self._resolve_market(asset)
@@ -653,40 +672,60 @@ class ArbBot:
         try:
             yes_book, no_book = await self._books(yes_token, no_token)
         except Exception as e:
-            logger.warning(f"[{asset}] book fetch failed even after validation: {e}")
+            logger.warning(f"[{asset}] book fetch failed: {e}")
             return
 
         yes_best = _best_ask(yes_book)
         no_best = _best_ask(no_book)
         if not yes_best or not no_best:
+            if self.s.debug and self._debug_throttle_ok(asset, 5.0):
+                yb = "none" if not yes_best else f"{yes_best[0]:.4f}@{yes_best[1]:.2f}"
+                nb = "none" if not no_best else f"{no_best[0]:.4f}@{no_best[1]:.2f}"
+                logger.info(f"[{asset}] skip: missing asks (YES={yb}, NO={nb})")
             return
 
         yes_best_p, _ = yes_best
         no_best_p, _ = no_best
 
-        notional = self._pick_notional() * max(0.0, self.s.size_mult)
-        notional = max(self.s.min_usdc, min(notional, self.s.max_usdc))
-
+        notional = self._pick_notional()
         est_price = max(yes_best_p, no_best_p, 0.01)
         shares = max(1.0, math.floor(notional / est_price))
 
         yes_worst = _walk_asks_for_size(yes_book, shares)
         no_worst = _walk_asks_for_size(no_book, shares)
         if yes_worst is None or no_worst is None:
+            if self.s.debug and self._debug_throttle_ok(asset, 5.0):
+                logger.info(f"[{asset}] skip: not enough ask depth (shares={shares:.0f}, notional={notional:.2f})")
             return
 
         if not _slippage_ok(yes_best_p, yes_worst, self.s.max_slippage):
+            if self.s.debug and self._debug_throttle_ok(asset, 5.0):
+                slip = (yes_worst - yes_best_p) / max(yes_best_p, 1e-9)
+                logger.info(f"[{asset}] skip: YES slippage {slip:.4f} > {self.s.max_slippage} (best={yes_best_p:.4f} worst={yes_worst:.4f})")
             return
+
         if not _slippage_ok(no_best_p, no_worst, self.s.max_slippage):
+            if self.s.debug and self._debug_throttle_ok(asset, 5.0):
+                slip = (no_worst - no_best_p) / max(no_best_p, 1e-9)
+                logger.info(f"[{asset}] skip: NO slippage {slip:.4f} > {self.s.max_slippage} (best={no_best_p:.4f} worst={no_worst:.4f})")
             return
 
         total_cost = yes_worst + no_worst
         edge = 1.0 - total_cost
+
+        if self.s.debug and self._debug_throttle_ok(asset, 5.0):
+            logger.info(
+                f"[{asset}] eval | notional={notional:.2f} shares={shares:.0f} "
+                f"YES best={yes_best_p:.4f} worst={yes_worst:.4f} | "
+                f"NO best={no_best_p:.4f} worst={no_worst:.4f} | "
+                f"total={total_cost:.4f} edge={edge:.4f} min_edge={self.s.min_edge:.4f}"
+            )
+
         if edge < self.s.min_edge:
             return
 
         logger.info(
-            f"[{asset}] edge={edge:.4f} total={total_cost:.4f} shares={shares:.0f} "
+            f"[{asset}] TRADE_SIGNAL | edge={edge:.4f} total={total_cost:.4f} shares={shares:.0f} "
             f"YES@{yes_worst:.4f} NO@{no_worst:.4f} tte={tte}s slug={market.get('slug')}"
         )
 
@@ -796,6 +835,8 @@ def _sanity(s: Settings) -> None:
         raise RuntimeError("WINDOW_SEC must be > 0")
     if s.min_usdc > s.max_usdc:
         raise RuntimeError("MIN_USDC must be <= MAX_USDC")
+    if s.size_mult <= 0:
+        raise RuntimeError("SIZE_MULT must be > 0")
 
 
 async def main() -> None:
