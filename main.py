@@ -1,18 +1,4 @@
 # main.py
-"""
-Polymarket 15m paired-outcome arb bot (single-file, Railway-ready).
-
-Edge:
-- In a binary market, one side settles at $1 and the other at $0.
-- If you BUY both sides for total < $1, you lock payoff ~ (1 - total_cost) per paired share
-  (ignoring fees and any execution/unwind losses).
-
-This build:
-- No batch order posting (PostOrdersArgs not available in your py-clob-client).
-- Instead: place both orders concurrently via asyncio.gather + to_thread.
-- Conservative: only trades when edge >= MIN_EDGE and slippage <= MAX_SLIPPAGE.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -50,7 +36,7 @@ logger = logging.getLogger("arb15m")
 
 
 # ----------------------------
-# Env helpers (supports both PM_* and POLYMARKET_*)
+# Env helpers
 # ----------------------------
 
 def _env(*keys: str, default: str = "") -> str:
@@ -103,7 +89,6 @@ def _env_json_list(*keys: str, default: List[str]) -> List[str]:
 class Settings:
     clob_host: str
     gamma_host: str
-    data_api_base: str
 
     chain_id: int
     signature_type: int
@@ -151,7 +136,6 @@ class Settings:
         return Settings(
             clob_host=_env("CLOB_HOST", "POLYMARKET_CLOB_HOST", default="https://clob.polymarket.com"),
             gamma_host=_env("GAMMA_HOST", "POLYMARKET_GAMMA_HOST", default="https://gamma-api.polymarket.com"),
-            data_api_base=_env("DATA_API_BASE", default="https://data-api.polymarket.com"),
 
             chain_id=_env_int("CHAIN_ID", "POLYMARKET_CHAIN_ID", default=137),
             signature_type=_env_int("PM_SIGNATURE_TYPE", "POLYMARKET_SIGNATURE_TYPE", default=2),
@@ -197,81 +181,7 @@ class Settings:
 
 
 # ----------------------------
-# Polymarket event page -> token IDs
-# ----------------------------
-
-def _extract_next_data_json(html: str) -> Dict[str, Any]:
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if not m:
-        raise RuntimeError("Could not find __NEXT_DATA__ in event page HTML")
-    return json.loads(m.group(1))
-
-
-def _dig_for_tokens(next_data: Dict[str, Any]) -> Tuple[str, List[str], List[str]]:
-    def walk(node: Any):
-        if isinstance(node, dict):
-            yield node
-            for v in node.values():
-                yield from walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                yield from walk(v)
-
-    market_id = ""
-    token_ids: List[str] = []
-    outcomes: List[str] = []
-
-    for d in walk(next_data):
-        if "clobTokenIds" in d and isinstance(d.get("clobTokenIds"), list):
-            tids = [str(x) for x in d["clobTokenIds"] if str(x).strip()]
-            if len(tids) >= 2:
-                token_ids = tids
-                if isinstance(d.get("outcomes"), list):
-                    outcomes = [str(x) for x in d["outcomes"]]
-                elif isinstance(d.get("outcomeNames"), list):
-                    outcomes = [str(x) for x in d["outcomeNames"]]
-                if isinstance(d.get("id"), str):
-                    market_id = d["id"]
-                break
-
-    if len(token_ids) < 2:
-        raise RuntimeError("Failed to extract CLOB token IDs from event page")
-
-    if not outcomes:
-        outcomes = ["Yes", "No"]
-
-    return market_id, token_ids, outcomes
-
-
-async def fetch_market_from_slug(slug: str) -> Dict[str, str]:
-    slug = slug.split("?")[0].strip()
-    url = f"https://polymarket.com/event/{slug}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        next_data = _extract_next_data_json(r.text)
-        market_id, token_ids, labels = _dig_for_tokens(next_data)
-
-    # normalize yes/no by label if available
-    yes_idx, no_idx = 0, 1
-    if len(labels) >= 2:
-        l0 = labels[0].strip().lower()
-        l1 = labels[1].strip().lower()
-        if l0 == "no" and l1 == "yes":
-            yes_idx, no_idx = 1, 0
-
-    return {
-        "slug": slug,
-        "market_id": market_id,
-        "yes_token_id": str(token_ids[yes_idx]),
-        "no_token_id": str(token_ids[no_idx]),
-        "yes_label": labels[yes_idx] if len(labels) > yes_idx else "Yes",
-        "no_label": labels[no_idx] if len(labels) > no_idx else "No",
-    }
-
-
-# ----------------------------
-# Slug discovery
+# Market helpers
 # ----------------------------
 
 def _bucket_start(ts: int, window_sec: int) -> int:
@@ -298,69 +208,103 @@ def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: in
     return dedup
 
 
-async def _find_slug_via_gamma(s: Settings, asset: str) -> Optional[str]:
+async def gamma_find_market_records_by_slug(gamma_host: str, slug: str) -> List[Dict[str, Any]]:
+    """
+    Gamma /markets returns a list of market records. We filter client-side by slug because
+    the API shape can vary.
+    """
+    url = f"{gamma_host.rstrip('/')}/markets"
+    params = {"closed": "false", "limit": 500}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        data = r.json()
+
+    if not isinstance(data, list):
+        return []
+    return [m for m in data if str(m.get("slug") or "").strip() == slug]
+
+
+def _extract_yes_no_from_gamma_record(m: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """
+    Gamma market records often include:
+      - clobTokenIds: [yes_token_id, no_token_id] (sometimes reversed)
+      - outcomes / outcomeNames: ["Yes","No"] etc
+    """
+    tids = m.get("clobTokenIds")
+    if not isinstance(tids, list) or len(tids) < 2:
+        return None
+    labels = m.get("outcomes") or m.get("outcomeNames") or ["Yes", "No"]
+    if not isinstance(labels, list) or len(labels) < 2:
+        labels = ["Yes", "No"]
+
+    # normalize by label when possible
+    yes_idx, no_idx = 0, 1
+    l0 = str(labels[0]).strip().lower()
+    l1 = str(labels[1]).strip().lower()
+    if l0 == "no" and l1 == "yes":
+        yes_idx, no_idx = 1, 0
+
+    return {
+        "slug": str(m.get("slug") or "").strip(),
+        "market_id": str(m.get("id") or ""),
+        "yes_token_id": str(tids[yes_idx]),
+        "no_token_id": str(tids[no_idx]),
+        "yes_label": str(labels[yes_idx]),
+        "no_label": str(labels[no_idx]),
+    }
+
+
+async def find_active_market_via_gamma(s: Settings, asset: str) -> Optional[Dict[str, str]]:
+    """
+    Best path: determine the active slug for asset/window and immediately return
+    token IDs from Gamma record (NOT from website scrape).
+    """
     minutes = int(s.window_sec / 60)
     pat = re.compile(rf"^{asset.lower()}-updown-{minutes}m-(\d+)$")
     url = f"{s.gamma_host.rstrip('/')}/markets"
     params = {"closed": "false", "limit": 500}
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-            data = r.json()
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        data = r.json()
 
-        if not isinstance(data, list):
-            return None
+    if not isinstance(data, list):
+        return None
 
-        now_ts = int(time.time())
-        cands: List[Tuple[int, str]] = []
+    now_ts = int(time.time())
+    candidates: List[Tuple[int, Dict[str, Any]]] = []
+    for m in data:
+        slug = str(m.get("slug") or "").strip()
+        mo = pat.match(slug)
+        if not mo:
+            continue
+        ts = int(mo.group(1))
+        # Prefer currently-open window
+        if now_ts < ts + s.window_sec:
+            candidates.append((ts, m))
+
+    # If none look "open", take newest matching
+    if not candidates:
         for m in data:
             slug = str(m.get("slug") or "").strip()
             mo = pat.match(slug)
-            if not mo:
-                continue
-            ts = int(mo.group(1))
-            if now_ts < ts + s.window_sec:
-                cands.append((ts, slug))
+            if mo:
+                candidates.append((int(mo.group(1)), m))
 
-        if not cands:
-            for m in data:
-                slug = str(m.get("slug") or "").strip()
-                mo = pat.match(slug)
-                if mo:
-                    cands.append((int(mo.group(1)), slug))
-
-        if not cands:
-            return None
-
-        cands.sort(key=lambda x: x[0], reverse=True)
-        return cands[0][1]
-    except Exception as e:
-        if s.debug:
-            logger.warning(f"Gamma lookup failed for {asset}: {e}")
+    if not candidates:
         return None
 
+    candidates.sort(key=lambda x: x[0], reverse=True)
 
-async def _find_slug_by_candidates(s: Settings, asset: str) -> Optional[str]:
-    now_ts = int(time.time())
-    candidates = _compute_candidate_slugs(asset, now_ts, s.window_sec, s.slug_scan_buckets_ahead, s.slug_scan_buckets_behind)
-    max_tries = min(s.max_slug_lookups, len(candidates))
-    for i in range(max_tries):
-        slug = candidates[i]
-        try:
-            info = await fetch_market_from_slug(slug)
-            return info["slug"]
-        except Exception:
-            continue
+    # Return first candidate that has clobTokenIds
+    for _, rec in candidates:
+        info = _extract_yes_no_from_gamma_record(rec)
+        if info and info.get("yes_token_id") and info.get("no_token_id"):
+            return info
+
     return None
-
-
-async def find_active_slug(s: Settings, asset: str) -> Optional[str]:
-    slug = await _find_slug_via_gamma(s, asset)
-    if slug:
-        return slug
-    return await _find_slug_by_candidates(s, asset)
 
 
 # ----------------------------
@@ -438,7 +382,6 @@ class PolymarketTrader:
             funder=funder,
         )
 
-        # If creds provided, use them; else derive them
         if self.s.api_key and self.s.api_secret and self.s.api_passphrase:
             c.set_api_creds(
                 {"apiKey": self.s.api_key, "secret": self.s.api_secret, "passphrase": self.s.api_passphrase}
@@ -449,13 +392,9 @@ class PolymarketTrader:
             c.set_api_creds(derived)
             logger.info("Derived API creds via private key.")
 
-        try:
-            logger.info(f"Wallet address: {c.get_address()}")
-            if funder:
-                logger.info(f"Funder: {funder}")
-        except Exception:
-            pass
-
+        logger.info(f"Wallet address: {c.get_address()}")
+        if funder:
+            logger.info(f"Funder: {funder}")
         return c
 
     def get_order_book(self, token_id: str) -> Dict[str, Any]:
@@ -528,6 +467,7 @@ class ArbBot:
         self.trader = PolymarketTrader(s)
 
         self._active: Dict[str, Dict[str, str]] = {}
+        self._invalid_until: Dict[str, float] = {}  # asset -> timestamp (cooldown on bad token ids)
         self._last_log = 0.0
         self._last_trade = 0.0
         self._trade_ts: List[float] = []
@@ -556,15 +496,21 @@ class ArbBot:
         return self.s.min_tte_select_sec <= tte <= self.s.max_tte_select_sec
 
     async def _refresh_market(self, asset: str) -> Optional[Dict[str, str]]:
-        slug = await find_active_slug(self.s, asset)
-        if not slug:
+        # backoff if we recently had invalid token ids (404 orderbook)
+        until = self._invalid_until.get(asset, 0.0)
+        if time.time() < until:
             return None
+
+        info = await find_active_market_via_gamma(self.s, asset)
+        if not info:
+            return None
+
         cached = self._active.get(asset)
-        if cached and cached.get("slug") == slug:
+        if cached and cached.get("slug") == info.get("slug") and cached.get("yes_token_id") == info.get("yes_token_id"):
             return cached
-        info = await fetch_market_from_slug(slug)
+
         self._active[asset] = info
-        logger.info(f"[{asset}] Active: {slug} | YES={info['yes_token_id']} NO={info['no_token_id']}")
+        logger.info(f"[{asset}] Active: {info['slug']} | YES={info['yes_token_id']} NO={info['no_token_id']}")
         return info
 
     def _pick_notional(self) -> float:
@@ -633,6 +579,14 @@ class ArbBot:
         try:
             yes_book, no_book = await self._books(yes_token, no_token)
         except Exception as e:
+            msg = str(e)
+            # Critical: if token IDs are wrong, CLOB throws 404 no orderbook exists.
+            # Mark invalid briefly, forcing gamma refresh next time.
+            if "No orderbook exists" in msg or "status_code=404" in msg:
+                logger.warning(f"[{asset}] Token IDs not orderbook-enabled. Forcing re-resolve in 10s. err={e}")
+                self._active.pop(asset, None)
+                self._invalid_until[asset] = time.time() + 10.0
+                return
             logger.warning(f"[{asset}] book fetch failed: {e}")
             return
 
@@ -669,7 +623,7 @@ class ArbBot:
             self._last_log = time.time()
             logger.info(
                 f"[{asset}] edge={edge:.4f} total={total_cost:.4f} shares={shares:.0f} "
-                f"YES@{yes_worst:.4f} NO@{no_worst:.4f} tte={self._tte(now_ts)}s"
+                f"YES@{yes_worst:.4f} NO@{no_worst:.4f} tte={self._tte(now_ts)}s slug={market.get('slug')}"
             )
 
         await self._execute_paired(asset, yes_token, no_token, shares, yes_worst, no_worst)
@@ -685,7 +639,6 @@ class ArbBot:
             yes_oid = None
             no_oid = None
             try:
-                # Place both orders concurrently (best alternative to missing batch post)
                 r_yes_task = asyncio.to_thread(self.trader.place_limit_buy_fok, yes_token, shares, yes_price)
                 r_no_task = asyncio.to_thread(self.trader.place_limit_buy_fok, no_token, shares, no_price)
                 r_yes, r_no = await asyncio.gather(r_yes_task, r_no_task)
@@ -709,10 +662,8 @@ class ArbBot:
                     logger.info(f"[{asset}] ✅ Paired fill | YES={yes_oid} NO={no_oid} shares={shares:.0f}")
                     return
 
-                # cancel both
                 await asyncio.gather(self._cancel(yes_oid), self._cancel(no_oid))
 
-                # unwind any filled leg(s)
                 if self.s.sell_opposite:
                     yes_book, no_book = await self._books(yes_token, no_token)
                     if y_fill > 0 and n_fill <= 0:
