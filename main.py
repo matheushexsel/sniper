@@ -89,6 +89,7 @@ def _env_json_list(*keys: str, default: List[str]) -> List[str]:
 class Settings:
     clob_host: str
     gamma_host: str
+    data_api_base: str
 
     chain_id: int
     signature_type: int
@@ -128,20 +129,25 @@ class Settings:
 
     sell_opposite: bool
 
+    max_slug_lookups: int
+    slug_scan_buckets_ahead: int
+    slug_scan_buckets_behind: int
+
     @staticmethod
     def load() -> "Settings":
         return Settings(
-            clob_host=_env("CLOB_HOST", "POLYMARKET_CLOB_HOST", default="https://clob.polymarket.com"),
-            gamma_host=_env("GAMMA_HOST", "POLYMARKET_GAMMA_HOST", default="https://gamma-api.polymarket.com"),
+            clob_host=_env("CLOB_HOST", default="https://clob.polymarket.com"),
+            gamma_host=_env("GAMMA_HOST", default="https://gamma-api.polymarket.com"),
+            data_api_base=_env("DATA_API_BASE", default="https://data-api.polymarket.com"),
 
-            chain_id=_env_int("CHAIN_ID", "POLYMARKET_CHAIN_ID", default=137),
-            signature_type=_env_int("PM_SIGNATURE_TYPE", "POLYMARKET_SIGNATURE_TYPE", default=2),
+            chain_id=_env_int("CHAIN_ID", default=137),
+            signature_type=_env_int("PM_SIGNATURE_TYPE", default=2),
             private_key=_env("PM_PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY", default=""),
-            funder=_env("PM_FUNDER", "POLYMARKET_FUNDER", default=""),
+            funder=_env("PM_FUNDER", default=""),
 
-            api_key=_env("PM_API_KEY", "POLYMARKET_API_KEY", default=""),
-            api_secret=_env("PM_API_SECRET", "POLYMARKET_API_SECRET", default=""),
-            api_passphrase=_env("PM_API_PASSPHRASE", "POLYMARKET_API_PASSPHRASE", default=""),
+            api_key=_env("PM_API_KEY", default=""),
+            api_secret=_env("PM_API_SECRET", default=""),
+            api_passphrase=_env("PM_API_PASSPHRASE", default=""),
 
             window_sec=_env_int("WINDOW_SEC", default=900),
             arm_before_boundary_sec=_env_int("ARM_BEFORE_BOUNDARY_SEC", default=900),
@@ -171,92 +177,208 @@ class Settings:
             max_retries=_env_int("MAX_RETRIES", default=3),
 
             sell_opposite=_env_bool("SELL_OPPOSITE", default=True),
+
+            max_slug_lookups=_env_int("MAX_SLUG_LOOKUPS", default=50),
+            slug_scan_buckets_ahead=_env_int("SLUG_SCAN_BUCKETS_AHEAD", default=12),
+            slug_scan_buckets_behind=_env_int("SLUG_SCAN_BUCKETS_BEHIND", default=12),
         )
 
 
 # ----------------------------
-# Time helpers
+# Time + slug helpers
 # ----------------------------
 
 def _bucket_start(ts: int, window_sec: int) -> int:
     return (ts // window_sec) * window_sec
 
 
+def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: int, behind: int) -> List[str]:
+    asset_l = asset.lower()
+    minutes = int(window_sec / 60)
+    base = _bucket_start(now_ts, window_sec)
+
+    out: List[str] = []
+    for off in range(-behind, ahead + 1):
+        start_ts = base + off * window_sec
+        out.append(f"{asset_l}-updown-{minutes}m-{start_ts}")
+        out.append(f"{asset_l}-updown-{minutes}m-{start_ts + window_sec}")
+
+    seen = set()
+    dedup: List[str] = []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            dedup.append(s)
+    return dedup
+
+
 # ----------------------------
-# Gamma market resolution (authoritative token IDs)
+# Data API discovery (authoritative for finding the markets)
 # ----------------------------
 
-def _extract_yes_no_from_gamma_record(m: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    tids = m.get("clobTokenIds")
-    if not isinstance(tids, list) or len(tids) < 2:
-        return None
-
-    labels = m.get("outcomes") or m.get("outcomeNames") or ["Yes", "No"]
-    if not isinstance(labels, list) or len(labels) < 2:
-        labels = ["Yes", "No"]
-
-    yes_idx, no_idx = 0, 1
-    l0 = str(labels[0]).strip().lower()
-    l1 = str(labels[1]).strip().lower()
-    if l0 == "no" and l1 == "yes":
-        yes_idx, no_idx = 1, 0
-
-    return {
-        "slug": str(m.get("slug") or "").strip(),
-        "market_id": str(m.get("id") or ""),
-        "yes_token_id": str(tids[yes_idx]),
-        "no_token_id": str(tids[no_idx]),
-        "yes_label": str(labels[yes_idx]),
-        "no_label": str(labels[no_idx]),
-    }
-
-
-async def find_active_market_via_gamma(s: Settings, asset: str) -> Optional[Dict[str, str]]:
+async def data_api_search_slugs(s: Settings, asset: str) -> List[str]:
+    """
+    Uses data-api.polymarket.com to discover active up/down 15m market slugs.
+    Data API is the right place to search; Gamma /markets list is paginated and not reliable to brute-scan.
+    """
+    asset_u = asset.upper()
     minutes = int(s.window_sec / 60)
+
+    # We try a few queries because the data API search endpoint shape can vary.
+    # We'll attempt /markets?search= first; if it fails, fallback to /search.
+    queries = [
+        f"{asset_u} up/down {minutes}m",
+        f"{asset_u} updown {minutes}m",
+        f"{asset_u} {minutes}m up/down",
+        f"{asset_u} updown",
+    ]
+
+    slugs: List[str] = []
+    async with httpx.AsyncClient(timeout=20) as client:
+        for q in queries:
+            # attempt common patterns
+            for path, params in [
+                ("/markets", {"search": q, "limit": 200}),
+                ("/markets", {"query": q, "limit": 200}),
+                ("/search", {"q": q, "limit": 200}),
+            ]:
+                url = s.data_api_base.rstrip("/") + path
+                try:
+                    r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+                    if r.status_code >= 400:
+                        continue
+                    data = r.json()
+                except Exception:
+                    continue
+
+                # normalize possible response shapes into a list of dicts
+                items: List[Dict[str, Any]] = []
+                if isinstance(data, list):
+                    items = [x for x in data if isinstance(x, dict)]
+                elif isinstance(data, dict):
+                    for key in ("markets", "data", "results", "items"):
+                        v = data.get(key)
+                        if isinstance(v, list):
+                            items = [x for x in v if isinstance(x, dict)]
+                            break
+
+                if not items:
+                    continue
+
+                for it in items:
+                    slug = str(it.get("slug") or it.get("market_slug") or "").strip()
+                    if slug:
+                        slugs.append(slug)
+
+    # keep only what looks like updown-{minutes}m-{ts}
     pat = re.compile(rf"^{asset.lower()}-updown-{minutes}m-(\d+)$")
-    url = f"{s.gamma_host.rstrip('/')}/markets"
-    params = {"closed": "false", "limit": 500}
+    filtered = [x for x in slugs if pat.match(x)]
+    # de-dupe
+    out: List[str] = []
+    seen = set()
+    for x in filtered:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        data = r.json()
 
-    if not isinstance(data, list):
+def pick_best_slug_for_now(slugs: List[str], asset: str, window_sec: int) -> Optional[str]:
+    if not slugs:
         return None
-
+    minutes = int(window_sec / 60)
+    pat = re.compile(rf"^{asset.lower()}-updown-{minutes}m-(\d+)$")
     now_ts = int(time.time())
 
-    candidates: List[Tuple[int, Dict[str, Any]]] = []
-    for m in data:
-        slug = str(m.get("slug") or "").strip()
-        mo = pat.match(slug)
-        if not mo:
+    scored: List[Tuple[int, str]] = []
+    for s in slugs:
+        m = pat.match(s)
+        if not m:
             continue
-        ts = int(mo.group(1))
-        # prefer current open window
-        if now_ts < ts + s.window_sec:
-            candidates.append((ts, m))
+        ts = int(m.group(1))
+        # prefer the current (open) window: now < ts + window
+        is_open = 1 if now_ts < ts + window_sec else 0
+        # closer start to now is better
+        dist = abs(now_ts - ts)
+        score = is_open * 10_000_000 - dist  # open dominates
+        scored.append((score, s))
 
-    if not candidates:
-        # fallback: newest matching
-        for m in data:
-            slug = str(m.get("slug") or "").strip()
-            mo = pat.match(slug)
-            if mo:
-                candidates.append((int(mo.group(1)), m))
-
-    if not candidates:
+    if not scored:
         return None
+    scored.sort(reverse=True)
+    return scored[0][1]
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
 
-    for _, rec in candidates:
-        info = _extract_yes_no_from_gamma_record(rec)
-        if info and info.get("yes_token_id") and info.get("no_token_id"):
-            return info
+# ----------------------------
+# Token resolution
+# ----------------------------
 
-    return None
+def _extract_next_data_json(html: str) -> Dict[str, Any]:
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if not m:
+        raise RuntimeError("Could not find __NEXT_DATA__ in event page HTML")
+    return json.loads(m.group(1))
+
+
+def _dig_for_tokens(next_data: Dict[str, Any]) -> Tuple[str, List[str], List[str]]:
+    def walk(node: Any):
+        if isinstance(node, dict):
+            yield node
+            for v in node.values():
+                yield from walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                yield from walk(v)
+
+    market_id = ""
+    token_ids: List[str] = []
+    outcomes: List[str] = []
+
+    for d in walk(next_data):
+        if "clobTokenIds" in d and isinstance(d.get("clobTokenIds"), list):
+            tids = [str(x) for x in d["clobTokenIds"] if str(x).strip()]
+            if len(tids) >= 2:
+                token_ids = tids
+                if isinstance(d.get("outcomes"), list):
+                    outcomes = [str(x) for x in d["outcomes"]]
+                elif isinstance(d.get("outcomeNames"), list):
+                    outcomes = [str(x) for x in d["outcomeNames"]]
+                if isinstance(d.get("id"), str):
+                    market_id = d["id"]
+                break
+
+    if len(token_ids) < 2:
+        raise RuntimeError("Failed to extract CLOB token IDs from event page")
+
+    if not outcomes:
+        outcomes = ["Yes", "No"]
+
+    return market_id, token_ids, outcomes
+
+
+async def tokens_from_event_page(slug: str) -> Dict[str, str]:
+    url = f"https://polymarket.com/event/{slug}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        next_data = _extract_next_data_json(r.text)
+        market_id, token_ids, labels = _dig_for_tokens(next_data)
+
+    yes_idx, no_idx = 0, 1
+    if len(labels) >= 2:
+        l0 = labels[0].strip().lower()
+        l1 = labels[1].strip().lower()
+        if l0 == "no" and l1 == "yes":
+            yes_idx, no_idx = 1, 0
+
+    return {
+        "slug": slug,
+        "market_id": market_id,
+        "yes_token_id": str(token_ids[yes_idx]),
+        "no_token_id": str(token_ids[no_idx]),
+        "yes_label": labels[yes_idx] if len(labels) > yes_idx else "Yes",
+        "no_label": labels[no_idx] if len(labels) > no_idx else "No",
+    }
 
 
 # ----------------------------
@@ -335,9 +457,7 @@ class PolymarketTrader:
         )
 
         if self.s.api_key and self.s.api_secret and self.s.api_passphrase:
-            c.set_api_creds(
-                {"apiKey": self.s.api_key, "secret": self.s.api_secret, "passphrase": self.s.api_passphrase}
-            )
+            c.set_api_creds({"apiKey": self.s.api_key, "secret": self.s.api_secret, "passphrase": self.s.api_passphrase})
             logger.info("Configured API creds from env.")
         else:
             derived = c.create_or_derive_api_creds()
@@ -447,21 +567,42 @@ class ArbBot:
             return False
         return self.s.min_tte_select_sec <= tte <= self.s.max_tte_select_sec
 
-    async def _refresh_market(self, asset: str) -> Optional[Dict[str, str]]:
+    async def _resolve_market(self, asset: str) -> Optional[Dict[str, str]]:
         until = self._invalid_until.get(asset, 0.0)
         if time.time() < until:
-            if self.s.debug:
-                logger.info(f"[{asset}] market refresh blocked until {until:.0f}")
             return None
 
+        # 1) Data API search
         try:
-            info = await find_active_market_via_gamma(self.s, asset)
+            slugs = await data_api_search_slugs(self.s, asset)
         except Exception as e:
-            logger.warning(f"[{asset}] gamma resolution failed: {e}")
+            logger.warning(f"[{asset}] data-api search failed: {e}")
+            slugs = []
+
+        slug = pick_best_slug_for_now(slugs, asset, self.s.window_sec)
+        if not slug:
+            # 2) fallback: brute candidate generation and test by fetching event page
+            now_ts = int(time.time())
+            cands = _compute_candidate_slugs(asset, now_ts, self.s.window_sec, self.s.slug_scan_buckets_ahead, self.s.slug_scan_buckets_behind)
+            cands = cands[: min(len(cands), self.s.max_slug_lookups)]
+            for c in cands:
+                try:
+                    info = await tokens_from_event_page(c)
+                    slug = info["slug"]
+                    self._active[asset] = info
+                    logger.info(f"[{asset}] Active (fallback): {slug} | YES={info['yes_token_id']} NO={info['no_token_id']}")
+                    return info
+                except Exception:
+                    continue
+
+            logger.warning(f"[{asset}] could not find any candidate slug (data-api empty + fallback failed).")
             return None
 
-        if not info:
-            logger.warning(f"[{asset}] gamma returned no active market (slug not found).")
+        # 3) token ids from event page (robust + avoids gamma pagination issues)
+        try:
+            info = await tokens_from_event_page(slug)
+        except Exception as e:
+            logger.warning(f"[{asset}] event-page token lookup failed for slug={slug}: {e}")
             return None
 
         cached = self._active.get(asset)
@@ -524,25 +665,13 @@ class ArbBot:
     async def try_trade(self, asset: str) -> None:
         now_ts = int(time.time())
         tte = self._tte(now_ts)
-        armed = self._armed(now_ts)
-        tradeable = self._tradeable(now_ts)
 
-        if self.s.debug:
-            if not armed or not tradeable:
-                logger.info(f"[{asset}] skip gates | armed={armed} tradeable={tradeable} tte={tte}")
-
-        if not armed or not tradeable:
+        if not self._armed(now_ts) or not self._tradeable(now_ts):
             return
-        if not self._trades_per_min_ok():
-            if self.s.debug:
-                logger.info(f"[{asset}] skip rate-limit | trades_last_min={len(self._trade_ts)}")
-            return
-        if not self._cooldown_ok():
-            if self.s.debug:
-                logger.info(f"[{asset}] skip cooldown")
+        if not self._trades_per_min_ok() or not self._cooldown_ok():
             return
 
-        market = await self._refresh_market(asset)
+        market = await self._resolve_market(asset)
         if not market:
             return
 
@@ -564,8 +693,6 @@ class ArbBot:
         yes_best = _best_ask(yes_book)
         no_best = _best_ask(no_book)
         if not yes_best or not no_best:
-            if self.s.debug:
-                logger.info(f"[{asset}] no top-of-book liquidity (asks empty).")
             return
 
         yes_best_p, _ = yes_best
@@ -580,8 +707,6 @@ class ArbBot:
         yes_worst = _walk_asks_for_size(yes_book, shares)
         no_worst = _walk_asks_for_size(no_book, shares)
         if yes_worst is None or no_worst is None:
-            if self.s.debug:
-                logger.info(f"[{asset}] insufficient ask depth for shares={shares:.0f}")
             return
 
         if not _slippage_ok(yes_best_p, yes_worst, self.s.max_slippage):
