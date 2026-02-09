@@ -10,7 +10,6 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -224,21 +223,18 @@ def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: in
 
 
 # ----------------------------
-# Polymarket event page resolver (the working approach)
+# Polymarket event page resolver (working approach)
 # ----------------------------
 
 _NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
 
+
 async def fetch_market_from_event_page(slug: str) -> Dict[str, Any]:
-    """
-    Fetch https://polymarket.com/event/<slug> and extract market object containing clobTokenIds.
-    This matches the approach from the repo you uploaded.
-    """
     slug = slug.split("?")[0].strip()
     url = f"https://polymarket.com/event/{slug}"
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         html = r.text
@@ -257,7 +253,6 @@ async def fetch_market_from_event_page(slug: str) -> Dict[str, Any]:
 
     market_obj: Optional[Dict[str, Any]] = None
 
-    # Scan dehydrated queries for a dict with "markets"
     for q in queries:
         data = q.get("state", {}).get("data")
         if isinstance(data, dict) and "markets" in data and isinstance(data["markets"], list):
@@ -278,7 +273,6 @@ def extract_yes_no_tokens_from_market(market_obj: Dict[str, Any], slug: str) -> 
     clob_tokens = market_obj.get("clobTokenIds") or market_obj.get("clob_token_ids") or []
     outcomes = market_obj.get("outcomes") or market_obj.get("outcomeNames") or []
 
-    # clobTokenIds sometimes arrives as JSON-string list
     if isinstance(clob_tokens, str):
         try:
             clob_tokens = json.loads(clob_tokens)
@@ -291,7 +285,6 @@ def extract_yes_no_tokens_from_market(market_obj: Dict[str, Any], slug: str) -> 
     if not isinstance(outcomes, list) or len(outcomes) < 2:
         outcomes = ["Yes", "No"]
 
-    # Prefer YES/NO mapping if outcomes literally include yes/no; otherwise keep index order stable
     yes_idx, no_idx = 0, 1
     l0 = str(outcomes[0]).strip().lower()
     l1 = str(outcomes[1]).strip().lower()
@@ -309,8 +302,56 @@ def extract_yes_no_tokens_from_market(market_obj: Dict[str, Any], slug: str) -> 
 
 
 # ----------------------------
-# Orderbook helpers
+# Orderbook normalization + helpers
 # ----------------------------
+
+def _book_to_dict(book: Any) -> Dict[str, Any]:
+    """
+    py_clob_client may return:
+      - dict with {asks:[{price,size}], bids:[...]}
+      - OrderBookSummary object with .asks/.bids
+      - pydantic model with .dict() / .model_dump()
+    Normalize to: {"asks":[{"price":..,"size":..}], "bids":[...]}
+    """
+    if book is None:
+        return {"asks": [], "bids": []}
+
+    if isinstance(book, dict):
+        return {"asks": book.get("asks") or [], "bids": book.get("bids") or []}
+
+    for m in ("model_dump", "dict"):
+        if hasattr(book, m):
+            try:
+                d = getattr(book, m)()
+                if isinstance(d, dict):
+                    return {"asks": d.get("asks") or [], "bids": d.get("bids") or []}
+            except Exception:
+                pass
+
+    asks = getattr(book, "asks", None) or []
+    bids = getattr(book, "bids", None) or []
+
+    def _lvls(x: Any) -> List[Dict[str, float]]:
+        out: List[Dict[str, float]] = []
+        for lvl in (x or []):
+            if isinstance(lvl, dict):
+                try:
+                    out.append({"price": float(lvl["price"]), "size": float(lvl["size"])})
+                except Exception:
+                    continue
+            else:
+                p = getattr(lvl, "price", None)
+                s = getattr(lvl, "size", None)
+                if p is None or s is None:
+                    continue
+                try:
+                    out.append({"price": float(p), "size": float(s)})
+                except Exception:
+                    continue
+        return out
+
+    return {"asks": _lvls(asks), "bids": _lvls(bids)}
+
 
 def _best_ask(book: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     asks = book.get("asks") or []
@@ -396,7 +437,7 @@ class PolymarketTrader:
             logger.info(f"Funder: {funder}")
         return c
 
-    def get_order_book(self, token_id: str) -> Dict[str, Any]:
+    def get_order_book(self, token_id: str) -> Any:
         return self.client.get_order_book(token_id)
 
     def get_order(self, order_id: str) -> Dict[str, Any]:
@@ -495,19 +536,16 @@ class ArbBot:
         return self.s.min_tte_select_sec <= tte <= self.s.max_tte_select_sec
 
     async def _validate_orderbooks(self, yes_token: str, no_token: str) -> bool:
-        """
-        Hard validation: if either token has no orderbook, skip this slug.
-        This kills the exact failure you keep hitting.
-        """
         try:
-            await asyncio.to_thread(self.trader.get_order_book, yes_token)
-            await asyncio.to_thread(self.trader.get_order_book, no_token)
+            y = await asyncio.to_thread(self.trader.get_order_book, yes_token)
+            n = await asyncio.to_thread(self.trader.get_order_book, no_token)
+            _book_to_dict(y)
+            _book_to_dict(n)
             return True
         except Exception as e:
             msg = str(e)
             if "No orderbook exists" in msg or "status_code=404" in msg:
                 return False
-            # Other errors: treat as transient failure
             raise
 
     async def _resolve_market(self, asset: str) -> Optional[Dict[str, str]]:
@@ -543,7 +581,6 @@ class ArbBot:
                 continue
 
         logger.warning(f"[{asset}] could not resolve any active market via event-page resolver (last_err={last_err}).")
-        # don’t hammer the site
         self._invalid_until[asset] = time.time() + max(3.0, self.s.poll_sec)
         return None
 
@@ -558,7 +595,8 @@ class ArbBot:
     async def _books(self, yes_token: str, no_token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         t1 = asyncio.to_thread(self.trader.get_order_book, yes_token)
         t2 = asyncio.to_thread(self.trader.get_order_book, no_token)
-        return await asyncio.gather(t1, t2)
+        y_raw, n_raw = await asyncio.gather(t1, t2)
+        return _book_to_dict(y_raw), _book_to_dict(n_raw)
 
     async def _wait_terminal(self, oid: str, timeout: float) -> Dict[str, Any]:
         deadline = time.time() + timeout
