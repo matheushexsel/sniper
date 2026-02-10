@@ -186,31 +186,95 @@ def _bucket_start(ts: int, window_sec: int) -> int:
 # Gamma API Market Discovery (Polymarket's market data API)
 # ----------------------------
 
-async def fetch_market_by_slug_gamma(slug: str) -> Optional[Dict[str, Any]]:
-    """Fetch a specific market by slug from Gamma API"""
-    url = f"https://gamma-api.polymarket.com/markets/{slug}"
+async def fetch_active_crypto_markets() -> List[Dict[str, Any]]:
+    """Fetch active crypto markets from Gamma API"""
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {
+        "active": "true",
+        "closed": "false",
+        "limit": "100",
+        "order": "end_date",
+        "ascending": "true"
+    }
     
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url)
-            if r.status_code == 404:
-                return None
+            r = await client.get(url, params=params)
             r.raise_for_status()
             return r.json()
     except Exception as e:
-        logger.warning(f"Gamma API error for slug {slug}: {e}")
+        logger.error(f"Gamma API error: {e}")
+        return []
+
+
+def find_15min_market_in_list(markets: List[Dict[str, Any]], asset: str, now_ts: int, window_sec: int) -> Optional[Dict[str, Any]]:
+    """Find the current 15-minute UP/DOWN market from Gamma markets list"""
+    asset_upper = asset.upper()
+    current_bucket_start = _bucket_start(now_ts, window_sec)
+    current_bucket_end = current_bucket_start + window_sec
+    
+    # Look for markets ending in the current or next window
+    min_end = current_bucket_start - 900  # 15 min before
+    max_end = current_bucket_end + 1800   # 30 min after
+    
+    candidates = []
+    
+    for market in markets:
+        try:
+            question = market.get("question", "")
+            
+            # Must contain "Up or Down" and asset name
+            if "up or down" not in question.lower():
+                continue
+            if asset_upper not in question.upper():
+                continue
+            
+            # Must be 15-minute (not hourly/daily)
+            if "15m" not in question.lower() and "11:" not in question and "12:" not in question:
+                # Check if it mentions specific 15-minute time ranges
+                # e.g., "11:00AM-11:15AM" or "February 10, 11-11:15AM"
+                has_15min_range = False
+                import re
+                # Look for patterns like "11:00AM-11:15AM" or "11-11:15AM"
+                if re.search(r'\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)\s*-\s*\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)', question):
+                    has_15min_range = True
+                elif re.search(r'\d{1,2}-\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)', question):
+                    has_15min_range = True
+                
+                if not has_15min_range:
+                    continue
+            
+            # Check end time
+            end_date = market.get("endDate") or market.get("end_date_iso")
+            if not end_date:
+                continue
+            
+            try:
+                import dateutil.parser
+                end_ts = int(dateutil.parser.parse(end_date).timestamp())
+                if min_end <= end_ts <= max_end:
+                    candidates.append((end_ts, market))
+            except Exception:
+                continue
+                
+        except Exception:
+            continue
+    
+    if not candidates:
         return None
+    
+    # Sort by end time, prefer closest to current bucket end
+    candidates.sort(key=lambda x: abs(x[0] - current_bucket_end))
+    return candidates[0][1]
 
 
 def extract_tokens_from_gamma_market(market: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """Extract UP/DOWN token IDs from Gamma market response"""
     try:
-        # Gamma returns clobTokenIds as a list
         clob_tokens = market.get("clobTokenIds", [])
         outcomes = market.get("outcomes", [])
         
         if len(clob_tokens) < 2 or len(outcomes) < 2:
-            logger.warning(f"Market missing tokens or outcomes: tokens={len(clob_tokens)}, outcomes={len(outcomes)}")
             return None
         
         # UP is typically index 0, DOWN is index 1
@@ -223,37 +287,19 @@ def extract_tokens_from_gamma_market(market: Dict[str, Any]) -> Optional[Dict[st
             if "down" in l0 and "up" in l1:
                 up_idx, down_idx = 1, 0
         
-        end_date_iso = market.get("endDate") or market.get("end_date_iso")
+        end_date = market.get("endDate") or market.get("end_date_iso")
         
         return {
             "slug": market.get("slug", ""),
             "question": market.get("question", ""),
             "up_token_id": str(clob_tokens[up_idx]),
             "down_token_id": str(clob_tokens[down_idx]),
-            "end_date_iso": end_date_iso,
-            "enable_order_book": market.get("enableOrderBook", False),
+            "end_date_iso": end_date,
+            "enable_order_book": market.get("enableOrderBook", True),
         }
     except Exception as e:
-        logger.warning(f"Failed to extract tokens from Gamma market: {e}")
+        logger.warning(f"Failed to extract tokens from market: {e}")
         return None
-
-
-def generate_slug_candidates(asset: str, now_ts: int, window_sec: int) -> List[str]:
-    """Generate slug candidates for current and nearby 15-minute windows"""
-    asset_lower = asset.lower()
-    minutes = window_sec // 60
-    
-    # Current bucket
-    current_bucket_start = _bucket_start(now_ts, window_sec)
-    
-    # Generate slugs for current +/- 2 windows
-    slugs = []
-    for offset in range(-2, 4):  # -2, -1, 0, 1, 2, 3
-        bucket_start = current_bucket_start + (offset * window_sec)
-        slug = f"{asset_lower}-updown-{minutes}m-{bucket_start}"
-        slugs.append(slug)
-    
-    return slugs
 
 
 # ----------------------------
@@ -535,73 +581,66 @@ class MomentumBot:
 
         now_ts = int(time.time())
         
-        # Generate candidate slugs
-        slugs = generate_slug_candidates(self.s.asset, now_ts, self.s.window_sec)
-        logger.info(f"🔍 Checking {len(slugs)} slug candidates: {slugs[:3]}...")
+        # Fetch all active markets
+        markets = await fetch_active_crypto_markets()
+        logger.info(f"🔍 Fetched {len(markets)} active markets from Gamma")
         
-        # Try each slug until we find a valid market
-        for slug in slugs:
-            try:
-                market = await fetch_market_by_slug_gamma(slug)
-                if not market:
-                    continue
-                
-                # Extract token IDs
-                info = extract_tokens_from_gamma_market(market)
-                if not info:
-                    continue
-                
-                # Check if orderbook is enabled
-                if not info.get("enable_order_book"):
-                    logger.warning(f"Market {slug} has orderbook disabled")
-                    continue
-                
-                # Validate it's an active UP/DOWN market
-                ok = await self._validate_updown_market(info["up_token_id"], info["down_token_id"], slug)
-                if not ok:
-                    continue
-                
-                # Parse end time
-                try:
-                    import dateutil.parser
-                    t_end = int(dateutil.parser.parse(info["end_date_iso"]).timestamp())
-                except Exception:
-                    logger.warning(f"Failed to parse end_date_iso: {info.get('end_date_iso')}")
-                    continue
-                
-                t_start = t_end - self.s.window_sec
-                
-                # Check if this is the same market
-                if self._current_state:
-                    if (self._current_state.up_token_id == info["up_token_id"] and 
-                        self._current_state.down_token_id == info["down_token_id"]):
-                        self._invalid_until = time.time() + self.s.resolve_cache_sec
-                        return self._current_state
-                
-                # New market found
-                state = MarketState(
-                    slug=slug,
-                    up_token_id=info["up_token_id"],
-                    down_token_id=info["down_token_id"],
-                    t_start=t_start,
-                    t_end=t_end,
-                )
-                
-                logger.info(f"🎯 NEW MARKET: {slug}")
-                logger.info(f"   UP={info['up_token_id'][:16]}... DOWN={info['down_token_id'][:16]}...")
-                logger.info(f"   Start: {t_start} | End: {t_end}")
-                
-                self._current_state = state
+        # Find the current 15-minute UP/DOWN market
+        market = find_15min_market_in_list(markets, self.s.asset, now_ts, self.s.window_sec)
+        
+        if not market:
+            logger.warning(f"[{self.s.asset}] No 15-minute UP/DOWN market found")
+            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+            return None
+        
+        # Extract token IDs
+        info = extract_tokens_from_gamma_market(market)
+        if not info:
+            logger.warning(f"[{self.s.asset}] Failed to extract tokens from market")
+            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+            return None
+        
+        # Validate orderbooks
+        ok = await self._validate_updown_market(info["up_token_id"], info["down_token_id"], info["question"])
+        if not ok:
+            logger.warning(f"[{self.s.asset}] Market validation failed")
+            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+            return None
+        
+        # Parse end time
+        try:
+            import dateutil.parser
+            t_end = int(dateutil.parser.parse(info["end_date_iso"]).timestamp())
+        except Exception:
+            logger.warning(f"Failed to parse end_date_iso: {info.get('end_date_iso')}")
+            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+            return None
+        
+        t_start = t_end - self.s.window_sec
+        
+        # Check if same market
+        if self._current_state:
+            if (self._current_state.up_token_id == info["up_token_id"] and 
+                self._current_state.down_token_id == info["down_token_id"]):
                 self._invalid_until = time.time() + self.s.resolve_cache_sec
-                return state
-                
-            except Exception as e:
-                logger.warning(f"Error checking slug {slug}: {e}")
-                continue
+                return self._current_state
         
-        logger.warning(f"[{self.s.asset}] No valid 15-minute market found")
-        self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
-        return None
+        # New market found
+        state = MarketState(
+            slug=info["slug"],
+            up_token_id=info["up_token_id"],
+            down_token_id=info["down_token_id"],
+            t_start=t_start,
+            t_end=t_end,
+        )
+        
+        logger.info(f"🎯 NEW MARKET: {info['question'][:80]}")
+        logger.info(f"   UP={info['up_token_id'][:16]}... DOWN={info['down_token_id'][:16]}...")
+        logger.info(f"   Start: {t_start} | End: {t_end}")
+        
+        self._current_state = state
+        self._invalid_until = time.time() + self.s.resolve_cache_sec
+        return state
 
     async def _books(self, up_token: str, down_token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         t1 = asyncio.to_thread(self.trader.get_order_book, up_token)
