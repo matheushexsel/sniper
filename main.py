@@ -213,6 +213,13 @@ def find_15min_updown_market(markets: List[Dict[str, Any]], asset: str, now_ts: 
     min_end = current_bucket_start - 1800  # 30 min before
     max_end = current_bucket_end + 1800    # 30 min after
     
+    # DEBUG: Log all markets we're examining
+    logger.info(f"DEBUG: Looking for {asset_upper} 15-min market. Current window: [{current_bucket_start}, {current_bucket_end}]")
+    for i, market in enumerate(markets[:10]):  # Show first 10
+        q = market.get("question", "")
+        end = market.get("end_date_iso", "N/A")
+        logger.info(f"  Market {i}: '{q[:80]}' | end={end}")
+    
     candidates = []
     
     for market in markets:
@@ -236,17 +243,23 @@ def find_15min_updown_market(markets: List[Dict[str, Any]], asset: str, now_ts: 
                     end_ts = int(dateutil.parser.parse(end_date_iso).timestamp())
                     if min_end <= end_ts <= max_end:
                         candidates.append((end_ts, market))
-                except Exception:
+                        logger.info(f"✅ CANDIDATE: '{question[:60]}' | end_ts={end_ts}")
+                except Exception as e:
+                    logger.warning(f"Failed to parse end_date_iso '{end_date_iso}': {e}")
                     continue
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Error processing market: {e}")
             continue
     
     if not candidates:
+        logger.warning(f"No candidates found for {asset_upper} 15-minute market")
         return None
     
     # Sort by end time, prefer the one closest to current bucket end
     candidates.sort(key=lambda x: abs(x[0] - current_bucket_end))
-    return candidates[0][1]
+    selected = candidates[0][1]
+    logger.info(f"🎯 SELECTED: '{selected.get('question', '')[:80]}'")
+    return selected
 
 
 def extract_tokens_from_clob_market(market: Dict[str, Any]) -> Optional[Dict[str, str]]:
