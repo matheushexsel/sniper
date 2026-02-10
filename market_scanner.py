@@ -1,3 +1,4 @@
+# market_scanner.py
 """
 Polymarket Market Scanner
 
@@ -7,6 +8,7 @@ Scans for temperature markets settling within 48 hours
 import httpx
 import logging
 import re
+import json  # Added for clob_token_ids parsing
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import dateutil.parser
@@ -153,6 +155,14 @@ class MarketScanner:
                         
                         # Extract token IDs - handle both possible field names
                         clob_token_ids = market.get("clobTokenIds") or market.get("clob_token_ids") or []
+                        
+                        # Parse if it's a JSON string
+                        if isinstance(clob_token_ids, str):
+                            try:
+                                clob_token_ids = json.loads(clob_token_ids)
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Failed to parse clob_token_ids as JSON: {e} - Raw: {clob_token_ids}")
+                                clob_token_ids = []
                         
                         # Basic validation - just check they exist
                         if not clob_token_ids or len(clob_token_ids) < 2:
