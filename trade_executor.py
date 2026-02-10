@@ -44,16 +44,35 @@ class TradeExecutor:
         Returns:
             Dict with yes_price, no_price, yes_token_id, no_token_id
         """
+        import json
+        
         clob_token_ids = market.get("clob_token_ids", [])
         outcomes = market.get("outcomes", [])
         
+        # Handle case where clob_token_ids might be a JSON string instead of a list
+        if isinstance(clob_token_ids, str):
+            try:
+                clob_token_ids = json.loads(clob_token_ids)
+            except:
+                logger.error(f"Failed to parse clob_token_ids string: {clob_token_ids[:100]}")
+                return None
+        
         # Basic validation
-        if len(clob_token_ids) < 2 or len(outcomes) < 2:
+        if not isinstance(clob_token_ids, list) or len(clob_token_ids) < 2:
+            logger.error(f"Invalid clob_token_ids format: {type(clob_token_ids)}, length: {len(clob_token_ids) if isinstance(clob_token_ids, list) else 'N/A'}")
+            return None
+            
+        if len(outcomes) < 2:
             return None
         
-        # Get token IDs
-        yes_token_id = clob_token_ids[0]
-        no_token_id = clob_token_ids[1]
+        # Get token IDs - ensure they're strings
+        yes_token_id = str(clob_token_ids[0])
+        no_token_id = str(clob_token_ids[1])
+        
+        # Validate token IDs look reasonable (should be long hex-like strings)
+        if len(yes_token_id) < 20 or len(no_token_id) < 20:
+            logger.error(f"Token IDs too short: yes={yes_token_id[:50]}, no={no_token_id[:50]}")
+            return None
         
         # Get orderbooks
         yes_book = await self.get_orderbook(yes_token_id)
