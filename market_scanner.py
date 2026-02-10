@@ -44,7 +44,7 @@ class MarketScanner:
             logger.error(f"Error fetching markets: {e}")
             return []
     
-    async def get_weather_markets(self, max_hours_until_settlement: int = 24) -> List[Dict]:
+    async def get_weather_markets(self, max_hours_until_settlement: int = 48) -> List[Dict]:
         """
         Get all temperature markets settling within specified hours.
         
@@ -60,6 +60,10 @@ class MarketScanner:
         now = datetime.now()
         cutoff = now + timedelta(hours=max_hours_until_settlement)
         
+        logger.info(f"Scanning {len(all_markets)} markets for temperature markets...")
+        logger.info(f"Current time: {now.strftime('%Y-%m-%d %H:%M')}")
+        logger.info(f"Cutoff time: {cutoff.strftime('%Y-%m-%d %H:%M')}")
+        
         for market in all_markets:
             try:
                 question = market.get("question", "")
@@ -68,31 +72,40 @@ class MarketScanner:
                 if not self._is_temperature_market(question):
                     continue
                 
+                logger.info(f"Found temp market: {question[:80]}")
+                
                 # Check settlement time
                 end_date_str = market.get("endDate") or market.get("end_date_iso")
                 if not end_date_str:
+                    logger.warning(f"  No end date for market")
                     continue
                 
                 try:
                     end_date = dateutil.parser.parse(end_date_str)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"  Could not parse date: {e}")
                     continue
                 
                 # Skip if settling too far in future
                 if end_date > cutoff:
+                    logger.info(f"  Settles too far: {end_date.strftime('%Y-%m-%d %H:%M')}")
                     continue
                 
                 # Skip if already settled
                 if end_date < now:
+                    logger.info(f"  Already settled: {end_date.strftime('%Y-%m-%d %H:%M')}")
                     continue
                 
                 # Parse temperature range from question
                 temp_range = self._parse_temperature_range(question)
                 if not temp_range:
+                    logger.warning(f"  Could not parse temperature range")
                     continue
                 
                 # Parse city from question
                 city = self._parse_city(question)
+                
+                logger.info(f"  ✅ Valid market! City={city}, Temp={temp_range}")
                 
                 # Build enriched market object
                 enriched = {
@@ -132,17 +145,12 @@ class MarketScanner:
         q_lower = question.lower()
         
         # Must contain temperature-related keywords
-        temp_keywords = ["temperature", "°f", "°c", "degrees"]
+        temp_keywords = ["temperature", "°f", "°c", "degrees", "high", "highest", "low", "lowest"]
         if not any(kw in q_lower for kw in temp_keywords):
             return False
         
-        # Must contain location keywords
-        location_keywords = ["in", "on", "at"]
-        if not any(kw in q_lower for kw in location_keywords):
-            return False
-        
         # Exclude non-weather markets
-        exclude_keywords = ["cpu", "processor", "gaming", "oven", "water"]
+        exclude_keywords = ["cpu", "processor", "gaming", "oven", "water", "stock", "price"]
         if any(kw in q_lower for kw in exclude_keywords):
             return False
         
