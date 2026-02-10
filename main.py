@@ -1,3 +1,4 @@
+# main.py
 """
 Weather Arbitrage Bot - Main Entry Point
 
