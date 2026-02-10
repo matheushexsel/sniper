@@ -47,26 +47,13 @@ class TradeExecutor:
         clob_token_ids = market.get("clob_token_ids", [])
         outcomes = market.get("outcomes", [])
         
-        # Validate token IDs exist and are valid hex strings
+        # Basic validation
         if len(clob_token_ids) < 2 or len(outcomes) < 2:
-            logger.warning(f"Market missing token IDs or outcomes")
             return None
         
-        # Validate token IDs are non-empty strings (not empty, not just whitespace)
+        # Get token IDs
         yes_token_id = clob_token_ids[0]
         no_token_id = clob_token_ids[1]
-        
-        if not yes_token_id or not no_token_id:
-            logger.warning(f"Market has empty token IDs")
-            return None
-            
-        if not isinstance(yes_token_id, str) or not isinstance(no_token_id, str):
-            logger.warning(f"Token IDs are not strings: {type(yes_token_id)}, {type(no_token_id)}")
-            return None
-            
-        if len(yes_token_id) < 10 or len(no_token_id) < 10:
-            logger.warning(f"Token IDs too short (likely invalid): {yes_token_id[:20]}, {no_token_id[:20]}")
-            return None
         
         # Get orderbooks
         yes_book = await self.get_orderbook(yes_token_id)
@@ -80,7 +67,6 @@ class TradeExecutor:
         no_asks = no_book.get("asks", [])
         
         if not yes_asks or not no_asks:
-            logger.warning(f"Empty orderbook for market")
             return None
         
         # Best ask price is what we'd pay to buy

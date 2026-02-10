@@ -154,14 +154,9 @@ class MarketScanner:
                         # Extract token IDs - handle both possible field names
                         clob_token_ids = market.get("clobTokenIds") or market.get("clob_token_ids") or []
                         
-                        # Validate token IDs before adding market
+                        # Basic validation - just check they exist
                         if not clob_token_ids or len(clob_token_ids) < 2:
                             logger.warning(f"    ⚠️  Market missing token IDs: {question[:40]}")
-                            continue
-                        
-                        # Ensure token IDs are strings and non-empty
-                        if not all(isinstance(tid, str) and len(tid) > 10 for tid in clob_token_ids[:2]):
-                            logger.warning(f"    ⚠️  Invalid token IDs in market: {clob_token_ids}")
                             continue
                         
                         # Build enriched market object
@@ -170,7 +165,7 @@ class MarketScanner:
                             "question": question,
                             "slug": market.get("slug", ""),
                             "market_id": market.get("id", ""),
-                            "clob_token_ids": clob_token_ids,  # Now validated
+                            "clob_token_ids": clob_token_ids,
                             "outcomes": market.get("outcomes", []),
                             "end_date": end_date,
                             "volume": market.get("volume", 0),
