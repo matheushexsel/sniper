@@ -1,954 +1,144 @@
-# momentum_strategy.py
-# 15-Minute Momentum Ladder Strategy
-# Buy both sides at start, then ladder into the winning side, exit before close
+"""
+Weather Arbitrage Bot - Main Entry Point
 
-from __future__ import annotations
+Runs continuously, scanning for opportunities and executing trades
+"""
 
 import asyncio
-import json
 import logging
-import math
 import os
-import re
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from dotenv import load_dotenv
 
-import httpx
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-from py_clob_client.order_builder.constants import BUY, SELL
+from market_scanner import MarketScanner
+from probability_calculator import ProbabilityCalculator
+from trade_executor import TradeExecutor
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-# ----------------------------
-# Logging
-# ----------------------------
-
-def _setup_logging() -> None:
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
-logger = logging.getLogger("momentum15m")
-
-
-# ----------------------------
-# Env helpers
-# ----------------------------
-
-def _env(*keys: str, default: str = "") -> str:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
-    return default
-
-
-def _env_bool(*keys: str, default: bool = False) -> bool:
-    v = _env(*keys, default=str(default))
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def _env_int(*keys: str, default: int) -> int:
-    v = _env(*keys, default=str(default))
-    try:
-        return int(float(v))
-    except Exception:
-        return default
-
-
-def _env_float(*keys: str, default: float) -> float:
-    v = _env(*keys, default=str(default))
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def _env_json_list(*keys: str, default: List[str]) -> List[str]:
-    raw = _env(*keys, default="")
-    if not raw:
-        return default
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return [str(x) for x in parsed]
-    except Exception:
-        pass
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-# ----------------------------
-# Settings
-# ----------------------------
-
-@dataclass
-class Settings:
-    # APIs
-    clob_host: str
-
-    # auth
-    chain_id: int
-    signature_type: int
-    private_key: str
-    funder: str
-
-    api_key: str
-    api_secret: str
-    api_passphrase: str
-
-    # Timing constants (seconds)
-    window_sec: int  # 900 (15 minutes)
-    eval_interval_sec: int  # 120 (2 minutes)
-    num_evals: int  # 6 evaluations
-    exit_time_sec: int  # 780 (13 minutes) - when to force exit
+class WeatherArbBot:
+    """Main bot orchestrator"""
     
-    # Asset
-    asset: str  # "BTC"
-
-    # loop
-    poll_sec: float
-    log_every_sec: float
-
-    # Sizing (all in USDC)
-    base_usdc_per_side: float  # $1 per side at start
-    step_usdc: float  # $1 per add
-
-    # Risk
-    max_slippage: float  # 0.05 (5%)
-    min_price_delta: float  # 0.0001 - minimum price change to trigger add
-
-    # Execution
-    dry_run: bool
-    fill_timeout_sec: float
-    max_retries: int
-
-    # Market resolution
-    max_slug_lookups: int
-    slug_scan_buckets_ahead: int
-    slug_scan_buckets_behind: int
-    resolve_cache_sec: float
-
-    @staticmethod
-    def load() -> "Settings":
-        return Settings(
-            clob_host=_env("CLOB_HOST", default="https://clob.polymarket.com"),
-
-            chain_id=_env_int("CHAIN_ID", default=137),
-            signature_type=_env_int("PM_SIGNATURE_TYPE", default=2),
-            private_key=_env("PM_PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY", default=""),
-            funder=_env("PM_FUNDER", default=""),
-
-            api_key=_env("PM_API_KEY", default=""),
-            api_secret=_env("PM_API_SECRET", default=""),
-            api_passphrase=_env("PM_API_PASSPHRASE", default=""),
-
-            window_sec=_env_int("WINDOW_SEC", default=900),
-            eval_interval_sec=_env_int("EVAL_INTERVAL_SEC", default=120),
-            num_evals=_env_int("NUM_EVALS", default=6),
-            exit_time_sec=_env_int("EXIT_TIME_SEC", default=780),
-
-            asset=_env("ASSET", default="BTC"),
-
-            poll_sec=_env_float("POLL_SEC", default=1.0),
-            log_every_sec=_env_float("LOG_EVERY_SEC", default=30.0),
-
-            base_usdc_per_side=_env_float("BASE_USDC_PER_SIDE", default=1.0),
-            step_usdc=_env_float("STEP_USDC", default=1.0),
-
-            max_slippage=_env_float("MAX_SLIPPAGE", default=0.05),
-            min_price_delta=_env_float("MIN_PRICE_DELTA", default=0.0001),
-
-            dry_run=_env_bool("DRY_RUN", default=True),
-            fill_timeout_sec=_env_float("FILL_TIMEOUT_SEC", default=2.0),
-            max_retries=_env_int("MAX_RETRIES", default=3),
-
-            max_slug_lookups=_env_int("MAX_SLUG_LOOKUPS", default=50),
-            slug_scan_buckets_ahead=_env_int("SLUG_SCAN_BUCKETS_AHEAD", default=3),
-            slug_scan_buckets_behind=_env_int("SLUG_SCAN_BUCKETS_BEHIND", default=5),
-            resolve_cache_sec=_env_float("RESOLVE_CACHE_SEC", default=10.0),
+    def __init__(self):
+        # Load config
+        load_dotenv()
+        
+        self.position_size = float(os.getenv("POSITION_SIZE_USD", "10.0"))
+        self.max_positions = int(os.getenv("MAX_POSITIONS", "10"))
+        self.min_edge = float(os.getenv("MIN_EDGE_PERCENT", "5.0")) / 100
+        self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+        
+        # Initialize components
+        self.scanner = MarketScanner()
+        self.calculator = ProbabilityCalculator()
+        self.executor = TradeExecutor(
+            private_key=os.getenv("PM_PRIVATE_KEY"),
+            funder=os.getenv("PM_FUNDER"),
         )
-
-
-# ----------------------------
-# Time helpers
-# ----------------------------
-
-def _bucket_start(ts: int, window_sec: int) -> int:
-    return (ts // window_sec) * window_sec
-
-
-# ----------------------------
-# Gamma API Market Discovery (Polymarket's market data API)
-# ----------------------------
-
-async def fetch_active_crypto_markets() -> List[Dict[str, Any]]:
-    """Fetch active crypto markets from Gamma API"""
-    url = "https://gamma-api.polymarket.com/markets"
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": "100",
-        "order": "end_date",
-        "ascending": "true"
-    }
+        
+        logger.info("="*80)
+        logger.info("WEATHER ARBITRAGE BOT")
+        logger.info("="*80)
+        logger.info(f"Position Size: ${self.position_size}")
+        logger.info(f"Max Positions: {self.max_positions}")
+        logger.info(f"Min Edge: {self.min_edge:.1%}")
+        logger.info(f"DRY RUN: {self.dry_run}")
+        logger.info("="*80)
     
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            return r.json()
-    except Exception as e:
-        logger.error(f"Gamma API error: {e}")
-        return []
-
-
-def find_15min_market_in_list(markets: List[Dict[str, Any]], asset: str, now_ts: int, window_sec: int) -> Optional[Dict[str, Any]]:
-    """Find the current 15-minute UP/DOWN market from Gamma markets list"""
-    asset_upper = asset.upper()
-    current_bucket_start = _bucket_start(now_ts, window_sec)
-    current_bucket_end = current_bucket_start + window_sec
-    
-    # Look for markets ending in the current or next window
-    min_end = current_bucket_start - 900  # 15 min before
-    max_end = current_bucket_end + 1800   # 30 min after
-    
-    candidates = []
-    
-    for market in markets:
+    async def run_scan(self):
+        """Run one complete scan cycle"""
+        logger.info(f"\n🔍 Starting scan at {datetime.now().strftime('%H:%M:%S')}")
+        
         try:
-            question = market.get("question", "")
+            # Step 1: Find weather markets settling within 24 hours
+            markets = await self.scanner.get_weather_markets(max_hours_until_settlement=24)
             
-            # Must contain "Up or Down" and asset name
-            if "up or down" not in question.lower():
-                continue
-            if asset_upper not in question.upper():
-                continue
+            if not markets:
+                logger.info("No weather markets found")
+                return
             
-            # Must be 15-minute (not hourly/daily)
-            if "15m" not in question.lower() and "11:" not in question and "12:" not in question:
-                # Check if it mentions specific 15-minute time ranges
-                # e.g., "11:00AM-11:15AM" or "February 10, 11-11:15AM"
-                has_15min_range = False
-                import re
-                # Look for patterns like "11:00AM-11:15AM" or "11-11:15AM"
-                if re.search(r'\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)\s*-\s*\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)', question):
-                    has_15min_range = True
-                elif re.search(r'\d{1,2}-\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)', question):
-                    has_15min_range = True
-                
-                if not has_15min_range:
-                    continue
+            logger.info(f"Found {len(markets)} weather markets")
             
-            # Check end time
-            end_date = market.get("endDate") or market.get("end_date_iso")
-            if not end_date:
-                continue
+            # Step 2: Calculate probabilities from weather forecasts
+            opportunities = await self.calculator.find_opportunities(markets)
             
-            try:
-                import dateutil.parser
-                end_ts = int(dateutil.parser.parse(end_date).timestamp())
-                if min_end <= end_ts <= max_end:
-                    candidates.append((end_ts, market))
-            except Exception:
-                continue
-                
-        except Exception:
-            continue
-    
-    if not candidates:
-        return None
-    
-    # Sort by end time, prefer closest to current bucket end
-    candidates.sort(key=lambda x: abs(x[0] - current_bucket_end))
-    return candidates[0][1]
-
-
-def extract_tokens_from_gamma_market(market: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Extract UP/DOWN token IDs from Gamma market response"""
-    try:
-        clob_tokens = market.get("clobTokenIds", [])
-        outcomes = market.get("outcomes", [])
-        
-        if len(clob_tokens) < 2 or len(outcomes) < 2:
-            return None
-        
-        # UP is typically index 0, DOWN is index 1
-        up_idx, down_idx = 0, 1
-        
-        # Check outcome labels
-        if len(outcomes) >= 2:
-            l0 = str(outcomes[0]).strip().lower()
-            l1 = str(outcomes[1]).strip().lower()
-            if "down" in l0 and "up" in l1:
-                up_idx, down_idx = 1, 0
-        
-        end_date = market.get("endDate") or market.get("end_date_iso")
-        
-        return {
-            "slug": market.get("slug", ""),
-            "question": market.get("question", ""),
-            "up_token_id": str(clob_tokens[up_idx]),
-            "down_token_id": str(clob_tokens[down_idx]),
-            "end_date_iso": end_date,
-            "enable_order_book": market.get("enableOrderBook", True),
-        }
-    except Exception as e:
-        logger.warning(f"Failed to extract tokens from market: {e}")
-        return None
-
-
-# ----------------------------
-# Orderbook helpers
-# ----------------------------
-
-def _book_to_dict(book: Any) -> Dict[str, Any]:
-    if book is None:
-        return {"asks": [], "bids": []}
-
-    if isinstance(book, dict):
-        return {"asks": book.get("asks") or [], "bids": book.get("bids") or []}
-
-    for m in ("model_dump", "dict"):
-        if hasattr(book, m):
-            try:
-                d = getattr(book, m)()
-                if isinstance(d, dict):
-                    return {"asks": d.get("asks") or [], "bids": d.get("bids") or []}
-            except Exception:
-                pass
-
-    asks = getattr(book, "asks", None) or []
-    bids = getattr(book, "bids", None) or []
-
-    def _lvls(x: Any) -> List[Dict[str, float]]:
-        out: List[Dict[str, float]] = []
-        for lvl in (x or []):
-            if isinstance(lvl, dict):
-                try:
-                    out.append({"price": float(lvl["price"]), "size": float(lvl["size"])})
-                except Exception:
-                    continue
+            if not opportunities:
+                logger.info("No opportunities with weather data")
+                return
+            
+            logger.info(f"Analyzed {len(opportunities)} markets with forecast data")
+            
+            # Step 3: Execute trades where edge exists
+            executed = await self.executor.execute_opportunities(
+                opportunities=opportunities,
+                position_size=self.position_size,
+                min_edge=self.min_edge,
+                max_positions=self.max_positions,
+            )
+            
+            if executed:
+                logger.info(f"✅ Executed {len(executed)} trades:")
+                for trade in executed:
+                    logger.info(f"   • {trade['side']} ${trade['size_usd']:.0f} @ {trade['price']:.3f} | Edge: {trade['edge']:+.1%}")
+                    logger.info(f"     {trade['market'][:70]}")
             else:
-                p = getattr(lvl, "price", None)
-                s = getattr(lvl, "size", None)
-                if p is None or s is None:
-                    continue
-                try:
-                    out.append({"price": float(p), "size": float(s)})
-                except Exception:
-                    continue
-        return out
-
-    return {"asks": _lvls(asks), "bids": _lvls(bids)}
-
-
-def _best_ask(book: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    asks = book.get("asks") or []
-    if not asks:
-        return None
-    try:
-        a0 = asks[0]
-        return float(a0["price"]), float(a0["size"])
-    except Exception:
-        return None
-
-
-def _best_bid(book: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    bids = book.get("bids") or []
-    if not bids:
-        return None
-    try:
-        b0 = bids[0]
-        return float(b0["price"]), float(b0["size"])
-    except Exception:
-        return None
-
-
-def _walk_asks_for_size(book: Dict[str, Any], size_needed: float) -> Optional[float]:
-    asks = book.get("asks") or []
-    remaining = float(size_needed)
-    worst = None
-    for lvl in asks:
-        try:
-            p = float(lvl["price"])
-            sz = float(lvl["size"])
-        except Exception:
-            continue
-        if sz <= 0:
-            continue
-        take = min(sz, remaining)
-        remaining -= take
-        worst = p
-        if remaining <= 1e-9:
-            return worst
-    return None
-
-
-def _slippage_ok(best: float, worst: float, max_slip: float) -> bool:
-    if best <= 0:
-        return False
-    return ((worst - best) / best) <= max_slip
-
-
-# ----------------------------
-# CLOB wrapper
-# ----------------------------
-
-class PolymarketTrader:
-    def __init__(self, s: Settings):
-        self.s = s
-        self.client = self._make_client()
-
-    def _make_client(self) -> ClobClient:
-        if not self.s.private_key:
-            raise RuntimeError("Missing PM_PRIVATE_KEY / POLYMARKET_PRIVATE_KEY")
-
-        funder = self.s.funder.strip() if self.s.funder else None
-
-        c = ClobClient(
-            self.s.clob_host,
-            key=self.s.private_key.strip(),
-            chain_id=self.s.chain_id,
-            signature_type=self.s.signature_type,
-            funder=funder,
-        )
-
-        if self.s.api_key and self.s.api_secret and self.s.api_passphrase:
-            c.set_api_creds({"apiKey": self.s.api_key, "secret": self.s.api_secret, "passphrase": self.s.api_passphrase})
-            logger.info("Configured API creds from env.")
-        else:
-            derived = c.create_or_derive_api_creds()
-            c.set_api_creds(derived)
-            logger.info("Derived API creds via private key.")
-
-        logger.info(f"Wallet address: {c.get_address()}")
-        if funder:
-            logger.info(f"Funder: {funder}")
-        return c
-
-    def get_order_book(self, token_id: str) -> Any:
-        return self.client.get_order_book(token_id)
-
-    def get_order(self, order_id: str) -> Dict[str, Any]:
-        return self.client.get_order(order_id)
-
-    def cancel_order(self, order_id: str) -> None:
-        try:
-            self.client.cancel(order_id)
-        except Exception:
-            pass
-
-    def place_limit_buy(self, token_id: str, size: float, price: float, ioc: bool = True) -> Dict[str, Any]:
-        args = OrderArgs(price=float(price), size=float(size), side=BUY, token_id=str(token_id))
-        opts = PartialCreateOrderOptions(tif=OrderType.FOK if ioc else OrderType.GTC)
-        return self.client.create_and_post_order(args, opts)
-
-    def place_limit_sell(self, token_id: str, size: float, price: float) -> Dict[str, Any]:
-        # Use GTC (Good-Til-Cancel) for sells to earn maker rebates
-        args = OrderArgs(price=float(price), size=float(size), side=SELL, token_id=str(token_id))
-        opts = PartialCreateOrderOptions(tif=OrderType.GTC)
-        return self.client.create_and_post_order(args, opts)
-
-
-def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
-    for k in ("orderID", "orderId", "id"):
-        if isinstance(resp, dict) and resp.get(k):
-            return str(resp[k])
-    d = resp.get("data") if isinstance(resp, dict) else None
-    if isinstance(d, dict):
-        for k in ("orderID", "orderId", "id"):
-            if d.get(k):
-                return str(d[k])
-    return None
-
-
-def _order_status(o: Dict[str, Any]) -> str:
-    for k in ("status", "state"):
-        if isinstance(o, dict) and o.get(k):
-            return str(o[k]).upper()
-    return ""
-
-
-def _filled_size(o: Dict[str, Any]) -> float:
-    for k in ("filledSize", "filled_size", "sizeFilled", "filled"):
-        if isinstance(o, dict) and o.get(k) is not None:
-            try:
-                return float(o[k])
-            except Exception:
-                pass
-    d = o.get("data") if isinstance(o, dict) else None
-    if isinstance(d, dict):
-        for k in ("filledSize", "filled_size", "sizeFilled", "filled"):
-            if d.get(k) is not None:
-                try:
-                    return float(d[k])
-                except Exception:
-                    pass
-    return 0.0
-
-
-# ----------------------------
-# Market State Tracker
-# ----------------------------
-
-@dataclass
-class MarketState:
-    slug: str
-    up_token_id: str
-    down_token_id: str
-    t_start: int  # Calculated as t_end - 900
-    t_end: int
-    
-    # Execution state
-    base_done: bool = False
-    eval_index: int = 0  # How many 2-min evals completed (0-6)
-    exit_done: bool = False
-    
-    # Positions (shares held)
-    pos_up_qty: float = 0.0
-    pos_down_qty: float = 0.0
-    
-    # Last evaluation prices (for delta calc)
-    last_eval_ask_up: Optional[float] = None
-    last_eval_ask_down: Optional[float] = None
-
-
-# ----------------------------
-# Momentum Strategy Bot
-# ----------------------------
-
-class MomentumBot:
-    def __init__(self, s: Settings):
-        self.s = s
-        self.trader = PolymarketTrader(s)
+                logger.info("No trades executed (insufficient edge or max positions reached)")
         
-        self._current_state: Optional[MarketState] = None
-        self._invalid_until: float = 0.0
-        self._last_heartbeat = 0.0
-
-    def _elapsed(self, state: MarketState) -> int:
-        """Seconds elapsed since market start"""
-        return int(time.time()) - state.t_start
-
-    def _tte(self, state: MarketState) -> int:
-        """Time to expiry in seconds"""
-        return state.t_end - int(time.time())
-
-    async def _validate_updown_market(self, up_token: str, down_token: str, slug: str) -> bool:
-        """Validate this is actually an UP/DOWN market by checking price distribution"""
-        try:
-            up_book, down_book = await self._books(up_token, down_token)
-            
-            up_best = _best_ask(up_book)
-            down_best = _best_ask(down_book)
-            
-            if not up_best or not down_best:
-                return False
-            
-            up_price, _ = up_best
-            down_price, _ = down_best
-            
-            # UP/DOWN markets should have competitive pricing
-            if up_price > 0.90 or down_price > 0.90:
-                logger.warning(f"Validation failed for {slug}: prices too high (UP={up_price:.4f} DOWN={down_price:.4f})")
-                return False
-            
-            if up_price < 0.10 or down_price < 0.10:
-                logger.warning(f"Validation failed for {slug}: prices too low (UP={up_price:.4f} DOWN={down_price:.4f})")
-                return False
-            
-            total = up_price + down_price
-            if total < 0.50 or total > 1.50:
-                logger.warning(f"Validation failed for {slug}: total price {total:.4f} out of range")
-                return False
-            
-            logger.info(f"✅ Validated UP/DOWN market {slug}: UP={up_price:.4f} DOWN={down_price:.4f} total={total:.4f}")
-            return True
-            
         except Exception as e:
-            logger.warning(f"Validation error for {slug}: {e}")
-            return False
-
-    async def _resolve_current_market(self) -> Optional[MarketState]:
-        """Find and validate the current 15-minute market via Gamma API"""
-        if time.time() < self._invalid_until:
-            return self._current_state
-
-        now_ts = int(time.time())
+            logger.error(f"Error during scan: {e}", exc_info=True)
+    
+    async def run_forever(self, scan_interval_minutes: int = 60):
+        """
+        Run bot continuously.
         
-        # Fetch all active markets
-        markets = await fetch_active_crypto_markets()
-        logger.info(f"🔍 Fetched {len(markets)} active markets from Gamma")
-        
-        # Find the current 15-minute UP/DOWN market
-        market = find_15min_market_in_list(markets, self.s.asset, now_ts, self.s.window_sec)
-        
-        if not market:
-            logger.warning(f"[{self.s.asset}] No 15-minute UP/DOWN market found")
-            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
-            return None
-        
-        # Extract token IDs
-        info = extract_tokens_from_gamma_market(market)
-        if not info:
-            logger.warning(f"[{self.s.asset}] Failed to extract tokens from market")
-            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
-            return None
-        
-        # Validate orderbooks
-        ok = await self._validate_updown_market(info["up_token_id"], info["down_token_id"], info["question"])
-        if not ok:
-            logger.warning(f"[{self.s.asset}] Market validation failed")
-            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
-            return None
-        
-        # Parse end time
-        try:
-            import dateutil.parser
-            t_end = int(dateutil.parser.parse(info["end_date_iso"]).timestamp())
-        except Exception:
-            logger.warning(f"Failed to parse end_date_iso: {info.get('end_date_iso')}")
-            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
-            return None
-        
-        t_start = t_end - self.s.window_sec
-        
-        # Check if same market
-        if self._current_state:
-            if (self._current_state.up_token_id == info["up_token_id"] and 
-                self._current_state.down_token_id == info["down_token_id"]):
-                self._invalid_until = time.time() + self.s.resolve_cache_sec
-                return self._current_state
-        
-        # New market found
-        state = MarketState(
-            slug=info["slug"],
-            up_token_id=info["up_token_id"],
-            down_token_id=info["down_token_id"],
-            t_start=t_start,
-            t_end=t_end,
-        )
-        
-        logger.info(f"🎯 NEW MARKET: {info['question'][:80]}")
-        logger.info(f"   UP={info['up_token_id'][:16]}... DOWN={info['down_token_id'][:16]}...")
-        logger.info(f"   Start: {t_start} | End: {t_end}")
-        
-        self._current_state = state
-        self._invalid_until = time.time() + self.s.resolve_cache_sec
-        return state
-
-    async def _books(self, up_token: str, down_token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        t1 = asyncio.to_thread(self.trader.get_order_book, up_token)
-        t2 = asyncio.to_thread(self.trader.get_order_book, down_token)
-        up_raw, down_raw = await asyncio.gather(t1, t2)
-        return _book_to_dict(up_raw), _book_to_dict(down_raw)
-
-    async def _wait_terminal(self, oid: str, timeout: float) -> Dict[str, Any]:
-        deadline = time.time() + timeout
-        last: Dict[str, Any] = {}
-        while time.time() < deadline:
-            try:
-                o = await asyncio.to_thread(self.trader.get_order, oid)
-                last = o
-                st = _order_status(o)
-                if st in ("FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
-                    return o
-            except Exception:
-                pass
-            await asyncio.sleep(0.15)
-        return last
-
-    async def _buy_side(self, token_id: str, usdc_amount: float, side_name: str) -> float:
-        """Buy a side with USDC amount, return shares filled"""
-        up_book, down_book = await self._books(self._current_state.up_token_id, self._current_state.down_token_id)
-        book = up_book if side_name == "UP" else down_book
-        
-        ask = _best_ask(book)
-        if not ask:
-            logger.warning(f"❌ No ask for {side_name}, skipping buy")
-            return 0.0
-        
-        ask_price, _ = ask
-        shares = usdc_amount / max(ask_price, 0.01)
-        
-        # Check slippage
-        worst = _walk_asks_for_size(book, shares)
-        if worst is None or not _slippage_ok(ask_price, worst, self.s.max_slippage):
-            logger.warning(f"❌ {side_name} slippage too high, skipping")
-            return 0.0
-        
-        if self.s.dry_run:
-            logger.info(f"[DRY_RUN] Would BUY {shares:.2f} {side_name} @ {worst:.4f} (${usdc_amount:.2f})")
-            return shares
-        
-        try:
-            resp = await asyncio.to_thread(self.trader.place_limit_buy, token_id, shares, worst, ioc=True)
-            oid = _extract_order_id(resp)
-            if not oid:
-                logger.warning(f"❌ No order ID from {side_name} buy")
-                return 0.0
-            
-            order = await self._wait_terminal(oid, self.s.fill_timeout_sec)
-            filled = _filled_size(order)
-            
-            if filled > 0:
-                logger.info(f"✅ BOUGHT {filled:.2f} {side_name} @ {worst:.4f}")
-            else:
-                logger.warning(f"⚠️ {side_name} buy not filled")
-            
-            return filled
-            
-        except Exception as e:
-            logger.warning(f"❌ {side_name} buy failed: {e}")
-            return 0.0
-
-    async def _sell_all(self, state: MarketState) -> None:
-        """Sell all positions at T=13min to go flat and earn maker rebates"""
-        up_book, down_book = await self._books(state.up_token_id, state.down_token_id)
-        
-        tasks = []
-        
-        # Sell UP position if any
-        if state.pos_up_qty > 0:
-            up_bid = _best_bid(up_book)
-            if up_bid:
-                bid_price, _ = up_bid
-                # Place limit slightly below bid to ensure fill while earning maker rebate
-                sell_price = bid_price * 0.999  # 0.1% below bid
-                tasks.append(self._sell_side(state.up_token_id, state.pos_up_qty, sell_price, "UP"))
-        
-        # Sell DOWN position if any
-        if state.pos_down_qty > 0:
-            down_bid = _best_bid(down_book)
-            if down_bid:
-                bid_price, _ = down_bid
-                sell_price = bid_price * 0.999
-                tasks.append(self._sell_side(state.down_token_id, state.pos_down_qty, sell_price, "DOWN"))
-        
-        if tasks:
-            await asyncio.gather(*tasks)
-        
-        logger.info(f"💰 EXIT COMPLETE | UP_sold={state.pos_up_qty:.2f} DOWN_sold={state.pos_down_qty:.2f}")
-
-    async def _sell_side(self, token_id: str, qty: float, price: float, side_name: str) -> None:
-        """Sell a side at limit price (GTC for maker rebates)"""
-        if self.s.dry_run:
-            logger.info(f"[DRY_RUN] Would SELL {qty:.2f} {side_name} @ {price:.4f}")
-            return
-        
-        try:
-            resp = await asyncio.to_thread(self.trader.place_limit_sell, token_id, qty, price)
-            oid = _extract_order_id(resp)
-            logger.info(f"📤 SELL order placed: {side_name} {qty:.2f} @ {price:.4f} (order_id={oid})")
-        except Exception as e:
-            logger.warning(f"❌ SELL {side_name} failed: {e}")
-
-    async def step_base_entry(self, state: MarketState) -> None:
-        """Step 1: Base entry at market start - buy both sides equally"""
-        elapsed = self._elapsed(state)
-        
-        # Only execute in first 60 seconds
-        if state.base_done or elapsed > 60:
-            return
-        
-        logger.info(f"🎬 BASE ENTRY | Buying ${self.s.base_usdc_per_side:.2f} each side")
-        
-        # Buy both sides simultaneously
-        up_task = self._buy_side(state.up_token_id, self.s.base_usdc_per_side, "UP")
-        down_task = self._buy_side(state.down_token_id, self.s.base_usdc_per_side, "DOWN")
-        
-        up_filled, down_filled = await asyncio.gather(up_task, down_task)
-        
-        state.pos_up_qty += up_filled
-        state.pos_down_qty += down_filled
-        
-        # Record prices for next evaluation
-        up_book, down_book = await self._books(state.up_token_id, state.down_token_id)
-        up_ask = _best_ask(up_book)
-        down_ask = _best_ask(down_book)
-        
-        if up_ask:
-            state.last_eval_ask_up, _ = up_ask
-        if down_ask:
-            state.last_eval_ask_down, _ = down_ask
-        
-        state.base_done = True
-        logger.info(f"✅ BASE DONE | UP={state.pos_up_qty:.2f} DOWN={state.pos_down_qty:.2f}")
-
-    async def step_momentum_add(self, state: MarketState) -> None:
-        """Step 2: Momentum adds every 2 minutes - buy the winning side"""
-        elapsed = self._elapsed(state)
-        
-        if not state.base_done:
-            return
-        
-        if state.eval_index >= self.s.num_evals:
-            return
-        
-        # Check if it's time for next evaluation
-        target_time = (state.eval_index + 1) * self.s.eval_interval_sec
-        if elapsed < target_time:
-            return
-        
-        # Prevent evaluations after exit time
-        if elapsed >= self.s.exit_time_sec:
-            return
-        
-        # Fetch current prices
-        up_book, down_book = await self._books(state.up_token_id, state.down_token_id)
-        up_ask = _best_ask(up_book)
-        down_ask = _best_ask(down_book)
-        
-        if not up_ask or not down_ask:
-            logger.warning(f"⚠️ Eval #{state.eval_index + 1}: Missing asks, skipping")
-            state.eval_index += 1
-            return
-        
-        up_price_now, _ = up_ask
-        down_price_now, _ = down_ask
-        
-        # Calculate deltas
-        if state.last_eval_ask_up is None or state.last_eval_ask_down is None:
-            # First eval, use current prices
-            delta_up = 0.0
-            delta_down = 0.0
-        else:
-            delta_up = up_price_now - state.last_eval_ask_up
-            delta_down = down_price_now - state.last_eval_ask_down
-        
-        # Determine winner
-        if abs(delta_up - delta_down) < self.s.min_price_delta:
-            # Tie or tiny diff - use higher current price
-            winner = "UP" if up_price_now >= down_price_now else "DOWN"
-        elif delta_up > delta_down:
-            winner = "UP"
-        else:
-            winner = "DOWN"
-        
-        logger.info(
-            f"📊 EVAL #{state.eval_index + 1} @ T={elapsed}s | "
-            f"UP: {state.last_eval_ask_up:.4f}→{up_price_now:.4f} (Δ={delta_up:+.4f}) | "
-            f"DOWN: {state.last_eval_ask_down:.4f}→{down_price_now:.4f} (Δ={delta_down:+.4f}) | "
-            f"WINNER: {winner}"
-        )
-        
-        # Buy winner
-        winner_token = state.up_token_id if winner == "UP" else state.down_token_id
-        filled = await self._buy_side(winner_token, self.s.step_usdc, winner)
-        
-        if winner == "UP":
-            state.pos_up_qty += filled
-        else:
-            state.pos_down_qty += filled
-        
-        # Update last eval prices
-        state.last_eval_ask_up = up_price_now
-        state.last_eval_ask_down = down_price_now
-        state.eval_index += 1
-
-    async def step_forced_exit(self, state: MarketState) -> None:
-        """Step 3: Forced exit at minute 13"""
-        elapsed = self._elapsed(state)
-        tte = self._tte(state)
-        
-        # Exit if we hit exit time OR if time is running out
-        should_exit = (elapsed >= self.s.exit_time_sec) or (tte <= 60)
-        
-        if not should_exit or state.exit_done:
-            return
-        
-        logger.info(f"🚪 FORCED EXIT @ T={elapsed}s (tte={tte}s)")
-        await self._sell_all(state)
-        state.exit_done = True
-
-    async def run_cycle(self) -> None:
-        """Main execution cycle"""
-        # Resolve current market
-        state = await self._resolve_current_market()
-        if not state:
-            return
-        
-        # Execute strategy steps in order
-        await self.step_base_entry(state)
-        await self.step_momentum_add(state)
-        await self.step_forced_exit(state)
-        
-        # Check if we need to move to next market
-        if state.exit_done:
-            tte = self._tte(state)
-            if tte <= 0:
-                logger.info(f"✅ Market {state.slug} expired, waiting for next...")
-                self._current_state = None  # Force refresh next cycle
-
-    async def run_forever(self) -> None:
-        logger.info("=" * 80)
-        logger.info("15-MINUTE MOMENTUM LADDER STRATEGY")
-        logger.info("=" * 80)
-        logger.info(f"Asset: {self.s.asset}")
-        logger.info(f"Base: ${self.s.base_usdc_per_side:.2f}/side | Step: ${self.s.step_usdc:.2f}")
-        logger.info(f"Evals: {self.s.num_evals} every {self.s.eval_interval_sec}s | Exit: {self.s.exit_time_sec}s")
-        logger.info(f"DRY_RUN: {self.s.dry_run}")
-        logger.info("=" * 80)
+        Args:
+            scan_interval_minutes: How often to scan (default 60 min = hourly)
+        """
+        logger.info(f"🚀 Bot started - scanning every {scan_interval_minutes} minutes")
         
         while True:
-            now = time.time()
-            
-            # Heartbeat
-            if now - self._last_heartbeat >= self.s.log_every_sec:
-                self._last_heartbeat = now
-                if self._current_state:
-                    elapsed = self._elapsed(self._current_state)
-                    tte = self._tte(self._current_state)
-                    logger.info(
-                        f"💓 HEARTBEAT | Market: {self._current_state.slug} | "
-                        f"T={elapsed}s | TTE={tte}s | "
-                        f"Evals: {self._current_state.eval_index}/{self.s.num_evals} | "
-                        f"Pos: UP={self._current_state.pos_up_qty:.2f} DOWN={self._current_state.pos_down_qty:.2f}"
-                    )
-                else:
-                    logger.info("💓 HEARTBEAT | No active market")
-            
-            # Main cycle
-            t0 = time.time()
             try:
-                await self.run_cycle()
+                await self.run_scan()
+                
+                # Wait for next scan
+                logger.info(f"\n⏸️  Sleeping for {scan_interval_minutes} minutes...")
+                await asyncio.sleep(scan_interval_minutes * 60)
+                
+            except KeyboardInterrupt:
+                logger.info("\n👋 Bot stopped by user")
+                break
             except Exception as e:
-                logger.error(f"❌ Cycle error: {e}")
-            
-            # Sleep
-            dt = time.time() - t0
-            await asyncio.sleep(max(0.0, self.s.poll_sec - dt))
+                logger.error(f"Fatal error: {e}", exc_info=True)
+                logger.info("Restarting in 5 minutes...")
+                await asyncio.sleep(300)
+    
+    async def run_once(self):
+        """Run a single scan and exit (useful for testing)"""
+        await self.run_scan()
+        logger.info("\n✅ Single scan complete")
 
 
-# ----------------------------
-# Entrypoint
-# ----------------------------
-
-def _sanity(s: Settings) -> None:
-    if not s.private_key:
-        raise RuntimeError("Missing PM_PRIVATE_KEY / POLYMARKET_PRIVATE_KEY")
-    if s.signature_type not in (0, 1, 2):
-        raise RuntimeError("PM_SIGNATURE_TYPE must be 0/1/2")
-    if s.window_sec <= 0:
-        raise RuntimeError("WINDOW_SEC must be > 0")
-    if s.exit_time_sec >= s.window_sec:
-        raise RuntimeError("EXIT_TIME_SEC must be < WINDOW_SEC")
-    if s.eval_interval_sec * s.num_evals >= s.exit_time_sec:
-        raise RuntimeError("Total eval time exceeds exit time")
-
-
-async def main() -> None:
-    _setup_logging()
-    s = Settings.load()
-    _sanity(s)
-
-    bot = MomentumBot(s)
-    await bot.run_forever()
+async def main():
+    """Main entry point"""
+    bot = WeatherArbBot()
+    
+    # Check if we should run once or continuously
+    run_mode = os.getenv("RUN_MODE", "continuous").lower()
+    
+    if run_mode == "once":
+        await bot.run_once()
+    else:
+        # Run forever with hourly scans
+        scan_interval = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
+        await bot.run_forever(scan_interval_minutes=scan_interval)
 
 
 if __name__ == "__main__":
