@@ -1,7 +1,7 @@
 """
 Polymarket Market Scanner
 
-Scans for temperature markets settling within 24 hours
+Scans for temperature markets settling within 48 hours
 """
 
 import httpx
@@ -19,75 +19,70 @@ class MarketScanner:
     
     GAMMA_BASE = "https://gamma-api.polymarket.com"
     
-    async def fetch_active_markets(self, limit: int = 200, tag: str = None) -> List[Dict]:
-        """Fetch active markets from Gamma API"""
-        url = f"{self.GAMMA_BASE}/markets"
+    async def fetch_active_events(self, limit: int = 500, offset: int = 0) -> List[Dict]:
+        """Fetch active EVENTS from Gamma API"""
+        url = f"{self.GAMMA_BASE}/events"
         params = {
             "limit": str(limit),
+            "offset": str(offset),
             "active": "true",
             "closed": "false",
         }
         
-        # Add tag filter if specified
-        if tag:
-            params["tag"] = tag
-        
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
+            async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(url, params=params)
                 
                 if response.status_code == 200:
-                    markets = response.json()
-                    logger.info(f"Fetched {len(markets)} active markets from Gamma (tag={tag})")
-                    return markets
+                    events = response.json()
+                    logger.info(f"Fetched {len(events)} active events from Gamma")
+                    return events
                 else:
                     logger.error(f"Gamma API error: {response.status_code}")
                     return []
                     
         except Exception as e:
-            logger.error(f"Error fetching markets: {e}")
+            logger.error(f"Error fetching events: {e}")
             return []
     
     async def get_weather_markets(self, max_hours_until_settlement: int = 48) -> List[Dict]:
         """
         Get all temperature markets settling within specified hours.
         
-        Args:
-            max_hours_until_settlement: Only return markets settling within this many hours
-            
+        Searches for events with "highest temperature" in the title,
+        then extracts all markets (outcomes) from those events.
+        
         Returns:
             List of market dicts with parsed metadata
         """
-        # Fetch weather-tagged markets specifically
-        all_markets = await self.fetch_active_markets(limit=200, tag="weather")
+        # Fetch active events
+        all_events = await self.fetch_active_events(limit=500)
         
         weather_markets = []
         now = datetime.now()
         cutoff = now + timedelta(hours=max_hours_until_settlement)
         
-        logger.info(f"Scanning {len(all_markets)} markets for temperature markets...")
+        logger.info(f"Scanning {len(all_events)} events for temperature markets...")
         logger.info(f"Current time: {now.strftime('%Y-%m-%d %H:%M')}")
         logger.info(f"Cutoff time: {cutoff.strftime('%Y-%m-%d %H:%M')}")
         
-        # Debug: Show first 10 market questions
-        logger.info(f"\nFirst 10 market questions:")
-        for i, m in enumerate(all_markets[:10], 1):
-            logger.info(f"  {i}. {m.get('question', 'NO QUESTION')[:100]}")
+        temp_event_count = 0
         
-        for market in all_markets:
+        for event in all_events:
             try:
-                question = market.get("question", "")
+                event_title = event.get("title", "")
                 
-                # Filter for temperature markets
-                if not self._is_temperature_market(question):
+                # Filter for temperature events
+                if not self._is_temperature_event(event_title):
                     continue
                 
-                logger.info(f"Found temp market: {question[:80]}")
+                temp_event_count += 1
+                logger.info(f"Found temp event #{temp_event_count}: {event_title}")
                 
                 # Check settlement time
-                end_date_str = market.get("endDate") or market.get("end_date_iso")
+                end_date_str = event.get("endDate") or event.get("end_date_iso")
                 if not end_date_str:
-                    logger.warning(f"  No end date for market")
+                    logger.warning(f"  No end date")
                     continue
                 
                 try:
@@ -103,52 +98,76 @@ class MarketScanner:
                 
                 # Skip if already settled
                 if end_date < now:
-                    logger.info(f"  Already settled: {end_date.strftime('%Y-%m-%d %H:%M')}")
+                    logger.info(f"  Already settled")
                     continue
                 
-                # Parse temperature range from question
-                temp_range = self._parse_temperature_range(question)
-                if not temp_range:
-                    logger.warning(f"  Could not parse temperature range")
-                    continue
+                # Parse city from title
+                city = self._parse_city(event_title)
                 
-                # Parse city from question
-                city = self._parse_city(question)
+                # Get all markets (outcomes) from this event
+                markets = event.get("markets", [])
+                logger.info(f"  ✅ Valid event! City={city}, {len(markets)} markets, settles in {(end_date - now).total_seconds() / 3600:.1f}h")
                 
-                logger.info(f"  ✅ Valid market! City={city}, Temp={temp_range}")
-                
-                # Build enriched market object
-                enriched = {
-                    "question": question,
-                    "slug": market.get("slug", ""),
-                    "market_id": market.get("id", ""),
-                    "clob_token_ids": market.get("clobTokenIds", []),
-                    "outcomes": market.get("outcomes", []),
-                    "end_date": end_date,
-                    "volume": market.get("volume", 0),
-                    "liquidity": market.get("liquidity", 0),
-                    "enable_order_book": market.get("enableOrderBook", True),
-                    
-                    # Parsed metadata
-                    "city": city,
-                    "temp_min": temp_range["min"],
-                    "temp_max": temp_range["max"],
-                    "temp_unit": temp_range["unit"],
-                    "hours_until_settlement": (end_date - now).total_seconds() / 3600,
-                }
-                
-                weather_markets.append(enriched)
+                # Process each market (outcome) in the event
+                for market in markets:
+                    try:
+                        question = market.get("question", "")
+                        
+                        # Parse temperature range from question
+                        temp_range = self._parse_temperature_range(question)
+                        if not temp_range:
+                            logger.warning(f"    Could not parse temp from: {question[:60]}")
+                            continue
+                        
+                        # Build enriched market object
+                        enriched = {
+                            "event_title": event_title,
+                            "question": question,
+                            "slug": market.get("slug", ""),
+                            "market_id": market.get("id", ""),
+                            "clob_token_ids": market.get("clobTokenIds", []),
+                            "outcomes": market.get("outcomes", []),
+                            "end_date": end_date,
+                            "volume": market.get("volume", 0),
+                            "liquidity": market.get("liquidity", 0),
+                            "enable_order_book": market.get("enableOrderBook", True),
+                            
+                            # Parsed metadata
+                            "city": city,
+                            "temp_min": temp_range["min"],
+                            "temp_max": temp_range["max"],
+                            "temp_unit": temp_range["unit"],
+                            "hours_until_settlement": (end_date - now).total_seconds() / 3600,
+                        }
+                        
+                        weather_markets.append(enriched)
+                        logger.info(f"    ✅ {question[:60]} ({temp_range['min']}-{temp_range['max']}{temp_range['unit']})")
+                        
+                    except Exception as e:
+                        logger.warning(f"    Error parsing market: {e}")
+                        continue
                 
             except Exception as e:
-                logger.warning(f"Error parsing market: {e}")
+                logger.warning(f"Error parsing event: {e}")
                 continue
         
-        logger.info(f"Found {len(weather_markets)} temperature markets settling within {max_hours_until_settlement}h")
+        logger.info(f"\n🎯 Found {len(weather_markets)} temperature markets from {temp_event_count} events")
         
         # Sort by settlement time (soonest first)
         weather_markets.sort(key=lambda m: m["end_date"])
         
         return weather_markets
+    
+    def _is_temperature_event(self, title: str) -> bool:
+        """Check if event title is about temperature"""
+        t_lower = title.lower()
+        
+        # Must contain "highest temperature" or similar
+        temp_keywords = ["highest temperature", "high temperature", "temperature in"]
+        if not any(kw in t_lower for kw in temp_keywords):
+            return False
+        
+        return True
     
     def _is_temperature_market(self, question: str) -> bool:
         """Check if question is about temperature"""
