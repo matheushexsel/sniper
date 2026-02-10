@@ -1,3 +1,4 @@
+# trade_executor.py
 """
 Trade Executor
 
@@ -34,8 +35,12 @@ class TradeExecutor:
             book = self.client.get_order_book(token_id)
             return book
         except Exception as e:
-            logger.error(f"Error fetching orderbook for {token_id}: {e}")
-            return None
+            if "404" in str(e) or "not found" in str(e).lower():
+                logger.debug(f"Normal 404 for token {token_id[:16]}... - Market inactive, skipping")
+                return None
+            else:
+                logger.error(f"Error fetching orderbook for {token_id}: {e}")
+                return None
     
     async def get_market_prices(self, market: Dict) -> Optional[Dict]:
         """
@@ -50,6 +55,9 @@ class TradeExecutor:
         if len(clob_token_ids) < 2 or len(outcomes) < 2:
             logger.warning(f"Market missing token IDs or outcomes")
             return None
+        
+        # Added debug logging
+        logger.debug(f"clob_token_ids: {clob_token_ids} (type: {type(clob_token_ids)}, len: {len(clob_token_ids)})")
         
         # Determine which token is YES and which is NO
         # For temperature ranges, the first outcome is usually the specific range
@@ -74,6 +82,9 @@ class TradeExecutor:
         if not yes_asks or not no_asks:
             logger.warning(f"Empty orderbook for market")
             return None
+        
+        # Added debug logging
+        logger.debug(f"yes_book: {type(yes_book)}, asks: {yes_asks[:2] if yes_asks else 'empty'}")
         
         # Best ask price is what we'd pay to buy
         # Each ask is likely an object too, not a dict
