@@ -64,6 +64,11 @@ class MarketScanner:
         logger.info(f"Current time: {now.strftime('%Y-%m-%d %H:%M')}")
         logger.info(f"Cutoff time: {cutoff.strftime('%Y-%m-%d %H:%M')}")
         
+        # Debug: Show first 10 market questions
+        logger.info(f"\nFirst 10 market questions:")
+        for i, m in enumerate(all_markets[:10], 1):
+            logger.info(f"  {i}. {m.get('question', 'NO QUESTION')[:100]}")
+        
         for market in all_markets:
             try:
                 question = market.get("question", "")
