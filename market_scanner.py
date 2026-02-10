@@ -66,11 +66,21 @@ class MarketScanner:
         logger.info(f"Current time: {now.strftime('%Y-%m-%d %H:%M')}")
         logger.info(f"Cutoff time: {cutoff.strftime('%Y-%m-%d %H:%M')}")
         
+        # Debug: Show first 10 event titles
+        logger.info(f"\nFirst 10 event titles:")
+        for i, e in enumerate(all_events[:10], 1):
+            logger.info(f"  {i}. {e.get('title', 'NO TITLE')[:100]}")
+        
         temp_event_count = 0
         
         for event in all_events:
             try:
                 event_title = event.get("title", "")
+                
+                # Debug: Log if no title
+                if not event_title:
+                    logger.warning(f"Event has no title! Keys: {list(event.keys())[:10]}")
+                    continue
                 
                 # Filter for temperature events
                 if not self._is_temperature_event(event_title):
@@ -160,14 +170,29 @@ class MarketScanner:
     
     def _is_temperature_event(self, title: str) -> bool:
         """Check if event title is about temperature"""
+        if not title:
+            return False
+            
         t_lower = title.lower()
         
-        # Must contain "highest temperature" or similar
-        temp_keywords = ["highest temperature", "high temperature", "temperature in"]
-        if not any(kw in t_lower for kw in temp_keywords):
-            return False
+        # Be VERY permissive - match any temp-related keywords
+        temp_keywords = [
+            "temperature", "°f", "°c", "degrees",
+            "high", "highest", "low", "lowest",
+            "hot", "cold", "warm", "cool"
+        ]
         
-        return True
+        has_temp = any(kw in t_lower for kw in temp_keywords)
+        
+        # Also check for city names (indicates it's probably weather)
+        cities = [
+            "nyc", "new york", "seattle", "chicago", "dallas", 
+            "miami", "atlanta", "boston", "denver", "phoenix",
+            "london", "seoul", "toronto", "buenos aires", "ankara"
+        ]
+        has_city = any(city in t_lower for city in cities)
+        
+        return has_temp and has_city
     
     def _is_temperature_market(self, question: str) -> bool:
         """Check if question is about temperature"""
