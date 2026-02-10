@@ -215,10 +215,13 @@ def find_15min_updown_market(markets: List[Dict[str, Any]], asset: str, now_ts: 
     
     # DEBUG: Log all markets we're examining
     logger.info(f"DEBUG: Looking for {asset_upper} 15-min market. Current window: [{current_bucket_start}, {current_bucket_end}]")
-    for i, market in enumerate(markets[:10]):  # Show first 10
-        q = market.get("question", "")
+    logger.info(f"DEBUG: Total markets received: {len(markets)}")
+    for i, market in enumerate(markets):
+        if i >= 10:  # Only show first 10
+            break
+        q = market.get("question", "N/A")
         end = market.get("end_date_iso", "N/A")
-        logger.info(f"  Market {i}: '{q[:80]}' | end={end}")
+        logger.info(f"  Market {i}: '{q[:80] if q != 'N/A' else q}' | end={end}")
     
     candidates = []
     
