@@ -168,8 +168,8 @@ class Settings:
             max_retries=_env_int("MAX_RETRIES", default=3),
 
             max_slug_lookups=_env_int("MAX_SLUG_LOOKUPS", default=50),
-            slug_scan_buckets_ahead=_env_int("SLUG_SCAN_BUCKETS_AHEAD", default=2),
-            slug_scan_buckets_behind=_env_int("SLUG_SCAN_BUCKETS_BEHIND", default=2),
+            slug_scan_buckets_ahead=_env_int("SLUG_SCAN_BUCKETS_AHEAD", default=3),
+            slug_scan_buckets_behind=_env_int("SLUG_SCAN_BUCKETS_BEHIND", default=5),
             resolve_cache_sec=_env_float("RESOLVE_CACHE_SEC", default=10.0),
         )
 
@@ -183,22 +183,34 @@ def _bucket_start(ts: int, window_sec: int) -> int:
 
 
 def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: int, behind: int) -> List[str]:
+    """
+    Generate candidate slugs for UP/DOWN markets.
+    
+    CRITICAL: The slug timestamp is the MARKET START time.
+    We prioritize CURRENT and FUTURE markets over past ones.
+    """
     asset_l = asset.lower()
     minutes = int(window_sec / 60)
-    base = _bucket_start(now_ts, window_sec)
-
+    
+    # Current bucket start time (this IS the slug timestamp for the current market)
+    current_bucket_start = _bucket_start(now_ts, window_sec)
+    
     out: List[str] = []
-    for off in range(-behind, ahead + 1):
-        start_ts = base + off * window_sec
-        out.append(f"{asset_l}-updown-{minutes}m-{start_ts}")
-
-    seen = set()
-    dedup: List[str] = []
-    for s in out:
-        if s not in seen:
-            seen.add(s)
-            dedup.append(s)
-    return dedup
+    
+    # Generate current market FIRST
+    out.append(f"{asset_l}-updown-{minutes}m-{current_bucket_start}")
+    
+    # Then future markets
+    for off in range(1, ahead + 1):
+        future_start = current_bucket_start + off * window_sec
+        out.append(f"{asset_l}-updown-{minutes}m-{future_start}")
+    
+    # Then past markets (in case we're slightly late to a window)
+    for off in range(1, behind + 1):
+        past_start = current_bucket_start - off * window_sec
+        out.append(f"{asset_l}-updown-{minutes}m-{past_start}")
+    
+    return out
 
 
 # ----------------------------
@@ -576,6 +588,8 @@ class MomentumBot:
             self.s.asset, now_ts, self.s.window_sec, 
             self.s.slug_scan_buckets_ahead, self.s.slug_scan_buckets_behind
         )[: self.s.max_slug_lookups]
+
+        logger.info(f"🔍 Scanning {len(cands)} candidate slugs (now={now_ts}): {cands[:3]}...")
 
         for slug in cands:
             try:
