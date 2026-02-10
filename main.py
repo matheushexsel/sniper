@@ -1,4 +1,5 @@
 # main.py
+# Polymarket 15-minute CLOB arbitrage bot
 from __future__ import annotations
 
 import asyncio
@@ -88,7 +89,7 @@ def _env_json_list(*keys: str, default: List[str]) -> List[str]:
 class Settings:
     # APIs
     clob_host: str
-    data_api_base: str  # kept for compatibility; not required in this resolver
+    data_api_base: str
 
     # auth
     chain_id: int
@@ -159,7 +160,7 @@ class Settings:
 
             window_sec=_env_int("WINDOW_SEC", default=900),
             arm_before_boundary_sec=_env_int("ARM_BEFORE_BOUNDARY_SEC", default=900),
-            stop_trying_before_boundary_sec=_env_int("STOP_TRYING_BEFORE_BOUNDARY_SEC", default=3),
+            stop_trying_before_boundary_sec=_env_int("STOP_TRYING_BEFORE_boundary_SEC", default=3),
             min_tte_select_sec=_env_int("MIN_TTE_SELECT_SEC", default=10),
             max_tte_select_sec=_env_int("MAX_TTE_SELECT_SEC", default=900),
 
@@ -491,7 +492,7 @@ def _filled_size(o: Dict[str, Any]) -> float:
 
 
 # ----------------------------
-# Bot
+# Bot - DIAGNOSTIC VERSION
 # ----------------------------
 
 class ArbBot:
@@ -504,7 +505,7 @@ class ArbBot:
         self._last_trade = 0.0
         self._trade_ts: List[float] = []
         self._last_heartbeat = 0.0
-        self._last_debug_log: Dict[str, float] = {}  # per-asset debug throttling
+        self._last_debug_log: Dict[str, float] = {}
 
     def _trades_per_min_ok(self) -> bool:
         now = time.time()
@@ -589,8 +590,6 @@ class ArbBot:
         return None
 
     def _pick_notional(self) -> float:
-        # Choose target notional in [min_usdc, max_usdc] stepping by step_usdc,
-        # then apply SIZE_MULT (scale), and clamp to [min_usdc, max_usdc].
         if self.s.step_usdc <= 0:
             raw = float(max(self.s.min_usdc, min(self.s.base_usdc, self.s.max_usdc)))
         else:
@@ -713,13 +712,13 @@ class ArbBot:
         total_cost = yes_worst + no_worst
         edge = 1.0 - total_cost
 
-        if self.s.debug and self._debug_throttle_ok(asset, 5.0):
-            logger.info(
-                f"[{asset}] eval | notional={notional:.2f} shares={shares:.0f} "
-                f"YES best={yes_best_p:.4f} worst={yes_worst:.4f} | "
-                f"NO best={no_best_p:.4f} worst={no_worst:.4f} | "
-                f"total={total_cost:.4f} edge={edge:.4f} min_edge={self.s.min_edge:.4f}"
-            )
+        # Always log evaluation metrics - this is critical for understanding bot behavior
+        logger.info(
+            f"[{asset}] eval | notional={notional:.2f} shares={shares:.0f} "
+            f"YES best={yes_best_p:.4f} worst={yes_worst:.4f} | "
+            f"NO best={no_best_p:.4f} worst={no_worst:.4f} | "
+            f"total={total_cost:.4f} edge={edge:.4f} min_edge={self.s.min_edge:.4f}"
+        )
 
         if edge < self.s.min_edge:
             return
