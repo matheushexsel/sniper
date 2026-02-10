@@ -44,35 +44,17 @@ class TradeExecutor:
         Returns:
             Dict with yes_price, no_price, yes_token_id, no_token_id
         """
-        import json
-        
         clob_token_ids = market.get("clob_token_ids", [])
         outcomes = market.get("outcomes", [])
         
-        # Handle case where clob_token_ids might be a JSON string instead of a list
-        if isinstance(clob_token_ids, str):
-            try:
-                clob_token_ids = json.loads(clob_token_ids)
-            except:
-                logger.error(f"Failed to parse clob_token_ids string: {clob_token_ids[:100]}")
-                return None
-        
-        # Basic validation
-        if not isinstance(clob_token_ids, list) or len(clob_token_ids) < 2:
-            logger.error(f"Invalid clob_token_ids format: {type(clob_token_ids)}, length: {len(clob_token_ids) if isinstance(clob_token_ids, list) else 'N/A'}")
-            return None
-            
-        if len(outcomes) < 2:
+        if len(clob_token_ids) < 2 or len(outcomes) < 2:
+            logger.warning(f"Market missing token IDs or outcomes")
             return None
         
-        # Get token IDs - ensure they're strings
-        yes_token_id = str(clob_token_ids[0])
-        no_token_id = str(clob_token_ids[1])
-        
-        # Validate token IDs look reasonable (should be long hex-like strings)
-        if len(yes_token_id) < 20 or len(no_token_id) < 20:
-            logger.error(f"Token IDs too short: yes={yes_token_id[:50]}, no={no_token_id[:50]}")
-            return None
+        # Determine which token is YES and which is NO
+        # For temperature ranges, the first outcome is usually the specific range
+        yes_token_id = clob_token_ids[0]
+        no_token_id = clob_token_ids[1]
         
         # Get orderbooks
         yes_book = await self.get_orderbook(yes_token_id)
@@ -81,16 +63,26 @@ class TradeExecutor:
         if not yes_book or not no_book:
             return None
         
-        # Get best prices
-        yes_asks = yes_book.get("asks", [])
-        no_asks = no_book.get("asks", [])
+        # OrderBookSummary is an object with .asks and .bids attributes, not a dict
+        try:
+            yes_asks = yes_book.asks if hasattr(yes_book, 'asks') else []
+            no_asks = no_book.asks if hasattr(no_book, 'asks') else []
+        except Exception as e:
+            logger.error(f"Error accessing orderbook data: {e}")
+            return None
         
         if not yes_asks or not no_asks:
+            logger.warning(f"Empty orderbook for market")
             return None
         
         # Best ask price is what we'd pay to buy
-        yes_price = float(yes_asks[0]["price"]) if yes_asks else None
-        no_price = float(no_asks[0]["price"]) if no_asks else None
+        # Each ask is likely an object too, not a dict
+        try:
+            yes_price = float(yes_asks[0].price if hasattr(yes_asks[0], 'price') else yes_asks[0]["price"])
+            no_price = float(no_asks[0].price if hasattr(no_asks[0], 'price') else no_asks[0]["price"])
+        except (AttributeError, KeyError, IndexError) as e:
+            logger.error(f"Error extracting prices: {e}")
+            return None
         
         if yes_price is None or no_price is None:
             return None

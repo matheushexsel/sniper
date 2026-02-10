@@ -160,23 +160,40 @@ class OpenMeteoFetcher:
             logger.error(f"Error fetching Open-Meteo data: {e}")
             return None
     
-    def _parse_forecast(self, data: Dict) -> Dict:
+    def _parse_forecast(self, data: Dict) -> Optional[Dict]:
         """Parse Open-Meteo response"""
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
         temps = hourly.get("temperature_2m", [])
         
+        if not times or not temps:
+            logger.warning(f"Open-Meteo returned no data")
+            return None
+        
         hourly_temps = []
         
         for time_str, temp_f in zip(times, temps):
             try:
-                dt = datetime.fromisoformat(time_str)
+                # Handle timezone-aware or naive datetimes
+                if 'T' in time_str:
+                    dt = datetime.fromisoformat(time_str)
+                    # Make timezone-aware if it isn't already
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=pytz.UTC)
+                else:
+                    continue
+                    
                 hourly_temps.append({
                     "time": dt,
                     "temp_f": temp_f,
                 })
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error parsing time {time_str}: {e}")
                 continue
+        
+        if not hourly_temps:
+            logger.warning(f"Failed to parse any forecast data from Open-Meteo")
+            return None
         
         return {
             "hourly": hourly_temps,
