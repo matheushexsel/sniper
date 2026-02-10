@@ -19,82 +19,59 @@ class MarketScanner:
     
     GAMMA_BASE = "https://gamma-api.polymarket.com"
     
-    async def fetch_weather_events_via_search(self) -> List[Dict]:
-        """Use search API to find temperature events"""
-        url = f"{self.GAMMA_BASE}/search"
-        
-        # Search for temperature-related terms
-        search_terms = ["highest temperature", "temperature in", "weather"]
+    async def fetch_all_active_events(self, max_events: int = 2000) -> List[Dict]:
+        """Fetch active events using pagination"""
         all_events = []
+        offset = 0
+        limit = 500
         
-        for term in search_terms:
-            params = {"_q": term}
+        while len(all_events) < max_events:
+            url = f"{self.GAMMA_BASE}/events"
+            params = {
+                "limit": str(limit),
+                "offset": str(offset),
+                "active": "true",
+                "closed": "false",
+            }
             
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
                     response = await client.get(url, params=params)
                     
                     if response.status_code == 200:
-                        data = response.json()
-                        events = data.get("events", [])
-                        logger.info(f"Search '{term}': found {len(events)} events")
+                        events = response.json()
+                        if not events:
+                            break  # No more events
+                        
+                        logger.info(f"Fetched {len(events)} events (offset={offset})")
                         all_events.extend(events)
+                        
+                        if len(events) < limit:
+                            break  # Last page
+                        
+                        offset += limit
                     else:
-                        logger.warning(f"Search API error for '{term}': {response.status_code}")
+                        logger.error(f"Gamma API error: {response.status_code}")
+                        break
                         
             except Exception as e:
-                logger.error(f"Error searching for '{term}': {e}")
-                continue
+                logger.error(f"Error fetching events: {e}")
+                break
         
-        # Deduplicate by event ID
-        seen = set()
-        unique_events = []
-        for event in all_events:
-            event_id = event.get("id")
-            if event_id and event_id not in seen:
-                seen.add(event_id)
-                unique_events.append(event)
-        
-        logger.info(f"Total unique events from search: {len(unique_events)}")
-        return unique_events
-    
-    async def fetch_active_events(self, limit: int = 500, offset: int = 0) -> List[Dict]:
-        """Fetch active EVENTS from Gamma API"""
-        url = f"{self.GAMMA_BASE}/events"
-        params = {
-            "limit": str(limit),
-            "offset": str(offset),
-            "active": "true",
-            "closed": "false",
-        }
-        
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(url, params=params)
-                
-                if response.status_code == 200:
-                    events = response.json()
-                    logger.info(f"Fetched {len(events)} active events from Gamma")
-                    return events
-                else:
-                    logger.error(f"Gamma API error: {response.status_code}")
-                    return []
-                    
-        except Exception as e:
-            logger.error(f"Error fetching events: {e}")
-            return []
+        logger.info(f"Total fetched: {len(all_events)} active events")
+        return all_events
     
     async def get_weather_markets(self, max_hours_until_settlement: int = 48) -> List[Dict]:
         """
         Get all temperature markets settling within specified hours.
         
-        Uses search API to find temperature events, then extracts all markets.
+        Fetches up to 2000 events and filters for temperature markets.
         
         Returns:
             List of market dicts with parsed metadata
         """
-        # Use search API to find temperature events
-        all_events = await self.fetch_weather_events_via_search()
+        # Fetch events with pagination (up to 2000)
+        all_events = await self.fetch_all_active_events(max_events=2000)
         
         weather_markets = []
         now = datetime.now()
@@ -103,6 +80,7 @@ class MarketScanner:
         logger.info(f"Scanning {len(all_events)} events for temperature markets...")
         logger.info(f"Current time: {now.strftime('%Y-%m-%d %H:%M')}")
         logger.info(f"Cutoff time: {cutoff.strftime('%Y-%m-%d %H:%M')}")
+        logger.info(f"Filtering for events with temperature keywords...")
         
         temp_event_count = 0
         
