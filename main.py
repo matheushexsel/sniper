@@ -647,22 +647,21 @@ class ArbBot:
         tte = self._tte(now_ts)
 
         if not self._armed(now_ts):
+            logger.info(f"[{asset}] EXIT: not armed (tte={tte}s > {self.s.arm_before_boundary_sec}s)")
             return
         if not self._tradeable(now_ts):
-            if self.s.debug and self._debug_throttle_ok(asset, 10.0):
-                logger.info(f"[{asset}] skip: not tradeable (tte={tte}s, min_tte={self.s.min_tte_select_sec}, stop_trying<={self.s.stop_trying_before_boundary_sec})")
+            logger.info(f"[{asset}] EXIT: not tradeable (tte={tte}s, window=[{self.s.min_tte_select_sec},{self.s.max_tte_select_sec}])")
             return
         if not self._trades_per_min_ok():
-            if self.s.debug and self._debug_throttle_ok(asset, 10.0):
-                logger.info(f"[{asset}] skip: trades/min cap hit ({len(self._trade_ts)}/{self.s.max_trades_per_min})")
+            logger.info(f"[{asset}] EXIT: rate limit ({len(self._trade_ts)}/{self.s.max_trades_per_min})")
             return
         if not self._cooldown_ok():
-            if self.s.debug and self._debug_throttle_ok(asset, 10.0):
-                logger.info(f"[{asset}] skip: cooldown ({time.time()-self._last_trade:.2f}s/{self.s.cooldown_sec}s)")
+            logger.info(f"[{asset}] EXIT: cooldown ({time.time()-self._last_trade:.2f}s < {self.s.cooldown_sec}s)")
             return
 
         market = await self._resolve_market(asset)
         if not market:
+            logger.info(f"[{asset}] EXIT: market resolution failed")
             return
 
         yes_token = market["yes_token_id"]
@@ -671,16 +670,15 @@ class ArbBot:
         try:
             yes_book, no_book = await self._books(yes_token, no_token)
         except Exception as e:
-            logger.warning(f"[{asset}] book fetch failed: {e}")
+            logger.warning(f"[{asset}] EXIT: book fetch failed: {e}")
             return
 
         yes_best = _best_ask(yes_book)
         no_best = _best_ask(no_book)
         if not yes_best or not no_best:
-            if self.s.debug and self._debug_throttle_ok(asset, 5.0):
-                yb = "none" if not yes_best else f"{yes_best[0]:.4f}@{yes_best[1]:.2f}"
-                nb = "none" if not no_best else f"{no_best[0]:.4f}@{no_best[1]:.2f}"
-                logger.info(f"[{asset}] skip: missing asks (YES={yb}, NO={nb})")
+            yb = "none" if not yes_best else f"{yes_best[0]:.4f}@{yes_best[1]:.2f}"
+            nb = "none" if not no_best else f"{no_best[0]:.4f}@{no_best[1]:.2f}"
+            logger.info(f"[{asset}] EXIT: missing asks (YES={yb}, NO={nb})")
             return
 
         yes_best_p, _ = yes_best
@@ -693,20 +691,17 @@ class ArbBot:
         yes_worst = _walk_asks_for_size(yes_book, shares)
         no_worst = _walk_asks_for_size(no_book, shares)
         if yes_worst is None or no_worst is None:
-            if self.s.debug and self._debug_throttle_ok(asset, 5.0):
-                logger.info(f"[{asset}] skip: not enough ask depth (shares={shares:.0f}, notional={notional:.2f})")
+            logger.info(f"[{asset}] EXIT: insufficient depth (shares={shares:.0f}, YES_worst={yes_worst}, NO_worst={no_worst})")
             return
 
         if not _slippage_ok(yes_best_p, yes_worst, self.s.max_slippage):
-            if self.s.debug and self._debug_throttle_ok(asset, 5.0):
-                slip = (yes_worst - yes_best_p) / max(yes_best_p, 1e-9)
-                logger.info(f"[{asset}] skip: YES slippage {slip:.4f} > {self.s.max_slippage} (best={yes_best_p:.4f} worst={yes_worst:.4f})")
+            slip = (yes_worst - yes_best_p) / max(yes_best_p, 1e-9)
+            logger.info(f"[{asset}] EXIT: YES slippage {slip:.4f} > {self.s.max_slippage} (best={yes_best_p:.4f} worst={yes_worst:.4f})")
             return
 
         if not _slippage_ok(no_best_p, no_worst, self.s.max_slippage):
-            if self.s.debug and self._debug_throttle_ok(asset, 5.0):
-                slip = (no_worst - no_best_p) / max(no_best_p, 1e-9)
-                logger.info(f"[{asset}] skip: NO slippage {slip:.4f} > {self.s.max_slippage} (best={no_best_p:.4f} worst={no_worst:.4f})")
+            slip = (no_worst - no_best_p) / max(no_best_p, 1e-9)
+            logger.info(f"[{asset}] EXIT: NO slippage {slip:.4f} > {self.s.max_slippage} (best={no_best_p:.4f} worst={no_worst:.4f})")
             return
 
         total_cost = yes_worst + no_worst
@@ -721,6 +716,7 @@ class ArbBot:
         )
 
         if edge < self.s.min_edge:
+            logger.info(f"[{asset}] EXIT: edge {edge:.4f} < min_edge {self.s.min_edge:.4f}")
             return
 
         logger.info(
