@@ -1,3 +1,4 @@
+# nws_fetcher.py
 """
 National Weather Service Data Fetcher
 
@@ -9,6 +10,7 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 import pytz
+from dateutil.parser import isoparse  # Added for better parsing
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ class NWSFetcher:
                 temp_f = period.get("temperature")
                 
                 if time_str and temp_f:
-                    dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+                    dt = isoparse(time_str)  # Updated to use isoparse
                     hourly_temps.append({
                         "time": dt,
                         "temp_f": temp_f,
@@ -143,6 +145,7 @@ class OpenMeteoFetcher:
             "hourly": "temperature_2m",
             "temperature_unit": "fahrenheit",
             "forecast_days": 2,
+            "timezone": "UTC",  # Added to standardize to UTC
         }
         
         try:
@@ -194,6 +197,12 @@ class OpenMeteoFetcher:
         if not hourly_temps:
             logger.warning(f"Failed to parse any forecast data from Open-Meteo")
             return None
+        
+        # Added check for incomplete forecasts
+        if len(hourly_temps) < 24:
+            logger.warning(f"Incomplete forecast: only {len(hourly_temps)} hours")
+            if len(hourly_temps) == 0:
+                return None
         
         return {
             "hourly": hourly_temps,
