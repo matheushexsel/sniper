@@ -19,7 +19,7 @@ class MarketScanner:
     
     GAMMA_BASE = "https://gamma-api.polymarket.com"
     
-    async def fetch_active_markets(self, limit: int = 200) -> List[Dict]:
+    async def fetch_active_markets(self, limit: int = 200, tag: str = None) -> List[Dict]:
         """Fetch active markets from Gamma API"""
         url = f"{self.GAMMA_BASE}/markets"
         params = {
@@ -28,13 +28,17 @@ class MarketScanner:
             "closed": "false",
         }
         
+        # Add tag filter if specified
+        if tag:
+            params["tag"] = tag
+        
         try:
             async with httpx.AsyncClient(timeout=20) as client:
                 response = await client.get(url, params=params)
                 
                 if response.status_code == 200:
                     markets = response.json()
-                    logger.info(f"Fetched {len(markets)} active markets from Gamma")
+                    logger.info(f"Fetched {len(markets)} active markets from Gamma (tag={tag})")
                     return markets
                 else:
                     logger.error(f"Gamma API error: {response.status_code}")
@@ -54,7 +58,8 @@ class MarketScanner:
         Returns:
             List of market dicts with parsed metadata
         """
-        all_markets = await self.fetch_active_markets(limit=200)
+        # Fetch weather-tagged markets specifically
+        all_markets = await self.fetch_active_markets(limit=200, tag="weather")
         
         weather_markets = []
         now = datetime.now()
