@@ -551,6 +551,44 @@ class ArbBot:
                 return False
             raise
 
+    async def _validate_updown_market(self, yes_token: str, no_token: str, slug: str) -> bool:
+        """Validate this is actually an UP/DOWN market by checking price distribution"""
+        try:
+            yes_book, no_book = await self._books(yes_token, no_token)
+            
+            yes_best = _best_ask(yes_book)
+            no_best = _best_ask(no_book)
+            
+            if not yes_best or not no_best:
+                logger.warning(f"Validation failed for {slug}: missing asks")
+                return False
+            
+            yes_price, _ = yes_best
+            no_price, _ = no_best
+            
+            # UP/DOWN markets should have competitive pricing (both sides ~0.30-0.70)
+            # If both sides are > 0.90 or < 0.10, it's not an active UP/DOWN market
+            if yes_price > 0.90 or no_price > 0.90:
+                logger.warning(f"Validation failed for {slug}: prices too high (YES={yes_price:.4f} NO={no_price:.4f}) - not an UP/DOWN market")
+                return False
+            
+            if yes_price < 0.10 or no_price < 0.10:
+                logger.warning(f"Validation failed for {slug}: prices too low (YES={yes_price:.4f} NO={no_price:.4f}) - not an UP/DOWN market")
+                return False
+            
+            # Total should be close to 1.0 (within 0.50 of 1.0)
+            total = yes_price + no_price
+            if total < 0.50 or total > 1.50:
+                logger.warning(f"Validation failed for {slug}: total price {total:.4f} out of range - not an UP/DOWN market")
+                return False
+            
+            logger.info(f"Validated UP/DOWN market {slug}: YES={yes_price:.4f} NO={no_price:.4f} total={total:.4f}")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Validation error for {slug}: {e}")
+            return False
+
     async def _resolve_market(self, asset: str) -> Optional[Dict[str, str]]:
         until = self._invalid_until.get(asset, 0.0)
         if time.time() < until:
@@ -572,6 +610,12 @@ class ArbBot:
                     if not ok:
                         if self.s.debug:
                             logger.warning(f"[{asset}] slug={slug} has clobTokenIds but NO CLOB orderbooks (skipping).")
+                        continue
+                    
+                    # Additional validation: ensure this is actually an UP/DOWN market
+                    updown_ok = await self._validate_updown_market(info["yes_token_id"], info["no_token_id"], slug)
+                    if not updown_ok:
+                        logger.warning(f"[{asset}] slug={slug} failed UP/DOWN market validation (skipping).")
                         continue
 
                 prev = self._active.get(asset)
