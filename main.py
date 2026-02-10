@@ -58,8 +58,8 @@ class WeatherArbBot:
         logger.info(f"\n🔍 Starting scan at {datetime.now().strftime('%H:%M:%S')}")
         
         try:
-            # Step 1: Find weather markets settling within 24 hours
-            markets = await self.scanner.get_weather_markets(max_hours_until_settlement=24)
+            # Step 1: Find weather markets settling within 48 hours
+            markets = await self.scanner.get_weather_markets(max_hours_until_settlement=48)
             
             if not markets:
                 logger.info("No weather markets found")
