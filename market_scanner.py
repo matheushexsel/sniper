@@ -19,68 +19,82 @@ class MarketScanner:
     
     GAMMA_BASE = "https://gamma-api.polymarket.com"
     
-    async def fetch_all_active_events(self, max_events: int = 2000) -> List[Dict]:
-        """Fetch active events using pagination"""
-        all_events = []
-        offset = 0
-        limit = 500
+    async def fetch_weather_events_by_slug(self) -> List[Dict]:
+        """
+        Fetch temperature events by constructing slugs directly.
+        Pattern: highest-temperature-in-{city}-on-{month}-{day}-{year}
+        """
+        # Cities with their slug names
+        cities = [
+            "nyc", "new-york", "london", "chicago", "seattle", 
+            "dallas", "miami", "atlanta", "boston", "denver", 
+            "phoenix", "seoul", "toronto", "buenos-aires", 
+            "ankara", "wellington", "los-angeles", "la"
+        ]
         
-        while len(all_events) < max_events:
-            url = f"{self.GAMMA_BASE}/events"
-            params = {
-                "limit": str(limit),
-                "offset": str(offset),
-                "active": "true",
-                "closed": "false",
-            }
-            
-            try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    response = await client.get(url, params=params)
-                    
-                    if response.status_code == 200:
-                        events = response.json()
-                        if not events:
-                            break  # No more events
-                        
-                        logger.info(f"Fetched {len(events)} events (offset={offset})")
-                        all_events.extend(events)
-                        
-                        if len(events) < limit:
-                            break  # Last page
-                        
-                        offset += limit
-                    else:
-                        logger.error(f"Gamma API error: {response.status_code}")
-                        break
-                        
-            except Exception as e:
-                logger.error(f"Error fetching events: {e}")
-                break
+        # Get today + next 2 days
+        today = datetime.now()
+        dates = [(today + timedelta(days=i)) for i in range(3)]
         
-        logger.info(f"Total fetched: {len(all_events)} active events")
-        return all_events
+        events = []
+        seen_ids = set()
+        
+        for city in cities:
+            for date in dates:
+                # Format: highest-temperature-in-{city}-on-february-10-2026
+                month_name = date.strftime("%B").lower()
+                day = date.day
+                year = date.year
+                
+                slug = f"highest-temperature-in-{city}-on-{month_name}-{day}-{year}"
+                
+                url = f"{self.GAMMA_BASE}/events/slug/{slug}"
+                
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        response = await client.get(url)
+                        
+                        if response.status_code == 200:
+                            event = response.json()
+                            event_id = event.get("id")
+                            
+                            # Deduplicate (NYC and new-york might return same event)
+                            if event_id and event_id not in seen_ids:
+                                seen_ids.add(event_id)
+                                events.append(event)
+                                logger.info(f"✅ {slug}")
+                        elif response.status_code == 404:
+                            # Event doesn't exist, skip quietly
+                            pass
+                        else:
+                            logger.warning(f"❌ {slug}: HTTP {response.status_code}")
+                            
+                except Exception as e:
+                    logger.warning(f"❌ {slug}: {e}")
+                    continue
+        
+        logger.info(f"\n🎯 Fetched {len(events)} unique weather events")
+        return events
     
     async def get_weather_markets(self, max_hours_until_settlement: int = 48) -> List[Dict]:
         """
         Get all temperature markets settling within specified hours.
         
-        Fetches up to 2000 events and filters for temperature markets.
+        Fetches events by constructing slugs directly - much faster!
         
         Returns:
             List of market dicts with parsed metadata
         """
-        # Fetch events with pagination (up to 2000)
-        all_events = await self.fetch_all_active_events(max_events=2000)
+        # Fetch events by slug (fast and targeted)
+        all_events = await self.fetch_weather_events_by_slug()
         
         weather_markets = []
         now = datetime.now()
         cutoff = now + timedelta(hours=max_hours_until_settlement)
         
-        logger.info(f"Scanning {len(all_events)} events for temperature markets...")
+        logger.info(f"Processing {len(all_events)} weather events...")
         logger.info(f"Current time: {now.strftime('%Y-%m-%d %H:%M')}")
         logger.info(f"Cutoff time: {cutoff.strftime('%Y-%m-%d %H:%M')}")
-        logger.info(f"Filtering for events with temperature keywords...")
         
         temp_event_count = 0
         
@@ -88,38 +102,35 @@ class MarketScanner:
             try:
                 event_title = event.get("title", "")
                 
-                # Debug: Log if no title
                 if not event_title:
-                    logger.warning(f"Event has no title! Keys: {list(event.keys())[:10]}")
-                    continue
-                
-                # Filter for temperature events
-                if not self._is_temperature_event(event_title):
                     continue
                 
                 temp_event_count += 1
-                logger.info(f"Found temp event #{temp_event_count}: {event_title}")
+                logger.info(f"Processing event #{temp_event_count}: {event_title}")
                 
                 # Check settlement time
                 end_date_str = event.get("endDate") or event.get("end_date_iso")
                 if not end_date_str:
-                    logger.warning(f"  No end date")
+                    logger.warning(f"  ❌ No end date")
                     continue
                 
                 try:
                     end_date = dateutil.parser.parse(end_date_str)
+                    # Convert to naive datetime for comparison
+                    if end_date.tzinfo is not None:
+                        end_date = end_date.replace(tzinfo=None)
                 except Exception as e:
-                    logger.warning(f"  Could not parse date: {e}")
+                    logger.warning(f"  ❌ Could not parse date '{end_date_str}': {e}")
                     continue
                 
                 # Skip if settling too far in future
                 if end_date > cutoff:
-                    logger.info(f"  Settles too far: {end_date.strftime('%Y-%m-%d %H:%M')}")
+                    logger.info(f"  ⏭️  Too far: settles {end_date.strftime('%Y-%m-%d %H:%M')} (>{max_hours_until_settlement}h)")
                     continue
                 
                 # Skip if already settled
                 if end_date < now:
-                    logger.info(f"  Already settled")
+                    logger.info(f"  ⏭️  Already settled: {end_date.strftime('%Y-%m-%d %H:%M')}")
                     continue
                 
                 # Parse city from title
