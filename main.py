@@ -175,135 +175,109 @@ class Settings:
 
 
 # ----------------------------
-# Time + slug helpers
+# Time helpers
 # ----------------------------
 
 def _bucket_start(ts: int, window_sec: int) -> int:
     return (ts // window_sec) * window_sec
 
 
-def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: int, behind: int) -> List[str]:
-    """
-    Generate candidate slugs for UP/DOWN markets.
-    
-    CRITICAL: The slug timestamp is the MARKET START time.
-    We prioritize CURRENT and FUTURE markets over past ones.
-    """
-    asset_l = asset.lower()
-    minutes = int(window_sec / 60)
-    
-    # Current bucket start time (this IS the slug timestamp for the current market)
-    current_bucket_start = _bucket_start(now_ts, window_sec)
-    
-    out: List[str] = []
-    
-    # Generate current market FIRST
-    out.append(f"{asset_l}-updown-{minutes}m-{current_bucket_start}")
-    
-    # Then future markets
-    for off in range(1, ahead + 1):
-        future_start = current_bucket_start + off * window_sec
-        out.append(f"{asset_l}-updown-{minutes}m-{future_start}")
-    
-    # Then past markets (in case we're slightly late to a window)
-    for off in range(1, behind + 1):
-        past_start = current_bucket_start - off * window_sec
-        out.append(f"{asset_l}-updown-{minutes}m-{past_start}")
-    
-    return out
-
-
 # ----------------------------
-# Polymarket event page resolver
+# CLOB API Market Discovery
 # ----------------------------
 
-_NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
-
-
-async def fetch_market_from_event_page(slug: str) -> Dict[str, Any]:
-    slug = slug.split("?")[0].strip()
-    url = f"https://polymarket.com/event/{slug}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-        r = await client.get(url, headers=headers)
+async def fetch_markets_from_clob(clob_host: str, tag: str = "crypto") -> List[Dict[str, Any]]:
+    """Fetch markets directly from CLOB API"""
+    url = f"{clob_host}/markets"
+    params = {"tag": tag, "active": "true"}
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params=params)
         r.raise_for_status()
-        html = r.text
+        return r.json()
 
-    m = _NEXT_DATA_RE.search(html)
-    if not m:
-        raise RuntimeError("__NEXT_DATA__ payload not found on event page")
 
-    payload = json.loads(m.group(1))
-    queries = (
-        payload.get("props", {})
-        .get("pageProps", {})
-        .get("dehydratedState", {})
-        .get("queries", [])
-    )
-
-    market_obj: Optional[Dict[str, Any]] = None
-
-    for q in queries:
-        data = q.get("state", {}).get("data")
-        if isinstance(data, dict) and "markets" in data and isinstance(data["markets"], list):
-            for mk in data["markets"]:
-                if isinstance(mk, dict) and mk.get("slug") == slug:
-                    market_obj = mk
-                    break
-        if market_obj:
-            break
-
-    if not market_obj:
-        raise RuntimeError("Market slug not found in dehydrated state")
-
-    # Also extract end_date for t_end calculation
-    end_date = market_obj.get("endDate") or market_obj.get("end_date")
-    if end_date:
-        # endDate is typically ISO timestamp or unix timestamp
+def find_15min_updown_market(markets: List[Dict[str, Any]], asset: str, now_ts: int, window_sec: int) -> Optional[Dict[str, Any]]:
+    """
+    Find the current 15-minute UP/DOWN market for an asset.
+    
+    Markets should have:
+    - question containing "Up or Down" and the asset name
+    - end_date_iso within the current 15-minute window
+    """
+    asset_upper = asset.upper()
+    current_bucket_start = _bucket_start(now_ts, window_sec)
+    current_bucket_end = current_bucket_start + window_sec
+    
+    # Look for markets ending in the current or next window (±30 min buffer)
+    min_end = current_bucket_start - 1800  # 30 min before
+    max_end = current_bucket_end + 1800    # 30 min after
+    
+    candidates = []
+    
+    for market in markets:
         try:
-            if isinstance(end_date, str):
-                import dateutil.parser
-                end_date = int(dateutil.parser.parse(end_date).timestamp())
-            else:
-                end_date = int(end_date)
+            # Check question contains "Up or Down" and asset
+            question = market.get("question", "")
+            if "up or down" not in question.lower():
+                continue
+            if asset_upper not in question.upper():
+                continue
+            
+            # Check it's a 15-minute market (not hourly, daily, etc)
+            if "15" not in question and "15m" not in question.lower():
+                continue
+            
+            # Check end time is in reasonable range
+            end_date_iso = market.get("end_date_iso")
+            if end_date_iso:
+                try:
+                    import dateutil.parser
+                    end_ts = int(dateutil.parser.parse(end_date_iso).timestamp())
+                    if min_end <= end_ts <= max_end:
+                        candidates.append((end_ts, market))
+                except Exception:
+                    continue
         except Exception:
-            end_date = None
+            continue
+    
+    if not candidates:
+        return None
+    
+    # Sort by end time, prefer the one closest to current bucket end
+    candidates.sort(key=lambda x: abs(x[0] - current_bucket_end))
+    return candidates[0][1]
 
-    return {"market": market_obj, "end_date": end_date}
 
-
-def extract_yes_no_tokens_from_market(market_obj: Dict[str, Any], slug: str) -> Dict[str, str]:
-    clob_tokens = market_obj.get("clobTokenIds") or market_obj.get("clob_token_ids") or []
-    outcomes = market_obj.get("outcomes") or market_obj.get("outcomeNames") or []
-
-    if isinstance(clob_tokens, str):
-        try:
-            clob_tokens = json.loads(clob_tokens)
-        except Exception:
-            clob_tokens = []
-
-    if not isinstance(clob_tokens, list) or len(clob_tokens) < 2:
-        raise RuntimeError(f"event-page missing usable clobTokenIds for slug={slug}")
-
-    if not isinstance(outcomes, list) or len(outcomes) < 2:
-        outcomes = ["Up", "Down"]
-
-    # UP is index 0, DOWN is index 1 (typically)
-    up_idx, down_idx = 0, 1
-    l0 = str(outcomes[0]).strip().lower()
-    l1 = str(outcomes[1]).strip().lower()
-    if "down" in l0 and "up" in l1:
-        up_idx, down_idx = 1, 0
-
-    return {
-        "slug": slug,
-        "market_id": str(market_obj.get("id") or market_obj.get("marketId") or ""),
-        "up_token_id": str(clob_tokens[up_idx]),
-        "down_token_id": str(clob_tokens[down_idx]),
-        "up_label": str(outcomes[up_idx]),
-        "down_label": str(outcomes[down_idx]),
-    }
+def extract_tokens_from_clob_market(market: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Extract UP/DOWN token IDs from CLOB market response"""
+    try:
+        tokens = market.get("tokens") or market.get("clobTokenIds") or []
+        outcomes = market.get("outcomes") or []
+        
+        if len(tokens) < 2 or len(outcomes) < 2:
+            return None
+        
+        # UP is typically index 0, DOWN is index 1
+        up_idx, down_idx = 0, 1
+        
+        # But check outcome labels to be sure
+        if len(outcomes) >= 2:
+            l0 = str(outcomes[0]).strip().lower()
+            l1 = str(outcomes[1]).strip().lower()
+            if "down" in l0 and "up" in l1:
+                up_idx, down_idx = 1, 0
+        
+        return {
+            "condition_id": market.get("condition_id", ""),
+            "question": market.get("question", ""),
+            "up_token_id": str(tokens[up_idx]),
+            "down_token_id": str(tokens[down_idx]),
+            "end_date_iso": market.get("end_date_iso", ""),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to extract tokens from market: {e}")
+        return None
 
 
 # ----------------------------
@@ -579,73 +553,79 @@ class MomentumBot:
             return False
 
     async def _resolve_current_market(self) -> Optional[MarketState]:
-        """Find and validate the current 15-minute market"""
+        """Find and validate the current 15-minute market via CLOB API"""
         if time.time() < self._invalid_until:
             return self._current_state
 
         now_ts = int(time.time())
-        cands = _compute_candidate_slugs(
-            self.s.asset, now_ts, self.s.window_sec, 
-            self.s.slug_scan_buckets_ahead, self.s.slug_scan_buckets_behind
-        )[: self.s.max_slug_lookups]
-
-        logger.info(f"🔍 Scanning {len(cands)} candidate slugs (now={now_ts}): {cands[:3]}...")
-
-        for slug in cands:
+        
+        try:
+            # Fetch all active crypto markets from CLOB
+            markets = await fetch_markets_from_clob(self.s.clob_host, tag="crypto")
+            logger.info(f"🔍 Fetched {len(markets)} active crypto markets from CLOB API")
+            
+            # Find the current 15-minute UP/DOWN market for this asset
+            market = find_15min_updown_market(markets, self.s.asset, now_ts, self.s.window_sec)
+            
+            if not market:
+                logger.warning(f"[{self.s.asset}] No 15-minute UP/DOWN market found in CLOB response")
+                self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+                return None
+            
+            # Extract token IDs
+            info = extract_tokens_from_clob_market(market)
+            if not info:
+                logger.warning(f"[{self.s.asset}] Failed to extract tokens from market")
+                self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+                return None
+            
+            # Validate it's an active UP/DOWN market with real orderbooks
+            ok = await self._validate_updown_market(info["up_token_id"], info["down_token_id"], info["question"])
+            if not ok:
+                logger.warning(f"[{self.s.asset}] Market validation failed: {info['question']}")
+                self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+                return None
+            
+            # Parse end time
             try:
-                result = await fetch_market_from_event_page(slug)
-                market_obj = result["market"]
-                end_date = result["end_date"]
-                
-                info = extract_yes_no_tokens_from_market(market_obj, slug)
-                
-                # Validate it's an active UP/DOWN market
-                ok = await self._validate_updown_market(info["up_token_id"], info["down_token_id"], slug)
-                if not ok:
-                    continue
-                
-                # Calculate t_start and t_end
-                if end_date:
-                    t_end = end_date
-                else:
-                    # Fallback: parse from slug timestamp
-                    try:
-                        ts_from_slug = int(slug.split("-")[-1])
-                        t_end = ts_from_slug + self.s.window_sec
-                    except Exception:
-                        logger.warning(f"Could not parse end time from slug {slug}")
-                        continue
-                
-                t_start = t_end - self.s.window_sec
-                
-                # Check if this is a new market or same as current
-                if self._current_state and self._current_state.slug == slug:
+                import dateutil.parser
+                t_end = int(dateutil.parser.parse(info["end_date_iso"]).timestamp())
+            except Exception:
+                logger.warning(f"[{self.s.asset}] Failed to parse end_date_iso: {info.get('end_date_iso')}")
+                self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+                return None
+            
+            t_start = t_end - self.s.window_sec
+            
+            # Check if this is the same market we already have
+            if self._current_state:
+                if (self._current_state.up_token_id == info["up_token_id"] and 
+                    self._current_state.down_token_id == info["down_token_id"]):
                     # Same market, just return existing state
                     self._invalid_until = time.time() + self.s.resolve_cache_sec
                     return self._current_state
-                
-                # New market found
-                state = MarketState(
-                    slug=slug,
-                    up_token_id=info["up_token_id"],
-                    down_token_id=info["down_token_id"],
-                    t_start=t_start,
-                    t_end=t_end,
-                )
-                
-                logger.info(f"🎯 NEW MARKET: {slug} | UP={info['up_token_id'][:16]}... DOWN={info['down_token_id'][:16]}...")
-                logger.info(f"   Start: {t_start} | End: {t_end} | Window: {self.s.window_sec}s")
-                
-                self._current_state = state
-                self._invalid_until = time.time() + self.s.resolve_cache_sec
-                return state
-
-            except Exception as e:
-                continue
-
-        logger.warning(f"[{self.s.asset}] Could not resolve any active UP/DOWN market")
-        self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
-        return None
+            
+            # New market found
+            state = MarketState(
+                slug=info["question"],  # Use question as "slug"
+                up_token_id=info["up_token_id"],
+                down_token_id=info["down_token_id"],
+                t_start=t_start,
+                t_end=t_end,
+            )
+            
+            logger.info(f"🎯 NEW MARKET: {info['question'][:80]}")
+            logger.info(f"   UP={info['up_token_id'][:16]}... DOWN={info['down_token_id'][:16]}...")
+            logger.info(f"   Start: {t_start} | End: {t_end} | Window: {self.s.window_sec}s")
+            
+            self._current_state = state
+            self._invalid_until = time.time() + self.s.resolve_cache_sec
+            return state
+            
+        except Exception as e:
+            logger.error(f"[{self.s.asset}] CLOB API error: {e}")
+            self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
+            return None
 
     async def _books(self, up_token: str, down_token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         t1 = asyncio.to_thread(self.trader.get_order_book, up_token)
