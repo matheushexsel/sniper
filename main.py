@@ -194,7 +194,39 @@ async def fetch_markets_from_clob(clob_host: str, tag: str = "crypto") -> List[D
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url, params=params)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        
+        # Log raw response for debugging
+        logger.info(f"DEBUG: CLOB API raw response type: {type(data)}")
+        logger.info(f"DEBUG: CLOB API raw response (first 500 chars): {str(data)[:500]}")
+        
+        # Handle different response formats
+        if isinstance(data, dict):
+            # Response might be wrapped in a data field
+            if "data" in data:
+                markets = data["data"]
+            elif "markets" in data:
+                markets = data["markets"]
+            else:
+                # The dict itself might be the market list
+                markets = [data]
+        elif isinstance(data, list):
+            markets = data
+        else:
+            logger.error(f"Unexpected CLOB API response type: {type(data)}")
+            return []
+        
+        # Ensure we have a list of dicts
+        if not isinstance(markets, list):
+            markets = [markets]
+        
+        logger.info(f"DEBUG: Parsed {len(markets)} markets")
+        if markets:
+            logger.info(f"DEBUG: First market type: {type(markets[0])}")
+            if isinstance(markets[0], dict):
+                logger.info(f"DEBUG: First market keys: {list(markets[0].keys())[:10]}")
+        
+        return markets
 
 
 def find_15min_updown_market(markets: List[Dict[str, Any]], asset: str, now_ts: int, window_sec: int) -> Optional[Dict[str, Any]]:
