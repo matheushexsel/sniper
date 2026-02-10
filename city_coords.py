@@ -25,6 +25,8 @@ INTL_CITIES = {
     "Seoul": ("Seoul", 37.5665, 126.9780, "Asia/Seoul"),
     "Toronto": ("Toronto", 43.6532, -79.3832, "America/Toronto"),
     "Buenos Aires": ("Buenos Aires", -34.6037, -58.3816, "America/Argentina/Buenos_Aires"),
+    "Ankara": ("Ankara", 39.9334, 32.8597, "Europe/Istanbul"),
+    "Wellington": ("Wellington", -41.2865, 174.7762, "Pacific/Auckland"),
 }
 
 

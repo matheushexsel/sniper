@@ -151,13 +151,26 @@ class MarketScanner:
                             logger.warning(f"    Could not parse temp from: {question[:60]}")
                             continue
                         
+                        # Extract token IDs - handle both possible field names
+                        clob_token_ids = market.get("clobTokenIds") or market.get("clob_token_ids") or []
+                        
+                        # Validate token IDs before adding market
+                        if not clob_token_ids or len(clob_token_ids) < 2:
+                            logger.warning(f"    ⚠️  Market missing token IDs: {question[:40]}")
+                            continue
+                        
+                        # Ensure token IDs are strings and non-empty
+                        if not all(isinstance(tid, str) and len(tid) > 10 for tid in clob_token_ids[:2]):
+                            logger.warning(f"    ⚠️  Invalid token IDs in market: {clob_token_ids}")
+                            continue
+                        
                         # Build enriched market object
                         enriched = {
                             "event_title": event_title,
                             "question": question,
                             "slug": market.get("slug", ""),
                             "market_id": market.get("id", ""),
-                            "clob_token_ids": market.get("clobTokenIds", []),
+                            "clob_token_ids": clob_token_ids,  # Now validated
                             "outcomes": market.get("outcomes", []),
                             "end_date": end_date,
                             "volume": market.get("volume", 0),
@@ -240,12 +253,14 @@ class MarketScanner:
             "Highest temperature in NYC on February 10?" with outcome "26-27°F"
             "Will NYC hit 85°F+ on Feb 15?"
             "Temperature below 0°C in London"
+            "33°F or below"
+            "44°F or higher"
         
         Returns:
             Dict with min, max, unit or None
         """
-        # Pattern 1: Range format "XX-YY°F" or "XX-YY°C"
-        range_pattern = r'(\d+)-(\d+)\s*°([FC])'
+        # Pattern 1: Range format "XX-YY°F" or "XX-YY°C" or "between XX-YY°F"
+        range_pattern = r'(?:between\s+)?(\d+)\s*-\s*(\d+)\s*°([FC])'
         match = re.search(range_pattern, question)
         if match:
             min_temp = float(match.group(1))
@@ -253,23 +268,32 @@ class MarketScanner:
             unit = match.group(3)
             return {"min": min_temp, "max": max_temp, "unit": unit}
         
-        # Pattern 2: Single temp with operator "85°F+" or "below 0°C"
-        single_pattern = r'(\d+)\s*°([FC])\s*(\+|or\s+above|or\s+higher)'
-        match = re.search(single_pattern, question, re.IGNORECASE)
+        # Pattern 2: "XX°F or higher" / "XX°C or above"
+        higher_pattern = r'(\d+)\s*°([FC])\s*(?:or\s+)?(?:higher|above)'
+        match = re.search(higher_pattern, question, re.IGNORECASE)
         if match:
             temp = float(match.group(1))
             unit = match.group(2)
-            return {"min": temp, "max": temp + 100, "unit": unit}  # Upper bound for "+"
+            return {"min": temp, "max": temp + 100, "unit": unit}
         
-        below_pattern = r'(below|under)\s+(\d+)\s*°([FC])'
+        # Pattern 3: "XX°F or below" / "XX°C or lower"  
+        lower_pattern = r'(\d+)\s*°([FC])\s*(?:or\s+)?(?:below|lower|under)'
+        match = re.search(lower_pattern, question, re.IGNORECASE)
+        if match:
+            temp = float(match.group(1))
+            unit = match.group(2)
+            return {"min": -100, "max": temp, "unit": unit}
+        
+        # Pattern 4: "below XX°F" / "under XX°C"
+        below_pattern = r'(?:below|under)\s+(\d+)\s*°([FC])'
         match = re.search(below_pattern, question, re.IGNORECASE)
         if match:
-            temp = float(match.group(2))
-            unit = match.group(3)
-            return {"min": -100, "max": temp, "unit": unit}  # Lower bound for "below"
+            temp = float(match.group(1))
+            unit = match.group(2)
+            return {"min": -100, "max": temp, "unit": unit}
         
-        # Pattern 3: Exact temp "33°F"
-        exact_pattern = r'(\d+)\s*°([FC])(?!\s*(?:-|\+|or))'
+        # Pattern 5: Exact temp "33°F" (single degree)
+        exact_pattern = r'(?:be\s+)?(\d+)\s*°([FC])\s+on'
         match = re.search(exact_pattern, question)
         if match:
             temp = float(match.group(1))
