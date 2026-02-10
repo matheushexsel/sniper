@@ -1,5 +1,7 @@
-# main.py
-# Polymarket 15-minute CLOB arbitrage bot
+# momentum_strategy.py
+# 15-Minute Momentum Ladder Strategy
+# Buy both sides at start, then ladder into the winning side, exit before close
+
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +9,6 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import time
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ def _setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-logger = logging.getLogger("arb15m")
+logger = logging.getLogger("momentum15m")
 
 
 # ----------------------------
@@ -89,7 +90,6 @@ def _env_json_list(*keys: str, default: List[str]) -> List[str]:
 class Settings:
     # APIs
     clob_host: str
-    data_api_base: str
 
     # auth
     chain_id: int
@@ -101,53 +101,42 @@ class Settings:
     api_secret: str
     api_passphrase: str
 
-    # strategy timing
-    window_sec: int
-    arm_before_boundary_sec: int
-    stop_trying_before_boundary_sec: int
-    min_tte_select_sec: int
-    max_tte_select_sec: int
-
-    assets: List[str]
+    # Timing constants (seconds)
+    window_sec: int  # 900 (15 minutes)
+    eval_interval_sec: int  # 120 (2 minutes)
+    num_evals: int  # 6 evaluations
+    exit_time_sec: int  # 780 (13 minutes) - when to force exit
+    
+    # Asset
+    asset: str  # "BTC"
 
     # loop
     poll_sec: float
     log_every_sec: float
-    debug: bool
 
-    # sizing
-    min_usdc: float
-    max_usdc: float
-    base_usdc: float
-    step_usdc: float
-    size_mult: float
+    # Sizing (all in USDC)
+    base_usdc_per_side: float  # $1 per side at start
+    step_usdc: float  # $1 per add
 
-    # risk
-    min_edge: float
-    max_slippage: float
+    # Risk
+    max_slippage: float  # 0.05 (5%)
+    min_price_delta: float  # 0.0001 - minimum price change to trigger add
 
-    # execution
+    # Execution
     dry_run: bool
-    max_trades_per_min: int
-    cooldown_sec: float
     fill_timeout_sec: float
     max_retries: int
-    sell_opposite: bool
 
-    # slug scanning
+    # Market resolution
     max_slug_lookups: int
     slug_scan_buckets_ahead: int
     slug_scan_buckets_behind: int
-
-    # resolver
-    resolve_validate_orderbook: bool
     resolve_cache_sec: float
 
     @staticmethod
     def load() -> "Settings":
         return Settings(
             clob_host=_env("CLOB_HOST", default="https://clob.polymarket.com"),
-            data_api_base=_env("DATA_API_BASE", default="https://data-api.polymarket.com"),
 
             chain_id=_env_int("CHAIN_ID", default=137),
             signature_type=_env_int("PM_SIGNATURE_TYPE", default=2),
@@ -159,38 +148,28 @@ class Settings:
             api_passphrase=_env("PM_API_PASSPHRASE", default=""),
 
             window_sec=_env_int("WINDOW_SEC", default=900),
-            arm_before_boundary_sec=_env_int("ARM_BEFORE_BOUNDARY_SEC", default=900),
-            stop_trying_before_boundary_sec=_env_int("STOP_TRYING_BEFORE_boundary_SEC", default=3),
-            min_tte_select_sec=_env_int("MIN_TTE_SELECT_SEC", default=10),
-            max_tte_select_sec=_env_int("MAX_TTE_SELECT_SEC", default=900),
+            eval_interval_sec=_env_int("EVAL_INTERVAL_SEC", default=120),
+            num_evals=_env_int("NUM_EVALS", default=6),
+            exit_time_sec=_env_int("EXIT_TIME_SEC", default=780),
 
-            assets=_env_json_list("ASSETS", default=["BTC"]),
+            asset=_env("ASSET", default="BTC"),
 
-            poll_sec=_env_float("POLL_SEC", default=2.0),
-            log_every_sec=_env_float("LOG_EVERY_SEC", default=15.0),
-            debug=_env_bool("DEBUG", default=False),
+            poll_sec=_env_float("POLL_SEC", default=1.0),
+            log_every_sec=_env_float("LOG_EVERY_SEC", default=30.0),
 
-            min_usdc=_env_float("MIN_USDC", default=1.0),
-            max_usdc=_env_float("MAX_USDC", default=3.0),
-            base_usdc=_env_float("BASE_USDC", default=1.0),
+            base_usdc_per_side=_env_float("BASE_USDC_PER_SIDE", default=1.0),
             step_usdc=_env_float("STEP_USDC", default=1.0),
-            size_mult=_env_float("SIZE_MULT", default=0.25),
 
-            min_edge=_env_float("MIN_EDGE", default=0.02),
-            max_slippage=_env_float("MAX_SLIPPAGE", default=0.02),
+            max_slippage=_env_float("MAX_SLIPPAGE", default=0.05),
+            min_price_delta=_env_float("MIN_PRICE_DELTA", default=0.0001),
 
             dry_run=_env_bool("DRY_RUN", default=True),
-            max_trades_per_min=_env_int("MAX_TRADES_PER_MIN", default=20),
-            cooldown_sec=_env_float("COOLDOWN_SEC", default=0.25),
             fill_timeout_sec=_env_float("FILL_TIMEOUT_SEC", default=2.0),
             max_retries=_env_int("MAX_RETRIES", default=3),
-            sell_opposite=_env_bool("SELL_OPPOSITE", default=True),
 
             max_slug_lookups=_env_int("MAX_SLUG_LOOKUPS", default=50),
-            slug_scan_buckets_ahead=_env_int("SLUG_SCAN_BUCKETS_AHEAD", default=12),
-            slug_scan_buckets_behind=_env_int("SLUG_SCAN_BUCKETS_BEHIND", default=12),
-
-            resolve_validate_orderbook=_env_bool("RESOLVE_VALIDATE_ORDERBOOK", default=True),
+            slug_scan_buckets_ahead=_env_int("SLUG_SCAN_BUCKETS_AHEAD", default=2),
+            slug_scan_buckets_behind=_env_int("SLUG_SCAN_BUCKETS_BEHIND", default=2),
             resolve_cache_sec=_env_float("RESOLVE_CACHE_SEC", default=10.0),
         )
 
@@ -212,7 +191,6 @@ def _compute_candidate_slugs(asset: str, now_ts: int, window_sec: int, ahead: in
     for off in range(-behind, ahead + 1):
         start_ts = base + off * window_sec
         out.append(f"{asset_l}-updown-{minutes}m-{start_ts}")
-        out.append(f"{asset_l}-updown-{minutes}m-{start_ts + window_sec}")
 
     seen = set()
     dedup: List[str] = []
@@ -267,7 +245,20 @@ async def fetch_market_from_event_page(slug: str) -> Dict[str, Any]:
     if not market_obj:
         raise RuntimeError("Market slug not found in dehydrated state")
 
-    return market_obj
+    # Also extract end_date for t_end calculation
+    end_date = market_obj.get("endDate") or market_obj.get("end_date")
+    if end_date:
+        # endDate is typically ISO timestamp or unix timestamp
+        try:
+            if isinstance(end_date, str):
+                import dateutil.parser
+                end_date = int(dateutil.parser.parse(end_date).timestamp())
+            else:
+                end_date = int(end_date)
+        except Exception:
+            end_date = None
+
+    return {"market": market_obj, "end_date": end_date}
 
 
 def extract_yes_no_tokens_from_market(market_obj: Dict[str, Any], slug: str) -> Dict[str, str]:
@@ -284,26 +275,27 @@ def extract_yes_no_tokens_from_market(market_obj: Dict[str, Any], slug: str) -> 
         raise RuntimeError(f"event-page missing usable clobTokenIds for slug={slug}")
 
     if not isinstance(outcomes, list) or len(outcomes) < 2:
-        outcomes = ["Yes", "No"]
+        outcomes = ["Up", "Down"]
 
-    yes_idx, no_idx = 0, 1
+    # UP is index 0, DOWN is index 1 (typically)
+    up_idx, down_idx = 0, 1
     l0 = str(outcomes[0]).strip().lower()
     l1 = str(outcomes[1]).strip().lower()
-    if l0 == "no" and l1 == "yes":
-        yes_idx, no_idx = 1, 0
+    if "down" in l0 and "up" in l1:
+        up_idx, down_idx = 1, 0
 
     return {
         "slug": slug,
         "market_id": str(market_obj.get("id") or market_obj.get("marketId") or ""),
-        "yes_token_id": str(clob_tokens[yes_idx]),
-        "no_token_id": str(clob_tokens[no_idx]),
-        "yes_label": str(outcomes[yes_idx]),
-        "no_label": str(outcomes[no_idx]),
+        "up_token_id": str(clob_tokens[up_idx]),
+        "down_token_id": str(clob_tokens[down_idx]),
+        "up_label": str(outcomes[up_idx]),
+        "down_label": str(outcomes[down_idx]),
     }
 
 
 # ----------------------------
-# Orderbook normalization + helpers
+# Orderbook helpers
 # ----------------------------
 
 def _book_to_dict(book: Any) -> Dict[str, Any]:
@@ -443,14 +435,15 @@ class PolymarketTrader:
         except Exception:
             pass
 
-    def place_limit_buy_fok(self, token_id: str, size: float, price: float) -> Dict[str, Any]:
+    def place_limit_buy(self, token_id: str, size: float, price: float, ioc: bool = True) -> Dict[str, Any]:
         args = OrderArgs(price=float(price), size=float(size), side=BUY, token_id=str(token_id))
-        opts = PartialCreateOrderOptions(tif=OrderType.FOK)
+        opts = PartialCreateOrderOptions(tif=OrderType.FOK if ioc else OrderType.GTC)
         return self.client.create_and_post_order(args, opts)
 
-    def place_limit_sell_fak(self, token_id: str, size: float, price: float) -> Dict[str, Any]:
+    def place_limit_sell(self, token_id: str, size: float, price: float) -> Dict[str, Any]:
+        # Use GTC (Good-Til-Cancel) for sells to earn maker rebates
         args = OrderArgs(price=float(price), size=float(size), side=SELL, token_id=str(token_id))
-        opts = PartialCreateOrderOptions(tif=OrderType.FAK)
+        opts = PartialCreateOrderOptions(tif=OrderType.GTC)
         return self.client.create_and_post_order(args, opts)
 
 
@@ -492,163 +485,159 @@ def _filled_size(o: Dict[str, Any]) -> float:
 
 
 # ----------------------------
-# Bot - DIAGNOSTIC VERSION
+# Market State Tracker
 # ----------------------------
 
-class ArbBot:
+@dataclass
+class MarketState:
+    slug: str
+    up_token_id: str
+    down_token_id: str
+    t_start: int  # Calculated as t_end - 900
+    t_end: int
+    
+    # Execution state
+    base_done: bool = False
+    eval_index: int = 0  # How many 2-min evals completed (0-6)
+    exit_done: bool = False
+    
+    # Positions (shares held)
+    pos_up_qty: float = 0.0
+    pos_down_qty: float = 0.0
+    
+    # Last evaluation prices (for delta calc)
+    last_eval_ask_up: Optional[float] = None
+    last_eval_ask_down: Optional[float] = None
+
+
+# ----------------------------
+# Momentum Strategy Bot
+# ----------------------------
+
+class MomentumBot:
     def __init__(self, s: Settings):
         self.s = s
         self.trader = PolymarketTrader(s)
-
-        self._active: Dict[str, Dict[str, str]] = {}
-        self._invalid_until: Dict[str, float] = {}
-        self._last_trade = 0.0
-        self._trade_ts: List[float] = []
+        
+        self._current_state: Optional[MarketState] = None
+        self._invalid_until: float = 0.0
         self._last_heartbeat = 0.0
-        self._last_debug_log: Dict[str, float] = {}
 
-    def _trades_per_min_ok(self) -> bool:
-        now = time.time()
-        cutoff = now - 60.0
-        self._trade_ts = [t for t in self._trade_ts if t >= cutoff]
-        return len(self._trade_ts) < self.s.max_trades_per_min
+    def _elapsed(self, state: MarketState) -> int:
+        """Seconds elapsed since market start"""
+        return int(time.time()) - state.t_start
 
-    def _cooldown_ok(self) -> bool:
-        return (time.time() - self._last_trade) >= self.s.cooldown_sec
+    def _tte(self, state: MarketState) -> int:
+        """Time to expiry in seconds"""
+        return state.t_end - int(time.time())
 
-    def _tte(self, now_ts: int) -> int:
-        window_start = _bucket_start(now_ts, self.s.window_sec)
-        boundary = window_start + self.s.window_sec
-        return boundary - now_ts
-
-    def _armed(self, now_ts: int) -> bool:
-        return self._tte(now_ts) <= self.s.arm_before_boundary_sec
-
-    def _tradeable(self, now_ts: int) -> bool:
-        tte = self._tte(now_ts)
-        if tte <= self.s.stop_trying_before_boundary_sec:
-            return False
-        return self.s.min_tte_select_sec <= tte <= self.s.max_tte_select_sec
-
-    def _debug_throttle_ok(self, asset: str, every_sec: float = 5.0) -> bool:
-        now = time.time()
-        last = self._last_debug_log.get(asset, 0.0)
-        if now - last >= every_sec:
-            self._last_debug_log[asset] = now
-            return True
-        return False
-
-    async def _validate_orderbooks(self, yes_token: str, no_token: str) -> bool:
-        try:
-            y = await asyncio.to_thread(self.trader.get_order_book, yes_token)
-            n = await asyncio.to_thread(self.trader.get_order_book, no_token)
-            _book_to_dict(y)
-            _book_to_dict(n)
-            return True
-        except Exception as e:
-            msg = str(e)
-            if "No orderbook exists" in msg or "status_code=404" in msg:
-                return False
-            raise
-
-    async def _validate_updown_market(self, yes_token: str, no_token: str, slug: str) -> bool:
+    async def _validate_updown_market(self, up_token: str, down_token: str, slug: str) -> bool:
         """Validate this is actually an UP/DOWN market by checking price distribution"""
         try:
-            yes_book, no_book = await self._books(yes_token, no_token)
+            up_book, down_book = await self._books(up_token, down_token)
             
-            yes_best = _best_ask(yes_book)
-            no_best = _best_ask(no_book)
+            up_best = _best_ask(up_book)
+            down_best = _best_ask(down_book)
             
-            if not yes_best or not no_best:
-                logger.warning(f"Validation failed for {slug}: missing asks")
+            if not up_best or not down_best:
                 return False
             
-            yes_price, _ = yes_best
-            no_price, _ = no_best
+            up_price, _ = up_best
+            down_price, _ = down_best
             
-            # UP/DOWN markets should have competitive pricing (both sides ~0.30-0.70)
-            # If both sides are > 0.90 or < 0.10, it's not an active UP/DOWN market
-            if yes_price > 0.90 or no_price > 0.90:
-                logger.warning(f"Validation failed for {slug}: prices too high (YES={yes_price:.4f} NO={no_price:.4f}) - not an UP/DOWN market")
+            # UP/DOWN markets should have competitive pricing
+            if up_price > 0.90 or down_price > 0.90:
+                logger.warning(f"Validation failed for {slug}: prices too high (UP={up_price:.4f} DOWN={down_price:.4f})")
                 return False
             
-            if yes_price < 0.10 or no_price < 0.10:
-                logger.warning(f"Validation failed for {slug}: prices too low (YES={yes_price:.4f} NO={no_price:.4f}) - not an UP/DOWN market")
+            if up_price < 0.10 or down_price < 0.10:
+                logger.warning(f"Validation failed for {slug}: prices too low (UP={up_price:.4f} DOWN={down_price:.4f})")
                 return False
             
-            # Total should be close to 1.0 (within 0.50 of 1.0)
-            total = yes_price + no_price
+            total = up_price + down_price
             if total < 0.50 or total > 1.50:
-                logger.warning(f"Validation failed for {slug}: total price {total:.4f} out of range - not an UP/DOWN market")
+                logger.warning(f"Validation failed for {slug}: total price {total:.4f} out of range")
                 return False
             
-            logger.info(f"Validated UP/DOWN market {slug}: YES={yes_price:.4f} NO={no_price:.4f} total={total:.4f}")
+            logger.info(f"✅ Validated UP/DOWN market {slug}: UP={up_price:.4f} DOWN={down_price:.4f} total={total:.4f}")
             return True
             
         except Exception as e:
             logger.warning(f"Validation error for {slug}: {e}")
             return False
 
-    async def _resolve_market(self, asset: str) -> Optional[Dict[str, str]]:
-        until = self._invalid_until.get(asset, 0.0)
-        if time.time() < until:
-            return self._active.get(asset)
+    async def _resolve_current_market(self) -> Optional[MarketState]:
+        """Find and validate the current 15-minute market"""
+        if time.time() < self._invalid_until:
+            return self._current_state
 
         now_ts = int(time.time())
         cands = _compute_candidate_slugs(
-            asset, now_ts, self.s.window_sec, self.s.slug_scan_buckets_ahead, self.s.slug_scan_buckets_behind
+            self.s.asset, now_ts, self.s.window_sec, 
+            self.s.slug_scan_buckets_ahead, self.s.slug_scan_buckets_behind
         )[: self.s.max_slug_lookups]
 
-        last_err: Optional[str] = None
         for slug in cands:
             try:
-                mk = await fetch_market_from_event_page(slug)
-                info = extract_yes_no_tokens_from_market(mk, slug)
-
-                if self.s.resolve_validate_orderbook:
-                    ok = await self._validate_orderbooks(info["yes_token_id"], info["no_token_id"])
-                    if not ok:
-                        if self.s.debug:
-                            logger.warning(f"[{asset}] slug={slug} has clobTokenIds but NO CLOB orderbooks (skipping).")
+                result = await fetch_market_from_event_page(slug)
+                market_obj = result["market"]
+                end_date = result["end_date"]
+                
+                info = extract_yes_no_tokens_from_market(market_obj, slug)
+                
+                # Validate it's an active UP/DOWN market
+                ok = await self._validate_updown_market(info["up_token_id"], info["down_token_id"], slug)
+                if not ok:
+                    continue
+                
+                # Calculate t_start and t_end
+                if end_date:
+                    t_end = end_date
+                else:
+                    # Fallback: parse from slug timestamp
+                    try:
+                        ts_from_slug = int(slug.split("-")[-1])
+                        t_end = ts_from_slug + self.s.window_sec
+                    except Exception:
+                        logger.warning(f"Could not parse end time from slug {slug}")
                         continue
-                    
-                    # Additional validation: ensure this is actually an UP/DOWN market
-                    updown_ok = await self._validate_updown_market(info["yes_token_id"], info["no_token_id"], slug)
-                    if not updown_ok:
-                        logger.warning(f"[{asset}] slug={slug} failed UP/DOWN market validation (skipping).")
-                        continue
-
-                prev = self._active.get(asset)
-                self._active[asset] = info
-                if not prev or prev.get("slug") != info.get("slug"):
-                    logger.info(f"[{asset}] Active: {info['slug']} | YES={info['yes_token_id']} NO={info['no_token_id']}")
-                self._invalid_until[asset] = time.time() + self.s.resolve_cache_sec
-                return info
+                
+                t_start = t_end - self.s.window_sec
+                
+                # Check if this is a new market or same as current
+                if self._current_state and self._current_state.slug == slug:
+                    # Same market, just return existing state
+                    self._invalid_until = time.time() + self.s.resolve_cache_sec
+                    return self._current_state
+                
+                # New market found
+                state = MarketState(
+                    slug=slug,
+                    up_token_id=info["up_token_id"],
+                    down_token_id=info["down_token_id"],
+                    t_start=t_start,
+                    t_end=t_end,
+                )
+                
+                logger.info(f"🎯 NEW MARKET: {slug} | UP={info['up_token_id'][:16]}... DOWN={info['down_token_id'][:16]}...")
+                logger.info(f"   Start: {t_start} | End: {t_end} | Window: {self.s.window_sec}s")
+                
+                self._current_state = state
+                self._invalid_until = time.time() + self.s.resolve_cache_sec
+                return state
 
             except Exception as e:
-                last_err = str(e)
                 continue
 
-        logger.warning(f"[{asset}] could not resolve any active market via event-page resolver (last_err={last_err}).")
-        self._invalid_until[asset] = time.time() + max(3.0, self.s.poll_sec)
+        logger.warning(f"[{self.s.asset}] Could not resolve any active UP/DOWN market")
+        self._invalid_until = time.time() + max(5.0, self.s.poll_sec)
         return None
 
-    def _pick_notional(self) -> float:
-        if self.s.step_usdc <= 0:
-            raw = float(max(self.s.min_usdc, min(self.s.base_usdc, self.s.max_usdc)))
-        else:
-            steps = int(max(0, math.floor((self.s.max_usdc - self.s.min_usdc) / self.s.step_usdc)))
-            k = random.randint(0, max(0, steps))
-            raw = self.s.min_usdc + k * self.s.step_usdc
-
-        scaled = raw * max(0.0, self.s.size_mult)
-        return float(max(self.s.min_usdc, min(scaled, self.s.max_usdc)))
-
-    async def _books(self, yes_token: str, no_token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        t1 = asyncio.to_thread(self.trader.get_order_book, yes_token)
-        t2 = asyncio.to_thread(self.trader.get_order_book, no_token)
-        y_raw, n_raw = await asyncio.gather(t1, t2)
-        return _book_to_dict(y_raw), _book_to_dict(n_raw)
+    async def _books(self, up_token: str, down_token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        t1 = asyncio.to_thread(self.trader.get_order_book, up_token)
+        t2 = asyncio.to_thread(self.trader.get_order_book, down_token)
+        up_raw, down_raw = await asyncio.gather(t1, t2)
+        return _book_to_dict(up_raw), _book_to_dict(down_raw)
 
     async def _wait_terminal(self, oid: str, timeout: float) -> Dict[str, Any]:
         deadline = time.time() + timeout
@@ -665,198 +654,264 @@ class ArbBot:
             await asyncio.sleep(0.15)
         return last
 
-    async def _cancel(self, oid: Optional[str]) -> None:
-        if oid:
-            await asyncio.to_thread(self.trader.cancel_order, oid)
-
-    async def _unwind(self, token_id: str, qty: float, book: Dict[str, Any], why: str) -> None:
-        if qty <= 0:
-            return
-        bid = _best_bid(book)
-        if not bid:
-            logger.warning(f"Unwind skipped (no bids) token={token_id} qty={qty} | {why}")
-            return
-        bid_price, _ = bid
+    async def _buy_side(self, token_id: str, usdc_amount: float, side_name: str) -> float:
+        """Buy a side with USDC amount, return shares filled"""
+        up_book, down_book = await self._books(self._current_state.up_token_id, self._current_state.down_token_id)
+        book = up_book if side_name == "UP" else down_book
+        
+        ask = _best_ask(book)
+        if not ask:
+            logger.warning(f"❌ No ask for {side_name}, skipping buy")
+            return 0.0
+        
+        ask_price, _ = ask
+        shares = usdc_amount / max(ask_price, 0.01)
+        
+        # Check slippage
+        worst = _walk_asks_for_size(book, shares)
+        if worst is None or not _slippage_ok(ask_price, worst, self.s.max_slippage):
+            logger.warning(f"❌ {side_name} slippage too high, skipping")
+            return 0.0
+        
         if self.s.dry_run:
-            logger.warning(f"[DRY_RUN] Would unwind SELL {qty} @ {bid_price} | {why}")
-            return
+            logger.info(f"[DRY_RUN] Would BUY {shares:.2f} {side_name} @ {worst:.4f} (${usdc_amount:.2f})")
+            return shares
+        
         try:
-            resp = await asyncio.to_thread(self.trader.place_limit_sell_fak, token_id, qty, bid_price)
-            logger.warning(f"Unwind SELL placed order={_extract_order_id(resp)} | {why}")
+            resp = await asyncio.to_thread(self.trader.place_limit_buy, token_id, shares, worst, ioc=True)
+            oid = _extract_order_id(resp)
+            if not oid:
+                logger.warning(f"❌ No order ID from {side_name} buy")
+                return 0.0
+            
+            order = await self._wait_terminal(oid, self.s.fill_timeout_sec)
+            filled = _filled_size(order)
+            
+            if filled > 0:
+                logger.info(f"✅ BOUGHT {filled:.2f} {side_name} @ {worst:.4f}")
+            else:
+                logger.warning(f"⚠️ {side_name} buy not filled")
+            
+            return filled
+            
         except Exception as e:
-            logger.warning(f"Unwind SELL failed | {why} | err={e}")
+            logger.warning(f"❌ {side_name} buy failed: {e}")
+            return 0.0
 
-    async def try_trade(self, asset: str) -> None:
-        now_ts = int(time.time())
-        tte = self._tte(now_ts)
+    async def _sell_all(self, state: MarketState) -> None:
+        """Sell all positions at T=13min to go flat and earn maker rebates"""
+        up_book, down_book = await self._books(state.up_token_id, state.down_token_id)
+        
+        tasks = []
+        
+        # Sell UP position if any
+        if state.pos_up_qty > 0:
+            up_bid = _best_bid(up_book)
+            if up_bid:
+                bid_price, _ = up_bid
+                # Place limit slightly below bid to ensure fill while earning maker rebate
+                sell_price = bid_price * 0.999  # 0.1% below bid
+                tasks.append(self._sell_side(state.up_token_id, state.pos_up_qty, sell_price, "UP"))
+        
+        # Sell DOWN position if any
+        if state.pos_down_qty > 0:
+            down_bid = _best_bid(down_book)
+            if down_bid:
+                bid_price, _ = down_bid
+                sell_price = bid_price * 0.999
+                tasks.append(self._sell_side(state.down_token_id, state.pos_down_qty, sell_price, "DOWN"))
+        
+        if tasks:
+            await asyncio.gather(*tasks)
+        
+        logger.info(f"💰 EXIT COMPLETE | UP_sold={state.pos_up_qty:.2f} DOWN_sold={state.pos_down_qty:.2f}")
 
-        if not self._armed(now_ts):
-            logger.info(f"[{asset}] EXIT: not armed (tte={tte}s > {self.s.arm_before_boundary_sec}s)")
-            return
-        if not self._tradeable(now_ts):
-            logger.info(f"[{asset}] EXIT: not tradeable (tte={tte}s, window=[{self.s.min_tte_select_sec},{self.s.max_tte_select_sec}])")
-            return
-        if not self._trades_per_min_ok():
-            logger.info(f"[{asset}] EXIT: rate limit ({len(self._trade_ts)}/{self.s.max_trades_per_min})")
-            return
-        if not self._cooldown_ok():
-            logger.info(f"[{asset}] EXIT: cooldown ({time.time()-self._last_trade:.2f}s < {self.s.cooldown_sec}s)")
-            return
-
-        market = await self._resolve_market(asset)
-        if not market:
-            logger.info(f"[{asset}] EXIT: market resolution failed")
-            return
-
-        yes_token = market["yes_token_id"]
-        no_token = market["no_token_id"]
-
-        try:
-            yes_book, no_book = await self._books(yes_token, no_token)
-        except Exception as e:
-            logger.warning(f"[{asset}] EXIT: book fetch failed: {e}")
-            return
-
-        yes_best = _best_ask(yes_book)
-        no_best = _best_ask(no_book)
-        if not yes_best or not no_best:
-            yb = "none" if not yes_best else f"{yes_best[0]:.4f}@{yes_best[1]:.2f}"
-            nb = "none" if not no_best else f"{no_best[0]:.4f}@{no_best[1]:.2f}"
-            logger.info(f"[{asset}] EXIT: missing asks (YES={yb}, NO={nb})")
-            return
-
-        yes_best_p, _ = yes_best
-        no_best_p, _ = no_best
-
-        notional = self._pick_notional()
-        est_price = max(yes_best_p, no_best_p, 0.01)
-        shares = max(1.0, math.floor(notional / est_price))
-
-        yes_worst = _walk_asks_for_size(yes_book, shares)
-        no_worst = _walk_asks_for_size(no_book, shares)
-        if yes_worst is None or no_worst is None:
-            logger.info(f"[{asset}] EXIT: insufficient depth (shares={shares:.0f}, YES_worst={yes_worst}, NO_worst={no_worst})")
-            return
-
-        if not _slippage_ok(yes_best_p, yes_worst, self.s.max_slippage):
-            slip = (yes_worst - yes_best_p) / max(yes_best_p, 1e-9)
-            logger.info(f"[{asset}] EXIT: YES slippage {slip:.4f} > {self.s.max_slippage} (best={yes_best_p:.4f} worst={yes_worst:.4f})")
-            return
-
-        if not _slippage_ok(no_best_p, no_worst, self.s.max_slippage):
-            slip = (no_worst - no_best_p) / max(no_best_p, 1e-9)
-            logger.info(f"[{asset}] EXIT: NO slippage {slip:.4f} > {self.s.max_slippage} (best={no_best_p:.4f} worst={no_worst:.4f})")
-            return
-
-        total_cost = yes_worst + no_worst
-        edge = 1.0 - total_cost
-
-        # Always log evaluation metrics - this is critical for understanding bot behavior
-        logger.info(
-            f"[{asset}] eval | notional={notional:.2f} shares={shares:.0f} "
-            f"YES best={yes_best_p:.4f} worst={yes_worst:.4f} | "
-            f"NO best={no_best_p:.4f} worst={no_worst:.4f} | "
-            f"total={total_cost:.4f} edge={edge:.4f} min_edge={self.s.min_edge:.4f}"
-        )
-
-        if edge < self.s.min_edge:
-            logger.info(f"[{asset}] EXIT: edge {edge:.4f} < min_edge {self.s.min_edge:.4f}")
-            return
-
-        logger.info(
-            f"[{asset}] TRADE_SIGNAL | edge={edge:.4f} total={total_cost:.4f} shares={shares:.0f} "
-            f"YES@{yes_worst:.4f} NO@{no_worst:.4f} tte={tte}s slug={market.get('slug')}"
-        )
-
-        await self._execute_paired(asset, yes_token, no_token, shares, yes_worst, no_worst)
-
-    async def _execute_paired(self, asset: str, yes_token: str, no_token: str, shares: float, yes_price: float, no_price: float) -> None:
+    async def _sell_side(self, token_id: str, qty: float, price: float, side_name: str) -> None:
+        """Sell a side at limit price (GTC for maker rebates)"""
         if self.s.dry_run:
-            logger.warning(
-                f"[DRY_RUN] [{asset}] Would BUY paired shares={shares:.0f} YES@{yes_price:.4f} NO@{no_price:.4f} total={yes_price+no_price:.4f}"
-            )
+            logger.info(f"[DRY_RUN] Would SELL {qty:.2f} {side_name} @ {price:.4f}")
             return
+        
+        try:
+            resp = await asyncio.to_thread(self.trader.place_limit_sell, token_id, qty, price)
+            oid = _extract_order_id(resp)
+            logger.info(f"📤 SELL order placed: {side_name} {qty:.2f} @ {price:.4f} (order_id={oid})")
+        except Exception as e:
+            logger.warning(f"❌ SELL {side_name} failed: {e}")
 
-        for attempt in range(1, self.s.max_retries + 1):
-            yes_oid = None
-            no_oid = None
-            try:
-                r_yes_task = asyncio.to_thread(self.trader.place_limit_buy_fok, yes_token, shares, yes_price)
-                r_no_task = asyncio.to_thread(self.trader.place_limit_buy_fok, no_token, shares, no_price)
-                r_yes, r_no = await asyncio.gather(r_yes_task, r_no_task)
+    async def step_base_entry(self, state: MarketState) -> None:
+        """Step 1: Base entry at market start - buy both sides equally"""
+        elapsed = self._elapsed(state)
+        
+        # Only execute in first 60 seconds
+        if state.base_done or elapsed > 60:
+            return
+        
+        logger.info(f"🎬 BASE ENTRY | Buying ${self.s.base_usdc_per_side:.2f} each side")
+        
+        # Buy both sides simultaneously
+        up_task = self._buy_side(state.up_token_id, self.s.base_usdc_per_side, "UP")
+        down_task = self._buy_side(state.down_token_id, self.s.base_usdc_per_side, "DOWN")
+        
+        up_filled, down_filled = await asyncio.gather(up_task, down_task)
+        
+        state.pos_up_qty += up_filled
+        state.pos_down_qty += down_filled
+        
+        # Record prices for next evaluation
+        up_book, down_book = await self._books(state.up_token_id, state.down_token_id)
+        up_ask = _best_ask(up_book)
+        down_ask = _best_ask(down_book)
+        
+        if up_ask:
+            state.last_eval_ask_up, _ = up_ask
+        if down_ask:
+            state.last_eval_ask_down, _ = down_ask
+        
+        state.base_done = True
+        logger.info(f"✅ BASE DONE | UP={state.pos_up_qty:.2f} DOWN={state.pos_down_qty:.2f}")
 
-                yes_oid = _extract_order_id(r_yes)
-                no_oid = _extract_order_id(r_no)
-                if not yes_oid or not no_oid:
-                    raise RuntimeError("Failed to obtain order IDs")
+    async def step_momentum_add(self, state: MarketState) -> None:
+        """Step 2: Momentum adds every 2 minutes - buy the winning side"""
+        elapsed = self._elapsed(state)
+        
+        if not state.base_done:
+            return
+        
+        if state.eval_index >= self.s.num_evals:
+            return
+        
+        # Check if it's time for next evaluation
+        target_time = (state.eval_index + 1) * self.s.eval_interval_sec
+        if elapsed < target_time:
+            return
+        
+        # Prevent evaluations after exit time
+        if elapsed >= self.s.exit_time_sec:
+            return
+        
+        # Fetch current prices
+        up_book, down_book = await self._books(state.up_token_id, state.down_token_id)
+        up_ask = _best_ask(up_book)
+        down_ask = _best_ask(down_book)
+        
+        if not up_ask or not down_ask:
+            logger.warning(f"⚠️ Eval #{state.eval_index + 1}: Missing asks, skipping")
+            state.eval_index += 1
+            return
+        
+        up_price_now, _ = up_ask
+        down_price_now, _ = down_ask
+        
+        # Calculate deltas
+        if state.last_eval_ask_up is None or state.last_eval_ask_down is None:
+            # First eval, use current prices
+            delta_up = 0.0
+            delta_down = 0.0
+        else:
+            delta_up = up_price_now - state.last_eval_ask_up
+            delta_down = down_price_now - state.last_eval_ask_down
+        
+        # Determine winner
+        if abs(delta_up - delta_down) < self.s.min_price_delta:
+            # Tie or tiny diff - use higher current price
+            winner = "UP" if up_price_now >= down_price_now else "DOWN"
+        elif delta_up > delta_down:
+            winner = "UP"
+        else:
+            winner = "DOWN"
+        
+        logger.info(
+            f"📊 EVAL #{state.eval_index + 1} @ T={elapsed}s | "
+            f"UP: {state.last_eval_ask_up:.4f}→{up_price_now:.4f} (Δ={delta_up:+.4f}) | "
+            f"DOWN: {state.last_eval_ask_down:.4f}→{down_price_now:.4f} (Δ={delta_down:+.4f}) | "
+            f"WINNER: {winner}"
+        )
+        
+        # Buy winner
+        winner_token = state.up_token_id if winner == "UP" else state.down_token_id
+        filled = await self._buy_side(winner_token, self.s.step_usdc, winner)
+        
+        if winner == "UP":
+            state.pos_up_qty += filled
+        else:
+            state.pos_down_qty += filled
+        
+        # Update last eval prices
+        state.last_eval_ask_up = up_price_now
+        state.last_eval_ask_down = down_price_now
+        state.eval_index += 1
 
-                y = await self._wait_terminal(yes_oid, self.s.fill_timeout_sec)
-                n = await self._wait_terminal(no_oid, self.s.fill_timeout_sec)
+    async def step_forced_exit(self, state: MarketState) -> None:
+        """Step 3: Forced exit at minute 13"""
+        elapsed = self._elapsed(state)
+        tte = self._tte(state)
+        
+        # Exit if we hit exit time OR if time is running out
+        should_exit = (elapsed >= self.s.exit_time_sec) or (tte <= 60)
+        
+        if not should_exit or state.exit_done:
+            return
+        
+        logger.info(f"🚪 FORCED EXIT @ T={elapsed}s (tte={tte}s)")
+        await self._sell_all(state)
+        state.exit_done = True
 
-                y_st = _order_status(y)
-                n_st = _order_status(n)
-                y_fill = _filled_size(y)
-                n_fill = _filled_size(n)
-
-                if y_st == "FILLED" and n_st == "FILLED":
-                    self._last_trade = time.time()
-                    self._trade_ts.append(self._last_trade)
-                    logger.info(f"[{asset}] ✅ Paired fill | YES={yes_oid} NO={no_oid} shares={shares:.0f}")
-                    return
-
-                await asyncio.gather(self._cancel(yes_oid), self._cancel(no_oid))
-
-                if self.s.sell_opposite:
-                    yes_book, no_book = await self._books(yes_token, no_token)
-                    if y_fill > 0 and n_fill <= 0:
-                        await self._unwind(yes_token, y_fill, yes_book, f"one-leg fill YES attempt={attempt}")
-                    elif n_fill > 0 and y_fill <= 0:
-                        await self._unwind(no_token, n_fill, no_book, f"one-leg fill NO attempt={attempt}")
-                    else:
-                        if y_fill > 0:
-                            await self._unwind(yes_token, y_fill, yes_book, f"partial fill YES attempt={attempt}")
-                        if n_fill > 0:
-                            await self._unwind(no_token, n_fill, no_book, f"partial fill NO attempt={attempt}")
-
-                logger.warning(
-                    f"[{asset}] ⚠️ Not filled | YES({y_st},filled={y_fill}) NO({n_st},filled={n_fill}) attempt={attempt}"
-                )
-                await asyncio.sleep(0.2)
-
-            except Exception as e:
-                logger.warning(f"[{asset}] order attempt failed: {e} attempt={attempt}")
-                await asyncio.gather(self._cancel(yes_oid), self._cancel(no_oid))
-                await asyncio.sleep(0.25)
-
-        logger.warning(f"[{asset}] ❌ Giving up after {self.s.max_retries} attempts.")
+    async def run_cycle(self) -> None:
+        """Main execution cycle"""
+        # Resolve current market
+        state = await self._resolve_current_market()
+        if not state:
+            return
+        
+        # Execute strategy steps in order
+        await self.step_base_entry(state)
+        await self.step_momentum_add(state)
+        await self.step_forced_exit(state)
+        
+        # Check if we need to move to next market
+        if state.exit_done:
+            tte = self._tte(state)
+            if tte <= 0:
+                logger.info(f"✅ Market {state.slug} expired, waiting for next...")
+                self._current_state = None  # Force refresh next cycle
 
     async def run_forever(self) -> None:
-        logger.info("Bot started.")
-        logger.info(f"Assets={self.s.assets} window={self.s.window_sec}s dry_run={self.s.dry_run}")
-        logger.info(f"min_edge={self.s.min_edge} max_slippage={self.s.max_slippage}")
-        logger.info(
-            f"gates: arm<= {self.s.arm_before_boundary_sec}s, tradeable in [{self.s.min_tte_select_sec},{self.s.max_tte_select_sec}] "
-            f"stop_trying<= {self.s.stop_trying_before_boundary_sec}s"
-        )
-
+        logger.info("=" * 80)
+        logger.info("15-MINUTE MOMENTUM LADDER STRATEGY")
+        logger.info("=" * 80)
+        logger.info(f"Asset: {self.s.asset}")
+        logger.info(f"Base: ${self.s.base_usdc_per_side:.2f}/side | Step: ${self.s.step_usdc:.2f}")
+        logger.info(f"Evals: {self.s.num_evals} every {self.s.eval_interval_sec}s | Exit: {self.s.exit_time_sec}s")
+        logger.info(f"DRY_RUN: {self.s.dry_run}")
+        logger.info("=" * 80)
+        
         while True:
             now = time.time()
+            
+            # Heartbeat
             if now - self._last_heartbeat >= self.s.log_every_sec:
                 self._last_heartbeat = now
-                now_ts = int(now)
-                tte = self._tte(now_ts)
-                logger.info(
-                    f"HEARTBEAT | tte={tte}s | armed={self._armed(now_ts)} tradeable={self._tradeable(now_ts)} "
-                    f"| trades_last_min={len(self._trade_ts)} | cooldown_ok={self._cooldown_ok()}"
-                )
-
+                if self._current_state:
+                    elapsed = self._elapsed(self._current_state)
+                    tte = self._tte(self._current_state)
+                    logger.info(
+                        f"💓 HEARTBEAT | Market: {self._current_state.slug} | "
+                        f"T={elapsed}s | TTE={tte}s | "
+                        f"Evals: {self._current_state.eval_index}/{self.s.num_evals} | "
+                        f"Pos: UP={self._current_state.pos_up_qty:.2f} DOWN={self._current_state.pos_down_qty:.2f}"
+                    )
+                else:
+                    logger.info("💓 HEARTBEAT | No active market")
+            
+            # Main cycle
             t0 = time.time()
             try:
-                for a in self.s.assets:
-                    await self.try_trade(a.upper())
+                await self.run_cycle()
             except Exception as e:
-                logger.warning(f"loop error: {e}")
-
+                logger.error(f"❌ Cycle error: {e}")
+            
+            # Sleep
             dt = time.time() - t0
             await asyncio.sleep(max(0.0, self.s.poll_sec - dt))
 
@@ -872,10 +927,10 @@ def _sanity(s: Settings) -> None:
         raise RuntimeError("PM_SIGNATURE_TYPE must be 0/1/2")
     if s.window_sec <= 0:
         raise RuntimeError("WINDOW_SEC must be > 0")
-    if s.min_usdc > s.max_usdc:
-        raise RuntimeError("MIN_USDC must be <= MAX_USDC")
-    if s.size_mult <= 0:
-        raise RuntimeError("SIZE_MULT must be > 0")
+    if s.exit_time_sec >= s.window_sec:
+        raise RuntimeError("EXIT_TIME_SEC must be < WINDOW_SEC")
+    if s.eval_interval_sec * s.num_evals >= s.exit_time_sec:
+        raise RuntimeError("Total eval time exceeds exit time")
 
 
 async def main() -> None:
@@ -883,7 +938,7 @@ async def main() -> None:
     s = Settings.load()
     _sanity(s)
 
-    bot = ArbBot(s)
+    bot = MomentumBot(s)
     await bot.run_forever()
 
 
