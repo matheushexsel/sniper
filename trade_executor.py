@@ -5,6 +5,12 @@ Trade Executor
 Executes trades on Polymarket CLOB when edge is identified.
 Uses Gamma API prices for edge calculation (not thin CLOB asks).
 Posts maker limit orders (0% fees) at our target price.
+
+This version:
+- Uses USER (L2) CLOB creds derived at runtime (no builder keys needed)
+- Uses env-driven host/chain/signature_type
+- Adds a compatibility shim for py_clob_client builds that reference builder_config
+- Adds an optional sanity log for signer vs funder (no secrets)
 """
 
 import logging
@@ -12,7 +18,7 @@ import os
 from typing import Dict, List, Optional
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs
+from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY
 
 logger = logging.getLogger(__name__)
@@ -29,19 +35,19 @@ class TradeExecutor:
     MIN_GAMMA_PRICE = 0.02
     MAX_GAMMA_PRICE = 0.98
 
-    def __init__(
-        self,
-        private_key: str,
-        funder: str,
-        host: str = "https://clob.polymarket.com",
-        chain_id: int = 137,
-        signature_type: int = 2,
-        derive_creds_if_missing: bool = True,
-    ):
+    def __init__(self, private_key: str, funder: str):
+        # --- Config from env ---
+        host = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
+        chain_id = int(os.getenv("CHAIN_ID", "137"))
+
+        # IMPORTANT: you asked to test signature type 2 first
+        # Your env var name is PM_SIGNATURE_TYPE
+        signature_type = int(os.getenv("PM_SIGNATURE_TYPE", "2"))
+
         if not private_key:
-            raise ValueError("Missing private_key")
+            raise ValueError("Missing PM_PRIVATE_KEY")
         if not funder:
-            raise ValueError("Missing funder (proxy wallet / funder address)")
+            raise ValueError("Missing PM_FUNDER")
 
         self.client = ClobClient(
             host=host,
@@ -52,41 +58,27 @@ class TradeExecutor:
         )
 
         # --- Compatibility shim ---
-        # Some py_clob_client versions reference self.builder_config during post_order(),
-        # but do not define it in __init__. Ensure it exists.
+        # Some py_clob_client versions reference client.builder_config during post_order()
+        # but do not define it. Ensure it exists.
         if not hasattr(self.client, "builder_config"):
             self.client.builder_config = None
 
-        # Load USER (L2) creds if provided
-        api_key = os.getenv("CLOB_API_KEY") or os.getenv("PM_API_KEY")
-        api_secret = os.getenv("CLOB_SECRET") or os.getenv("PM_API_SECRET")
-        api_passphrase = os.getenv("CLOB_PASS_PHRASE") or os.getenv("PM_API_PASSPHRASE")
-
-        if api_key and api_secret and api_passphrase:
-            self.client.set_api_creds(
-                ApiCreds(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    api_passphrase=api_passphrase,
-                )
-            )
-            logger.info("Loaded USER API creds from env vars.")
-        else:
-            if not derive_creds_if_missing:
-                raise ValueError(
-                    "Missing USER API creds. Set CLOB_API_KEY/CLOB_SECRET/CLOB_PASS_PHRASE "
-                    "(or PM_API_KEY/PM_API_SECRET/PM_API_PASSPHRASE), or enable derivation."
-                )
-            derived = self.client.create_or_derive_api_creds()
-            self.client.set_api_creds(derived)
-            logger.info("Derived USER API creds via private key.")
+        # --- Derive USER (L2) creds for trading ---
+        # This is the correct path when you don't already have CLOB_API_KEY/CLOB_SECRET/CLOB_PASS_PHRASE.
+        derived = self.client.create_or_derive_api_creds()
+        self.client.set_api_creds(derived)
 
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+
         logger.info(
-            f"TradeExecutor initialized (DRY_RUN={self.dry_run}, signature_type={signature_type}, chain_id={chain_id})"
+            f"TradeExecutor initialized (DRY_RUN={self.dry_run}, "
+            f"host={host}, chain_id={chain_id}, signature_type={signature_type}, funder={funder})"
         )
 
     def _get_gamma_prices(self, market: Dict) -> Optional[Dict]:
+        """
+        Get market prices from Gamma API data (already fetched by scanner).
+        """
         outcome_prices = market.get("outcome_prices", [])
         outcomes = market.get("outcomes", [])
         clob_token_ids = market.get("clob_token_ids", [])
@@ -97,16 +89,21 @@ class TradeExecutor:
         yes_price = outcome_prices[0]
         no_price = outcome_prices[1]
 
+        # Sanity check: prices should roughly sum to 1.0
         if yes_price + no_price < 0.5 or yes_price + no_price > 1.5:
             logger.warning(f"Suspicious gamma prices: YES={yes_price}, NO={no_price}")
             return None
 
+        # Skip if both prices are 0 (no market data yet)
         if yes_price == 0 and no_price == 0:
             return None
 
+        # Skip nearly-resolved markets
         if yes_price < self.MIN_GAMMA_PRICE and no_price > self.MAX_GAMMA_PRICE:
+            logger.debug(f"Skipping resolved market: YES={yes_price:.3f}")
             return None
         if no_price < self.MIN_GAMMA_PRICE and yes_price > self.MAX_GAMMA_PRICE:
+            logger.debug(f"Skipping resolved market: NO={no_price:.3f}")
             return None
 
         return {
@@ -118,6 +115,14 @@ class TradeExecutor:
         }
 
     async def calculate_edge(self, market: Dict, forecast_probability: float) -> Optional[Dict]:
+        """
+        Calculate edge using Gamma API prices.
+        Edge = expected_return_pct on capital risked.
+
+        For buying YES at price P with win probability W:
+            EV  = W * 1.0 - P
+            Edge = EV / P
+        """
         prices = self._get_gamma_prices(market)
         if not prices:
             logger.debug(f"No gamma prices for: {market.get('question', '')[:50]}")
@@ -170,10 +175,13 @@ class TradeExecutor:
             "gamma_price": price,
             "token_id": token_id,
             "forecast_prob": forecast_probability,
-            "market_prob": yes_price,
+            "market_prob": yes_price,  # market-implied YES prob
         }
 
     def _calculate_bid_price(self, gamma_price: float, forecast_prob: float, side: str, edge: float) -> float:
+        """
+        Calculate our limit bid price.
+        """
         fair_value = forecast_prob if side == "YES" else (1 - forecast_prob)
 
         if edge >= self.MAX_BELIEVABLE_EDGE:
@@ -189,6 +197,9 @@ class TradeExecutor:
         return our_bid
 
     async def execute_trade(self, token_id: str, side: str, price: float, size_usd: float) -> Optional[str]:
+        """
+        Post a GTC limit order (maker, 0% fees).
+        """
         if self.dry_run:
             logger.info(f"[DRY RUN] Would BUY {side} ${size_usd:.2f} at {price:.3f} on token {token_id[:16]}...")
             return f"dry_run_{token_id[:8]}"
@@ -224,11 +235,15 @@ class TradeExecutor:
         min_edge: float = 0.05,
         max_positions: int = 10,
     ) -> List[Dict]:
+        """
+        Execute trades for all opportunities with sufficient edge.
+        """
         executed: List[Dict] = []
 
         def _opportunity_score(opp: Dict) -> float:
             hours = opp.get("hours_until_settlement", 24)
             gamma_prices = opp["market"].get("outcome_prices", [])
+
             time_score = min(hours / 24.0, 1.5)
 
             if gamma_prices and len(gamma_prices) >= 2:
@@ -307,6 +322,7 @@ class TradeExecutor:
 
 
 async def test_executor():
+    """Test the trade executor"""
     from dotenv import load_dotenv
     from market_scanner import MarketScanner
     from probability_calculator import ProbabilityCalculator
@@ -322,15 +338,12 @@ async def test_executor():
     executor = TradeExecutor(
         private_key=os.getenv("PM_PRIVATE_KEY"),
         funder=os.getenv("PM_FUNDER"),
-        host=os.getenv("CLOB_HOST", "https://clob.polymarket.com"),
-        chain_id=int(os.getenv("CHAIN_ID", "137")),
-        signature_type=int(os.getenv("SIGNATURE_TYPE", "2")),
     )
 
     executed = await executor.execute_opportunities(
         opportunities=opportunities,
         position_size=float(os.getenv("POSITION_SIZE_USD", "10.0")),
-        min_edge=float(os.getenv("MIN_EDGE_PERCENT", "10.0")) / 100,
+        min_edge=float(os.getenv("MIN_EDGE_PERCENT", "5.0")) / 100,
         max_positions=int(os.getenv("MAX_POSITIONS", "10")),
     )
 
