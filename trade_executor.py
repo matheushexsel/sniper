@@ -213,7 +213,6 @@ class TradeExecutor:
                 price=price,
                 size=size_shares,
                 side=BUY,
-                order_type=OrderType.GTC,
             )
             
             signed_order = self.client.create_order(order_args)
