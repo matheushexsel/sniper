@@ -169,6 +169,18 @@ class MarketScanner:
                             logger.warning(f"    ⚠️  Market missing token IDs: {question[:40]}")
                             continue
                         
+                        # Extract outcome prices from Gamma API (the actual market-implied prices)
+                        outcome_prices_raw = market.get("outcomePrices") or market.get("outcome_prices") or "[]"
+                        if isinstance(outcome_prices_raw, str):
+                            try:
+                                outcome_prices = [float(p) for p in json.loads(outcome_prices_raw)]
+                            except (json.JSONDecodeError, ValueError):
+                                outcome_prices = []
+                        elif isinstance(outcome_prices_raw, list):
+                            outcome_prices = [float(p) for p in outcome_prices_raw]
+                        else:
+                            outcome_prices = []
+                        
                         # Build enriched market object
                         enriched = {
                             "event_title": event_title,
@@ -177,6 +189,10 @@ class MarketScanner:
                             "market_id": market.get("id", ""),
                             "clob_token_ids": clob_token_ids,
                             "outcomes": market.get("outcomes", []),
+                            "outcome_prices": outcome_prices,  # [yes_price, no_price] from Gamma
+                            "best_bid": float(market.get("bestBid", 0) or 0),
+                            "best_ask": float(market.get("bestAsk", 0) or 0),
+                            "last_trade_price": float(market.get("lastTradePrice", 0) or 0),
                             "end_date": end_date,
                             "volume": market.get("volume", 0),
                             "liquidity": market.get("liquidity", 0),
@@ -191,7 +207,8 @@ class MarketScanner:
                         }
                         
                         weather_markets.append(enriched)
-                        logger.info(f"    ✅ {question[:60]} ({temp_range['min']}-{temp_range['max']}{temp_range['unit']})")
+                        gamma_price_str = f" γ={outcome_prices[0]:.0%}" if outcome_prices else ""
+                        logger.info(f"    ✅ {question[:60]} ({temp_range['min']}-{temp_range['max']}{temp_range['unit']}{gamma_price_str})")
                         
                     except Exception as e:
                         logger.warning(f"    Error parsing market: {e}")

@@ -2,7 +2,9 @@
 """
 Trade Executor
 
-Executes trades on Polymarket CLOB when edge is identified
+Executes trades on Polymarket CLOB when edge is identified.
+Uses Gamma API prices for edge calculation (not thin CLOB asks).
+Posts maker limit orders (0% fees) at our target price.
 """
 
 import logging
@@ -18,6 +20,11 @@ logger = logging.getLogger(__name__)
 class TradeExecutor:
     """Execute trades on Polymarket"""
     
+    # --- Profitability filters ---
+    MAX_BUY_PRICE = 0.93   # Never buy above 93¢
+    MIN_BUY_PRICE = 0.01   # Ignore dust
+    MIN_EDGE_ROC = 0.05    # Minimum 5% return-on-capital
+    
     def __init__(self, private_key: str, funder: str, host: str = "https://clob.polymarket.com"):
         self.client = ClobClient(
             host=host,
@@ -29,111 +36,60 @@ class TradeExecutor:
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
         logger.info(f"TradeExecutor initialized (DRY_RUN={self.dry_run})")
     
-    async def get_orderbook(self, token_id: str) -> Optional[Dict]:
-        """Get orderbook for a token"""
-        try:
-            book = self.client.get_order_book(token_id)
-            return book
-        except Exception as e:
-            if "404" in str(e) or "not found" in str(e).lower():
-                logger.debug(f"Normal 404 for token {token_id[:16]}... - Market inactive, skipping")
-                return None
-            else:
-                logger.error(f"Error fetching orderbook for {token_id}: {e}")
-                return None
-    
-    async def get_market_prices(self, market: Dict) -> Optional[Dict]:
+    def _get_gamma_prices(self, market: Dict) -> Optional[Dict]:
         """
-        Get current market prices for YES and NO.
+        Get market prices from Gamma API data (already fetched by scanner).
         
-        Returns:
-            Dict with yes_price, no_price, yes_token_id, no_token_id
+        These are the REAL market-implied prices that Polymarket displays,
+        NOT the thin CLOB orderbook asks.
         """
-        clob_token_ids = market.get("clob_token_ids", [])
+        outcome_prices = market.get("outcome_prices", [])
         outcomes = market.get("outcomes", [])
+        clob_token_ids = market.get("clob_token_ids", [])
         
-        if len(clob_token_ids) < 2 or len(outcomes) < 2:
-            logger.warning(f"Market missing token IDs or outcomes")
+        if len(outcome_prices) < 2 or len(clob_token_ids) < 2:
             return None
         
-        # Added debug logging
-        logger.debug(f"clob_token_ids: {clob_token_ids} (type: {type(clob_token_ids)}, len: {len(clob_token_ids)})")
+        yes_price = outcome_prices[0]
+        no_price = outcome_prices[1]
         
-        # Determine which token is YES and which is NO
-        # For temperature ranges, the first outcome is usually the specific range
-        yes_token_id = clob_token_ids[0]
-        no_token_id = clob_token_ids[1]
-        
-        # Get orderbooks
-        yes_book = await self.get_orderbook(yes_token_id)
-        no_book = await self.get_orderbook(no_token_id)
-        
-        if not yes_book or not no_book:
+        # Sanity check: prices should roughly sum to 1.0
+        if yes_price + no_price < 0.5 or yes_price + no_price > 1.5:
+            logger.warning(f"Suspicious gamma prices: YES={yes_price}, NO={no_price}")
             return None
         
-        # OrderBookSummary is an object with .asks and .bids attributes, not a dict
-        try:
-            yes_asks = yes_book.asks if hasattr(yes_book, 'asks') else []
-            no_asks = no_book.asks if hasattr(no_book, 'asks') else []
-        except Exception as e:
-            logger.error(f"Error accessing orderbook data: {e}")
-            return None
-        
-        if not yes_asks or not no_asks:
-            logger.warning(f"Empty orderbook for market")
-            return None
-        
-        # Added debug logging
-        logger.debug(f"yes_book: {type(yes_book)}, asks: {yes_asks[:2] if yes_asks else 'empty'}")
-        
-        # Best ask price is what we'd pay to buy
-        # Each ask is likely an object too, not a dict
-        try:
-            yes_price = float(yes_asks[0].price if hasattr(yes_asks[0], 'price') else yes_asks[0]["price"])
-            no_price = float(no_asks[0].price if hasattr(no_asks[0], 'price') else no_asks[0]["price"])
-        except (AttributeError, KeyError, IndexError) as e:
-            logger.error(f"Error extracting prices: {e}")
-            return None
-        
-        if yes_price is None or no_price is None:
+        # Skip if both prices are 0 (no market data yet)
+        if yes_price == 0 and no_price == 0:
             return None
         
         return {
             "yes_price": yes_price,
             "no_price": no_price,
-            "yes_token_id": yes_token_id,
-            "no_token_id": no_token_id,
+            "yes_token_id": clob_token_ids[0],
+            "no_token_id": clob_token_ids[1],
             "outcomes": outcomes,
         }
     
-    # --- Profitability filters ---
-    MAX_BUY_PRICE = 0.93   # Never buy above 93¢ (need room for profit after fees)
-    MIN_BUY_PRICE = 0.01   # Ignore dust-priced positions
-    TAKER_FEE = 0.02       # Conservative 2% fee assumption
-    
     async def calculate_edge(self, market: Dict, forecast_probability: float) -> Optional[Dict]:
         """
-        Calculate edge for a market.
+        Calculate edge using Gamma API prices (the actual market-implied probability).
         
-        Edge = expected_return_pct on capital risked, NOT raw probability difference.
+        Edge = expected_return_pct on capital risked.
         
         For buying YES at price P with win probability W:
-            EV  = W * 1.0 - P            (pay P, receive 1.0 if win)
-            Edge = EV / P                 (return on capital)
-        
-        For buying NO at price P_no with win probability (1-W):
-            EV  = (1-W) * 1.0 - P_no
-            Edge = EV / P_no
+            EV  = W * 1.0 - P
+            Edge = EV / P
         """
-        prices = await self.get_market_prices(market)
+        prices = self._get_gamma_prices(market)
         
         if not prices:
+            logger.debug(f"No gamma prices for: {market.get('question', '')[:50]}")
             return None
         
         yes_price = prices["yes_price"]
         no_price = prices["no_price"]
         
-        # --- YES side ---
+        # --- YES side: buy YES, win if forecast is right ---
         ev_yes = forecast_probability * 1.0 - yes_price
         edge_yes = ev_yes / yes_price if yes_price > 0 else -999
         yes_tradeable = (
@@ -141,7 +97,7 @@ class TradeExecutor:
             and edge_yes > 0
         )
         
-        # --- NO side ---
+        # --- NO side: buy NO, win if forecast is wrong ---
         ev_no = (1 - forecast_probability) * 1.0 - no_price
         edge_no = ev_no / no_price if no_price > 0 else -999
         no_tradeable = (
@@ -150,13 +106,13 @@ class TradeExecutor:
         )
         
         logger.info(
-            f"   YES: price={yes_price:.3f} EV={ev_yes:+.3f} edge={edge_yes:+.1%} {'✓' if yes_tradeable else '✗'} | "
-            f"NO: price={no_price:.3f} EV={ev_no:+.3f} edge={edge_no:+.1%} {'✓' if no_tradeable else '✗'}"
+            f"   γ YES={yes_price:.3f} edge={edge_yes:+.1%} {'✓' if yes_tradeable else '✗'} | "
+            f"γ NO={no_price:.3f} edge={edge_no:+.1%} {'✓' if no_tradeable else '✗'} | "
+            f"forecast={forecast_probability:.1%}"
         )
         
         # Pick the better tradeable side
         if yes_tradeable and no_tradeable:
-            # Both sides have positive edge — pick the better one
             if edge_yes >= edge_no:
                 side, edge, price, token_id = "YES", edge_yes, yes_price, prices["yes_token_id"]
             else:
@@ -166,23 +122,47 @@ class TradeExecutor:
         elif no_tradeable:
             side, edge, price, token_id = "NO", edge_no, no_price, prices["no_token_id"]
         else:
-            logger.info(f"   ⛔ No tradeable side (prices out of range or negative EV)")
+            logger.info(f"   ⛔ No tradeable side")
             return None
         
-        # Final profitability check: edge must exceed fees
-        if edge < self.TAKER_FEE:
-            logger.info(f"   ⛔ Edge {edge:.1%} doesn't cover fees ({self.TAKER_FEE:.0%})")
+        # Edge must meet minimum threshold
+        if edge < self.MIN_EDGE_ROC:
+            logger.info(f"   ⛔ Edge {edge:.1%} below minimum {self.MIN_EDGE_ROC:.0%}")
             return None
         
         return {
             "market": market,
             "side": side,
             "edge": edge,
-            "price": price,
+            "gamma_price": price,
             "token_id": token_id,
             "forecast_prob": forecast_probability,
             "market_prob": yes_price,
         }
+    
+    def _calculate_bid_price(self, gamma_price: float, forecast_prob: float, side: str) -> float:
+        """
+        Calculate our limit bid price.
+        
+        Strategy: bid slightly below gamma price to get a better entry.
+        We want to be filled, but not overpay.
+        """
+        if side == "YES":
+            fair_value = forecast_prob
+        else:
+            fair_value = 1 - forecast_prob
+        
+        # Bid at the lower of gamma price or our fair value minus a small spread
+        spread = 0.02  # 2¢ spread for safety margin
+        our_bid = min(gamma_price, fair_value - spread)
+        
+        # Round to nearest cent
+        our_bid = round(our_bid, 2)
+        
+        # Clamp to valid range
+        our_bid = max(self.MIN_BUY_PRICE, min(self.MAX_BUY_PRICE, our_bid))
+        
+        return our_bid
     
     async def execute_trade(
         self, 
@@ -192,53 +172,33 @@ class TradeExecutor:
         size_usd: float
     ) -> Optional[str]:
         """
-        Execute a trade.
-        
-        Args:
-            token_id: Token to trade
-            side: "YES" or "NO"
-            price: Limit price (0.0 to 1.0)
-            size_usd: Size in USD
-            
-        Returns:
-            Order ID or None if failed
+        Post a GTC limit order (maker, 0% fees).
         """
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would {side} ${size_usd:.2f} at {price:.3f} on token {token_id[:16]}...")
+            logger.info(f"[DRY RUN] Would BUY {side} ${size_usd:.2f} at {price:.3f} on token {token_id[:16]}...")
             return f"dry_run_{token_id[:8]}"
         
         try:
-            # Calculate size in shares
-            # For YES: shares = usd / price
-            # For NO: shares = usd / (1 - price)
-            if side == "YES":
-                size_shares = size_usd / price
-            else:
-                size_shares = size_usd / (1 - price)
+            size_shares = size_usd / price
             
-            # Build order
             order_args = OrderArgs(
                 token_id=token_id,
                 price=price,
                 size=size_shares,
                 side=BUY,
-                order_type=OrderType.GTC,  # Good-til-cancel for 0% fees
+                order_type=OrderType.GTC,
             )
             
-            # Create and sign order
             signed_order = self.client.create_order(order_args)
-            
-            # Post order
             resp = self.client.post_order(signed_order)
             
             order_id = resp.get("orderID")
-            
-            logger.info(f"✅ Executed {side} ${size_usd:.2f} at {price:.3f} → Order {order_id}")
+            logger.info(f"✅ Posted {side} limit ${size_usd:.2f} at {price:.3f} → Order {order_id}")
             
             return order_id
             
         except Exception as e:
-            logger.error(f"Error executing trade: {e}")
+            logger.error(f"Error posting order: {e}")
             return None
     
     async def execute_opportunities(
@@ -251,15 +211,8 @@ class TradeExecutor:
         """
         Execute trades for all opportunities with sufficient edge.
         
-        Args:
-            opportunities: List from probability_calculator
-            position_size: USD per position
-            min_edge: Minimum edge required as return-on-capital (default 5%)
-                      e.g., 0.10 = must expect 10% return on money risked
-            max_positions: Maximum number of positions to open
-            
-        Returns:
-            List of executed trades
+        Uses Gamma API prices for edge calculation.
+        Posts GTC limit orders at our target bid price (maker, 0% fees).
         """
         executed = []
         
@@ -269,7 +222,6 @@ class TradeExecutor:
                 break
             
             try:
-                # Calculate edge with current prices
                 edge_analysis = await self.calculate_edge(
                     market=opp["market"],
                     forecast_probability=opp["forecast_probability"],
@@ -280,19 +232,29 @@ class TradeExecutor:
                 
                 edge = edge_analysis["edge"]
                 
-                # Check if edge meets threshold
                 if edge < min_edge:
                     logger.info(f"Edge {edge:.1%} below threshold {min_edge:.1%}, skipping")
                     continue
                 
-                # Execute trade
+                # Calculate our bid price
+                bid_price = self._calculate_bid_price(
+                    gamma_price=edge_analysis["gamma_price"],
+                    forecast_prob=opp["forecast_probability"],
+                    side=edge_analysis["side"],
+                )
+                
                 logger.info(f"📊 {opp['market']['question'][:60]}")
-                logger.info(f"   Forecast: {opp['forecast_probability']:.1%} | Market: {edge_analysis['market_prob']:.1%} | Edge: {edge:+.1%}")
+                logger.info(
+                    f"   Forecast: {opp['forecast_probability']:.1%} | "
+                    f"Market: {edge_analysis['market_prob']:.1%} | "
+                    f"Edge: {edge:+.1%} | "
+                    f"Bid: {bid_price:.2f}"
+                )
                 
                 order_id = await self.execute_trade(
                     token_id=edge_analysis["token_id"],
                     side=edge_analysis["side"],
-                    price=edge_analysis["price"],
+                    price=bid_price,
                     size_usd=position_size,
                 )
                 
@@ -302,7 +264,8 @@ class TradeExecutor:
                         "market": opp["market"]["question"],
                         "side": edge_analysis["side"],
                         "edge": edge,
-                        "price": edge_analysis["price"],
+                        "gamma_price": edge_analysis["gamma_price"],
+                        "bid_price": bid_price,
                         "size_usd": position_size,
                         "forecast_prob": opp["forecast_probability"],
                     })
@@ -327,14 +290,12 @@ async def test_executor():
     
     load_dotenv()
     
-    # Get opportunities
     scanner = MarketScanner()
     markets = await scanner.get_weather_markets(max_hours_until_settlement=24)
     
     calc = ProbabilityCalculator()
-    opportunities = await calc.find_opportunities(markets[:5])  # Test with first 5
+    opportunities = await calc.find_opportunities(markets[:5])
     
-    # Execute
     executor = TradeExecutor(
         private_key=os.getenv("PM_PRIVATE_KEY"),
         funder=os.getenv("PM_FUNDER"),
@@ -343,7 +304,7 @@ async def test_executor():
     executed = await executor.execute_opportunities(
         opportunities=opportunities,
         position_size=float(os.getenv("POSITION_SIZE_USD", "10.0")),
-        min_edge=float(os.getenv("MIN_EDGE_PERCENT", "5.0")) / 100,
+        min_edge=float(os.getenv("MIN_EDGE_PERCENT", "10.0")) / 100,
         max_positions=int(os.getenv("MAX_POSITIONS", "10")),
     )
     

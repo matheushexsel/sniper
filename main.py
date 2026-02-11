@@ -88,7 +88,7 @@ class WeatherArbBot:
             if executed:
                 logger.info(f"✅ Executed {len(executed)} trades:")
                 for trade in executed:
-                    logger.info(f"   • {trade['side']} ${trade['size_usd']:.0f} @ {trade['price']:.3f} | Edge: {trade['edge']:+.1%}")
+                    logger.info(f"   • {trade['side']} ${trade['size_usd']:.0f} bid@{trade['bid_price']:.3f} (mkt@{trade['gamma_price']:.3f}) | Edge: {trade['edge']:+.1%}")
                     logger.info(f"     {trade['market'][:70]}")
             else:
                 logger.info("No trades executed (insufficient edge or max positions reached)")
