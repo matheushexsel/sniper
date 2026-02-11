@@ -21,9 +21,12 @@ class TradeExecutor:
     """Execute trades on Polymarket"""
     
     # --- Profitability filters ---
-    MAX_BUY_PRICE = 0.93   # Never buy above 93¢
-    MIN_BUY_PRICE = 0.01   # Ignore dust
+    MAX_BUY_PRICE = 0.85   # Never buy above 85¢ (need room for profit)
+    MIN_BUY_PRICE = 0.02   # Ignore dust / nearly-resolved markets
     MIN_EDGE_ROC = 0.05    # Minimum 5% return-on-capital
+    MAX_BELIEVABLE_EDGE = 0.50  # Cap edge at 50% — above this, assume model error
+    MIN_GAMMA_PRICE = 0.02  # Skip markets with gamma < 2% (basically resolved NO)
+    MAX_GAMMA_PRICE = 0.98  # Skip markets with gamma > 98% (basically resolved YES)
     
     def __init__(self, private_key: str, funder: str, host: str = "https://clob.polymarket.com"):
         self.client = ClobClient(
@@ -60,6 +63,14 @@ class TradeExecutor:
         
         # Skip if both prices are 0 (no market data yet)
         if yes_price == 0 and no_price == 0:
+            return None
+        
+        # Skip nearly-resolved markets (one side is basically done)
+        if yes_price < self.MIN_GAMMA_PRICE and no_price > self.MAX_GAMMA_PRICE:
+            logger.debug(f"Skipping resolved market: YES={yes_price:.3f}")
+            return None
+        if no_price < self.MIN_GAMMA_PRICE and yes_price > self.MAX_GAMMA_PRICE:
+            logger.debug(f"Skipping resolved market: NO={no_price:.3f}")
             return None
         
         return {
@@ -130,6 +141,12 @@ class TradeExecutor:
             logger.info(f"   ⛔ Edge {edge:.1%} below minimum {self.MIN_EDGE_ROC:.0%}")
             return None
         
+        # Sanity cap: if edge is implausibly large, our model is probably wrong
+        # Log it but cap the edge for position sizing/ranking purposes
+        if edge > self.MAX_BELIEVABLE_EDGE:
+            logger.info(f"   ⚠️  Edge {edge:.1%} exceeds believable max — capping to {self.MAX_BELIEVABLE_EDGE:.0%} (model may be wrong)")
+            edge = self.MAX_BELIEVABLE_EDGE
+        
         return {
             "market": market,
             "side": side,
@@ -140,20 +157,30 @@ class TradeExecutor:
             "market_prob": yes_price,
         }
     
-    def _calculate_bid_price(self, gamma_price: float, forecast_prob: float, side: str) -> float:
+    def _calculate_bid_price(self, gamma_price: float, forecast_prob: float, side: str, edge: float) -> float:
         """
         Calculate our limit bid price.
         
-        Strategy: bid slightly below gamma price to get a better entry.
-        We want to be filled, but not overpay.
+        Strategy:
+        - High confidence (edge 5-20%): bid close to gamma, get filled more often
+        - Medium confidence (edge 20-40%): bid below gamma, be patient  
+        - Capped edge (model may be wrong): bid well below gamma, only fill if truly cheap
         """
         if side == "YES":
             fair_value = forecast_prob
         else:
             fair_value = 1 - forecast_prob
         
-        # Bid at the lower of gamma price or our fair value minus a small spread
-        spread = 0.02  # 2¢ spread for safety margin
+        # Dynamic spread based on confidence
+        if edge >= self.MAX_BELIEVABLE_EDGE:
+            # Edge was capped — we're not sure about our model. Be very conservative.
+            spread = 0.05
+        elif edge > 0.20:
+            spread = 0.03
+        else:
+            spread = 0.02  # High confidence, bid tighter
+        
+        # Bid at the lower of gamma price or our fair value minus spread
         our_bid = min(gamma_price, fair_value - spread)
         
         # Round to nearest cent
@@ -216,6 +243,28 @@ class TradeExecutor:
         """
         executed = []
         
+        # Sort opportunities: prefer moderate edges (5-30%) from tomorrow's markets
+        # over extreme edges (100%+) from nearly-settled today's markets
+        def _opportunity_score(opp):
+            hours = opp.get("hours_until_settlement", 24)
+            gamma_prices = opp["market"].get("outcome_prices", [])
+            
+            # Prefer markets with more time remaining (more fills, less stale)
+            time_score = min(hours / 24.0, 1.5)  # 24h = 1.0, 36h = 1.5
+            
+            # Prefer markets with moderate gamma prices (not nearly resolved)
+            if gamma_prices and len(gamma_prices) >= 2:
+                max_price = max(gamma_prices)
+                min_price = min(gamma_prices)
+                # Best: both sides between 0.10 and 0.90
+                liquidity_score = min(min_price, 1 - max_price) * 10
+            else:
+                liquidity_score = 0.5
+            
+            return time_score + liquidity_score
+        
+        opportunities.sort(key=_opportunity_score, reverse=True)
+        
         for opp in opportunities:
             if len(executed) >= max_positions:
                 logger.info(f"Reached max positions ({max_positions}), stopping")
@@ -241,6 +290,7 @@ class TradeExecutor:
                     gamma_price=edge_analysis["gamma_price"],
                     forecast_prob=opp["forecast_probability"],
                     side=edge_analysis["side"],
+                    edge=edge,
                 )
                 
                 logger.info(f"📊 {opp['market']['question'][:60]}")

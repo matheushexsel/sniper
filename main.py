@@ -138,7 +138,7 @@ async def main():
         await bot.run_once()
     else:
         # Run forever with hourly scans
-        scan_interval = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
+        scan_interval = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
         await bot.run_forever(scan_interval_minutes=scan_interval)
 
 
