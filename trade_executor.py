@@ -29,38 +29,29 @@ class TradeExecutor:
     MAX_GAMMA_PRICE = 0.98  # Skip markets with gamma > 98% (basically resolved YES)
     
     def __init__(self, private_key: str, funder: str, host: str = "https://clob.polymarket.com"):
-        # Derive or load API creds
-        creds = self._get_api_creds()
+        api_key = os.getenv("PM_API_KEY")
+        api_secret = os.getenv("PM_API_SECRET")
+        api_passphrase = os.getenv("PM_API_PASSPHRASE")
+        
+        if not api_key or not api_secret or not api_passphrase:
+            raise ValueError("Missing PM_API_KEY, PM_API_SECRET, or PM_API_PASSPHRASE in .env")
+        
+        creds = {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "passphrase": api_passphrase
+        }
         
         self.client = ClobClient(
             host=host,
             key=private_key,
             chain_id=137,  # Polygon
-            signature_type=2,  # GNOSIS_SAFE for browser wallet
+            signature_type=2,
             funder=funder,
             creds=creds
         )
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
         logger.info(f"TradeExecutor initialized (DRY_RUN={self.dry_run})")
-    
-    def _get_api_creds(self) -> Dict:
-        """Load from env or derive if missing"""
-        api_key = os.getenv("PM_API_KEY")
-        api_secret = os.getenv("PM_API_SECRET")
-        api_passphrase = os.getenv("PM_API_PASSPHRASE")
-        
-        if api_key and api_secret and api_passphrase:
-            return {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "passphrase": api_passphrase
-            }
-        
-        logger.info("Deriving API creds...")
-        creds = self.client.derive_api_key()  # This derives if not exist
-        # Save to env or file for future (manual step for now)
-        logger.info(f"Derived: key={creds['apiKey']}, secret={creds['secret']}, passphrase={creds['passphrase']}")
-        return creds
     
     def _get_gamma_prices(self, market: Dict) -> Optional[Dict]:
         """
