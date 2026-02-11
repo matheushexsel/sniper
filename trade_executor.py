@@ -42,9 +42,11 @@ class TradeExecutor:
             chain_id=137,  # Polygon
             signature_type=2,
             funder=funder,
-            api_key=api_key,
-            api_secret=api_secret,
-            api_passphrase=api_passphrase
+            creds={
+                "key": api_key,
+                "secret": api_secret,
+                "passphrase": api_passphrase
+            }
         )
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
         logger.info(f"TradeExecutor initialized (DRY_RUN={self.dry_run})")
