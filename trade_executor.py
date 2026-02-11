@@ -11,8 +11,8 @@ import logging
 import os
 from typing import Dict, List, Optional
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.clob_types import OrderArgs
+from py_clob_client.order_builder.constants import BUY
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +29,24 @@ class TradeExecutor:
     MAX_GAMMA_PRICE = 0.98  # Skip markets with gamma > 98% (basically resolved YES)
     
     def __init__(self, private_key: str, funder: str, host: str = "https://clob.polymarket.com"):
+        api_key = os.getenv("PM_API_KEY")
+        api_secret = os.getenv("PM_API_SECRET")
+        api_passphrase = os.getenv("PM_API_PASSPHRASE")
+        
+        if not api_key or not api_secret or not api_passphrase:
+            raise ValueError("Missing PM_API_KEY, PM_API_SECRET, or PM_API_PASSPHRASE in .env")
+        
         self.client = ClobClient(
             host=host,
             key=private_key,
             chain_id=137,  # Polygon
             signature_type=2,
             funder=funder,
+            creds={
+                "key": api_key,
+                "secret": api_secret,
+                "passphrase": api_passphrase
+            }
         )
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
         logger.info(f"TradeExecutor initialized (DRY_RUN={self.dry_run})")
