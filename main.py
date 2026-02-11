@@ -34,7 +34,7 @@ class WeatherArbBot:
         
         self.position_size = float(os.getenv("POSITION_SIZE_USD", "10.0"))
         self.max_positions = int(os.getenv("MAX_POSITIONS", "10"))
-        self.min_edge = float(os.getenv("MIN_EDGE_PERCENT", "5.0")) / 100
+        self.min_edge = float(os.getenv("MIN_EDGE_PERCENT", "10.0")) / 100
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
         
         # Initialize components

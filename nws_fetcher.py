@@ -7,12 +7,45 @@ Fetches hourly temperature forecasts from NWS API (FREE, no key needed)
 
 import httpx
 import logging
+import math
 from typing import Dict, List, Optional
 from datetime import datetime
 import pytz
 from dateutil.parser import isoparse  # Added for better parsing
 
 logger = logging.getLogger(__name__)
+
+
+def _normal_cdf(x: float) -> float:
+    """Standard normal CDF using the error function (no scipy needed)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _prob_in_range(forecast_high: float, temp_min: float, temp_max: float, std_dev: float = 3.0) -> float:
+    """
+    Probability that the actual daily high falls within [temp_min, temp_max],
+    given a forecast high and assumed standard deviation of forecast error.
+    
+    Uses a normal distribution centered on forecast_high.
+    
+    Args:
+        forecast_high: Forecasted daily high temperature (°F)
+        temp_min: Lower bound of the market's range (°F)
+        temp_max: Upper bound of the market's range (°F)
+        std_dev: Forecast uncertainty in °F (default 3.0°F ≈ typical NWS error)
+    
+    Returns:
+        Probability between 0.0 and 1.0
+    """
+    if std_dev <= 0:
+        # Point estimate: either in range or not
+        return 1.0 if temp_min <= forecast_high <= temp_max else 0.0
+    
+    z_low = (temp_min - forecast_high) / std_dev
+    z_high = (temp_max - forecast_high) / std_dev
+    
+    prob = _normal_cdf(z_high) - _normal_cdf(z_low)
+    return max(0.0, min(1.0, prob))
 
 
 class NWSFetcher:
@@ -120,14 +153,22 @@ class NWSFetcher:
             logger.warning(f"No forecast data for target date {target_date.date()}")
             return None
         
-        # Count how many hours fall in the target range
-        in_range = sum(1 for temp in target_temps if temp_min_f <= temp <= temp_max_f)
-        total = len(target_temps)
+        # --- KEY FIX: Use the forecasted daily HIGH, not hours-in-range ---
+        # These markets ask "Will the HIGHEST temperature be X-Y?"
+        # So we need: P(actual high ∈ [temp_min, temp_max])
+        forecast_high = max(target_temps)
         
-        # Simple probability: fraction of hours in range
-        probability = in_range / total if total > 0 else 0.0
+        # Use normal distribution around forecasted high
+        # NWS same-day forecasts are typically accurate to ±2-3°F
+        hours_out = max(1, len(target_temps))
+        std_dev = 2.5 if hours_out <= 12 else 3.5  # Tighter for same-day
         
-        logger.info(f"Temperature {temp_min_f}-{temp_max_f}°F: {in_range}/{total} hours in range = {probability:.1%}")
+        probability = _prob_in_range(forecast_high, temp_min_f, temp_max_f, std_dev=std_dev)
+        
+        logger.info(
+            f"Forecast high: {forecast_high:.0f}°F | Range: {temp_min_f:.0f}-{temp_max_f:.0f}°F | "
+            f"σ={std_dev} | P={probability:.1%}"
+        )
         
         return probability
 
@@ -232,11 +273,17 @@ class OpenMeteoFetcher:
         if not target_temps:
             return None
         
-        in_range = sum(1 for temp in target_temps if temp_min_f <= temp <= temp_max_f)
-        total = len(target_temps)
+        # --- KEY FIX: Use the forecasted daily HIGH ---
+        forecast_high = max(target_temps)
         
-        probability = in_range / total if total > 0 else 0.0
+        # Open-Meteo is slightly less accurate than NWS, use wider std dev
+        std_dev = 3.0 if len(target_temps) <= 12 else 4.0
         
-        logger.info(f"Temperature {temp_min_f}-{temp_max_f}°F: {in_range}/{total} hours = {probability:.1%}")
+        probability = _prob_in_range(forecast_high, temp_min_f, temp_max_f, std_dev=std_dev)
+        
+        logger.info(
+            f"Forecast high: {forecast_high:.0f}°F | Range: {temp_min_f:.0f}-{temp_max_f:.0f}°F | "
+            f"σ={std_dev} | P={probability:.1%}"
+        )
         
         return probability

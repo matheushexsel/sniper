@@ -106,16 +106,24 @@ class TradeExecutor:
             "outcomes": outcomes,
         }
     
+    # --- Profitability filters ---
+    MAX_BUY_PRICE = 0.93   # Never buy above 93¢ (need room for profit after fees)
+    MIN_BUY_PRICE = 0.01   # Ignore dust-priced positions
+    TAKER_FEE = 0.02       # Conservative 2% fee assumption
+    
     async def calculate_edge(self, market: Dict, forecast_probability: float) -> Optional[Dict]:
         """
         Calculate edge for a market.
         
-        Args:
-            market: Market dict
-            forecast_probability: True probability from weather forecast
-            
-        Returns:
-            Dict with edge analysis or None
+        Edge = expected_return_pct on capital risked, NOT raw probability difference.
+        
+        For buying YES at price P with win probability W:
+            EV  = W * 1.0 - P            (pay P, receive 1.0 if win)
+            Edge = EV / P                 (return on capital)
+        
+        For buying NO at price P_no with win probability (1-W):
+            EV  = (1-W) * 1.0 - P_no
+            Edge = EV / P_no
         """
         prices = await self.get_market_prices(market)
         
@@ -125,25 +133,46 @@ class TradeExecutor:
         yes_price = prices["yes_price"]
         no_price = prices["no_price"]
         
-        # Implied probability from market price
-        market_prob_yes = yes_price
-        market_prob_no = 1 - yes_price  # or could use no_price
+        # --- YES side ---
+        ev_yes = forecast_probability * 1.0 - yes_price
+        edge_yes = ev_yes / yes_price if yes_price > 0 else -999
+        yes_tradeable = (
+            self.MIN_BUY_PRICE <= yes_price <= self.MAX_BUY_PRICE
+            and edge_yes > 0
+        )
         
-        # Calculate edge for YES and NO
-        edge_yes = forecast_probability - market_prob_yes
-        edge_no = (1 - forecast_probability) - (1 - yes_price)
+        # --- NO side ---
+        ev_no = (1 - forecast_probability) * 1.0 - no_price
+        edge_no = ev_no / no_price if no_price > 0 else -999
+        no_tradeable = (
+            self.MIN_BUY_PRICE <= no_price <= self.MAX_BUY_PRICE
+            and edge_no > 0
+        )
         
-        # Determine best side to bet
-        if abs(edge_yes) > abs(edge_no):
-            side = "YES"
-            edge = edge_yes
-            price = yes_price
-            token_id = prices["yes_token_id"]
+        logger.info(
+            f"   YES: price={yes_price:.3f} EV={ev_yes:+.3f} edge={edge_yes:+.1%} {'✓' if yes_tradeable else '✗'} | "
+            f"NO: price={no_price:.3f} EV={ev_no:+.3f} edge={edge_no:+.1%} {'✓' if no_tradeable else '✗'}"
+        )
+        
+        # Pick the better tradeable side
+        if yes_tradeable and no_tradeable:
+            # Both sides have positive edge — pick the better one
+            if edge_yes >= edge_no:
+                side, edge, price, token_id = "YES", edge_yes, yes_price, prices["yes_token_id"]
+            else:
+                side, edge, price, token_id = "NO", edge_no, no_price, prices["no_token_id"]
+        elif yes_tradeable:
+            side, edge, price, token_id = "YES", edge_yes, yes_price, prices["yes_token_id"]
+        elif no_tradeable:
+            side, edge, price, token_id = "NO", edge_no, no_price, prices["no_token_id"]
         else:
-            side = "NO"
-            edge = edge_no
-            price = no_price
-            token_id = prices["no_token_id"]
+            logger.info(f"   ⛔ No tradeable side (prices out of range or negative EV)")
+            return None
+        
+        # Final profitability check: edge must exceed fees
+        if edge < self.TAKER_FEE:
+            logger.info(f"   ⛔ Edge {edge:.1%} doesn't cover fees ({self.TAKER_FEE:.0%})")
+            return None
         
         return {
             "market": market,
@@ -152,7 +181,7 @@ class TradeExecutor:
             "price": price,
             "token_id": token_id,
             "forecast_prob": forecast_probability,
-            "market_prob": market_prob_yes,
+            "market_prob": yes_price,
         }
     
     async def execute_trade(
@@ -225,7 +254,8 @@ class TradeExecutor:
         Args:
             opportunities: List from probability_calculator
             position_size: USD per position
-            min_edge: Minimum edge required (default 5%)
+            min_edge: Minimum edge required as return-on-capital (default 5%)
+                      e.g., 0.10 = must expect 10% return on money risked
             max_positions: Maximum number of positions to open
             
         Returns:
@@ -251,7 +281,7 @@ class TradeExecutor:
                 edge = edge_analysis["edge"]
                 
                 # Check if edge meets threshold
-                if abs(edge) < min_edge:
+                if edge < min_edge:
                     logger.info(f"Edge {edge:.1%} below threshold {min_edge:.1%}, skipping")
                     continue
                 
